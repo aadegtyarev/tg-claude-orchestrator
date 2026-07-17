@@ -962,11 +962,16 @@ class TelegramBot:
             )
 
     async def notify_startup(self, restored: int) -> None:
-        """№4: сообщить в привязанный чат, что бот онлайн."""
+        """№4: сообщить в привязанный чат, что бот онлайн (+ профиль и URL)."""
         if self.chat_id is None:
             return
+        config_dir = self.config.claude_config_dir or Path.home() / ".claude"
+        base_url = self.config.claude_env.get("ANTHROPIC_BASE_URL") or self.t("url_default")
         try:
-            await self._send(self.chat_id, None, self.t("startup", n=restored))
+            await self._send(
+                self.chat_id, None,
+                self.t("startup", n=restored, config=config_dir, url=base_url),
+            )
         except Exception as e:
             logger.warning("Не удалось отправить стартовое уведомление: %s", e)
 
