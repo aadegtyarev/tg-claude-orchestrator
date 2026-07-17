@@ -117,7 +117,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "session_died_tail": "Хвост лога:\n{tail}",
         "idle_closed": "😴 Сессия остановлена по простою (> {hours} ч). Напиши — возобновлю.",
-        "startup": "🟢 Бот онлайн. Восстановлено сессий: {n} (возобновятся по сообщению).",
+        "startup": (
+            "🟢 Бот онлайн. Восстановлено сессий: {n} (возобновятся по сообщению).\n"
+            "Профиль Claude (CLAUDE_CONFIG_DIR): {config}\n"
+            "Anthropic URL: {url}"
+        ),
+        "url_default": "по умолчанию (api.anthropic.com)",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
         "sendfile_fail": "❌ Не удалось отправить файл: {error}",
@@ -273,7 +278,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "session_died_tail": "Log tail:\n{tail}",
         "idle_closed": "😴 Session stopped after being idle (> {hours} h). Send a message to resume.",
-        "startup": "🟢 Bot online. Restored sessions: {n} (resume on message).",
+        "startup": (
+            "🟢 Bot online. Restored sessions: {n} (resume on message).\n"
+            "Claude profile (CLAUDE_CONFIG_DIR): {config}\n"
+            "Anthropic URL: {url}"
+        ),
+        "url_default": "default (api.anthropic.com)",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
         "sendfile_fail": "❌ Failed to send the file: {error}",
