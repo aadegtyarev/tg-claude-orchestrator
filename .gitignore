@@ -1,0 +1,24 @@
+# Секреты и локальная конфигурация
+.env
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Данные сессий (обычно вне репо, но на всякий случай)
+.sessions.json
+*.log
+*.log.old
+tests/*-sessions/
+tests/*sessions/
+
+# Swap/temp редакторов
+*.swp
+*.swo
+*~
