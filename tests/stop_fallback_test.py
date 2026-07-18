@@ -36,7 +36,7 @@ def make_bot():
     b._texts = {"stop_fallback_prefix": "💬 (fallback)"}
     b.t = lambda k, **kw: b._texts[k]
     b._last_action_was_reply = {}
-    b.bubbles = SimpleNamespace(append=lambda *a: asyncio.sleep(0))
+    b.bubbles = SimpleNamespace(append=lambda *a, **kw: asyncio.sleep(0))
 
     async def fake_send(chat_id, thread_id, text, reply_to=None):
         sent.append((chat_id, thread_id, text))
