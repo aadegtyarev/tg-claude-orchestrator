@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -30,6 +31,10 @@ class Bubble:
     lines: list[str] = field(default_factory=list)
     sent_text: str = ""
     flush_task: asyncio.Task | None = None
+    # Момент последнего добавления строки — метка «когда обновлено» в конце
+    # списка. Замораживаем, чтобы бабл не перепечатывался каждую секунду:
+    # время обновляется только на реальной активности (новая строка).
+    updated_at: float = field(default_factory=time.time)
 
 
 class BubbleManager:
@@ -62,6 +67,7 @@ class BubbleManager:
             return
         bubble = self._bubbles.setdefault(thread_id, Bubble())
         bubble.lines.append(line)
+        bubble.updated_at = time.time()
         # Переполнение: вытесняем старые строки с начала.
         while len(bubble.lines) > 1 and len("\n".join(bubble.lines)) > TEXT_LIMIT:
             bubble.lines.pop(0)
@@ -75,7 +81,13 @@ class BubbleManager:
         chat_id = self._get_chat_id()
         if bubble is None or not bubble.lines or chat_id is None:
             return
+        # Метка «обновлено» — в конец списка, временем последней активности.
+        # Заморожена: перепечатка идёт только на новой строке, поэтому время
+        # показывает, когда Клод последний раз подавал признаки жизни.
+        updated = time.strftime("%H:%M:%S", time.localtime(bubble.updated_at))
         text = f"<b>{self._t('bubble_working')}</b>\n" + "\n".join(bubble.lines)
+        if bubble.lines:
+            text += f"\n🕐 {updated}"
         if text == bubble.sent_text:
             return
         # reply_markup нужен и при edit — иначе Telegram снимает кнопку.
@@ -109,14 +121,8 @@ class BubbleManager:
         except Exception as e:
             logger.debug("Бабл (топик %s): %s", thread_id, e)
 
-    async def close(self, thread_id: int) -> None:
-        self._active.discard(thread_id)  # ход завершён — append больше не создаёт бабл
-        bubble = self._bubbles.pop(thread_id, None)
-        chat_id = self._get_chat_id()
-        if bubble is None or chat_id is None:
-            return
-        # Даём начатому flush завершиться, чтобы не осиротить только что
-        # отправленное сообщение (wait_for сам отменит задачу по таймауту).
+    async def _finish_message(self, bubble: Bubble, chat_id: int) -> None:
+        """Закрыть сообщение бабла: дождаться flush, удалить/оставить журналом."""
         if bubble.flush_task is not None and not bubble.flush_task.done():
             try:
                 await asyncio.wait_for(bubble.flush_task, timeout=5)
@@ -133,4 +139,31 @@ class BubbleManager:
                     chat_id=chat_id, message_id=bubble.message_id, reply_markup=None
                 )
         except Exception as e:
-            logger.debug("Не удалось закрыть бабл (топик %s): %s", thread_id, e)
+            logger.debug("Не удалось закрыть бабл: %s", e)
+
+    async def close(self, thread_id: int) -> None:
+        self._active.discard(thread_id)  # ход завершён — append больше не создаёт бабл
+        bubble = self._bubbles.pop(thread_id, None)
+        chat_id = self._get_chat_id()
+        if bubble is not None and chat_id is not None:
+            await self._finish_message(bubble, chat_id)
+
+    async def fork(self, thread_id: int) -> None:
+        """Новый бабл с переносом строк старого.
+
+        Пользователь шлёт следующее сообщение, не дождавшись ответа модели:
+        старый бабл закрываем (сообщение — удалить/журнал по конфигу), а его
+        строки — список вызванных тулов — уносим в свежий бабл. Так история
+        работы не теряется и всегда на виду, а не начинается с пустого места.
+        """
+        old = self._bubbles.pop(thread_id, None)
+        chat_id = self._get_chat_id()
+        carried = list(old.lines) if old and old.lines else []
+        if old is not None and chat_id is not None:
+            await self._finish_message(old, chat_id)
+        self._active.add(thread_id)
+        new = Bubble()
+        new.lines = carried
+        new.updated_at = time.time()
+        self._bubbles[thread_id] = new
+
