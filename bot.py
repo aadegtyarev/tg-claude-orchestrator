@@ -1038,7 +1038,7 @@ class TelegramBot:
             quoted = reply_txt                                # весь процитированный пост
         # Диагностика: дошли ли до бота данные цитаты (в форумах/при privacy
         # mode их может не быть — тогда функцию надо крепить иначе).
-        logger.info(
+        logger.debug(
             "on_text quote=%s reply_msg=%s quote_len=%d reply_len=%d",
             bool(quote_txt), message.reply_to_message is not None,
             len(quote_txt or ""), len(reply_txt or ""),
@@ -1246,14 +1246,24 @@ class TelegramBot:
 
         while True:
             await asyncio.sleep(ERROR_RELAY_INTERVAL)
+            # Читаем ТОЛЬКО приращение с прошлого тика (seek), а не весь лог
+            # целиком каждый тик (REVIEW.md B5): под лимитом LOG_MAX_MB это
+            # полные чтения в память ради хвоста. Размер — через stat; если
+            # файл стал меньше (resume/ротация) — с начала.
             try:
-                data = log.read_bytes()
+                size = log.stat().st_size
             except OSError:
                 continue
-            if offset > len(data):  # лог обнулили (resume/ротация) — смотрим с начала
+            if offset > size:
                 offset = 0
-            chunk = _LOG_ANSI_RE.sub(b"", data[offset:]).replace(b"\r", b"")
-            offset = len(data)
+            try:
+                with open(log, "rb") as fh:
+                    fh.seek(offset)
+                    delta = fh.read(size - offset)
+            except OSError:
+                continue
+            offset = size
+            chunk = _LOG_ANSI_RE.sub(b"", delta).replace(b"\r", b"")
             sig = _detect_log_signals(chunk)
             now = loop_time()
 

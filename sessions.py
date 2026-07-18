@@ -270,9 +270,24 @@ class SessionManager:
         self._by_thread: dict[int, Session] = {}
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
+        # Общий HTTP-пул к channel-серверам (keep-alive, без сессии на запрос —
+        # REVIEW.md E1). Ленивый: создаётся в event loop при первом обращении.
+        self._http: aiohttp.ClientSession | None = None
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
+
+    def _http_session(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        return self._http
+
+    def _channel_headers(self) -> dict[str, str]:
+        """Auth на эндпоинты channel-сервера (/notify /permission /ping) —
+        симметрично ORCH_TOKEN на стороне оркестратора: без него локальный
+        процесс мог бы POST /notify и вбросить промпт в Claude или POST
+        /permission behavior=allow и авто-разрешить запрос."""
+        return {"Authorization": f"Bearer {self.config.orch_token}"}
 
     # ── состояние на диске ──────────────────────────────────────
     # Записи переживают /close_session и рестарт launcher'а: топик остаётся,
@@ -583,29 +598,32 @@ class SessionManager:
     async def _wait_ready(self, session: Session) -> None:
         """Готовность = channel-сервер отвечает на /ping (его поднял Claude)."""
         deadline = asyncio.get_running_loop().time() + READY_TIMEOUT
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=2)
-        ) as http:
-            while True:
-                proc = session.process
-                if proc is None or proc.returncode is not None:
-                    code = proc.returncode if proc else "?"
-                    raise SessionError(
-                        f"Claude завершился при старте (код {code}). "
-                        f"Лог: {session.session_dir / 'claude.log'}"
-                    )
-                try:
-                    async with http.get(f"http://127.0.0.1:{session.port}/ping") as resp:
-                        if resp.status == 200:
-                            return
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    pass
-                if asyncio.get_running_loop().time() > deadline:
-                    raise SessionError(
-                        f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
-                        f"Лог: {session.session_dir / 'claude.log'}"
-                    )
-                await asyncio.sleep(1)
+        http = self._http_session()
+        ping_timeout = aiohttp.ClientTimeout(total=2)
+        while True:
+            proc = session.process
+            if proc is None or proc.returncode is not None:
+                code = proc.returncode if proc else "?"
+                raise SessionError(
+                    f"Claude завершился при старте (код {code}). "
+                    f"Лог: {session.session_dir / 'claude.log'}"
+                )
+            try:
+                async with http.get(
+                    f"http://127.0.0.1:{session.port}/ping",
+                    timeout=ping_timeout,
+                    headers=self._channel_headers(),
+                ) as resp:
+                    if resp.status == 200:
+                        return
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+            if asyncio.get_running_loop().time() > deadline:
+                raise SessionError(
+                    f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
+                    f"Лог: {session.session_dir / 'claude.log'}"
+                )
+            await asyncio.sleep(1)
 
     # ── жизненный цикл: close / resume / clear / set_model ─────
 
@@ -722,6 +740,8 @@ class SessionManager:
         for session in self.list_all():
             await self._stop_process(session, save=False)
         self.save_state()
+        if self._http is not None and not self._http.closed:
+            await self._http.close()
 
     # ── внутренняя механика процессов ───────────────────────────
 
@@ -745,7 +765,12 @@ class SessionManager:
         self.save_state()
         logger.warning("Сессия %s: Claude неожиданно завершился (код %s)", session.name, code)
         if self.on_dead is not None:
-            await self.on_dead(session, code)
+            # Колбэк (уведомление в Telegram) не должен ронять watcher-таск:
+            # исключение здесь otherwise убило бы задачу молча (REVIEW.md B3).
+            try:
+                await self.on_dead(session, code)
+            except Exception:
+                logger.exception("on_dead для сессии %s — колбэк упал", session.name)
 
     async def _stop_process(self, session: Session, save: bool = True) -> None:
         """Погасить процесс сессии: watcher, группа процессов, лог."""
@@ -799,14 +824,13 @@ class SessionManager:
 
     async def send_to_claude(self, session: Session, text: str, context_id: str) -> None:
         session.last_activity = time.time()
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as http:
-            async with http.post(
-                f"http://127.0.0.1:{session.port}/notify",
-                json={"content": text, "context_id": context_id},
-            ) as resp:
-                resp.raise_for_status()
+        http = self._http_session()
+        async with http.post(
+            f"http://127.0.0.1:{session.port}/notify",
+            json={"content": text, "context_id": context_id},
+            headers=self._channel_headers(),
+        ) as resp:
+            resp.raise_for_status()
 
     def touch(self, session: Session) -> None:
         """Отметить активность (ответ Claude) — сброс таймера простоя."""
@@ -883,14 +907,13 @@ class SessionManager:
 
     async def send_permission(self, session: Session, request_id: str, behavior: str) -> None:
         """Вердикт по запросу разрешения — обратно в channel_server."""
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as http:
-            async with http.post(
-                f"http://127.0.0.1:{session.port}/permission",
-                json={"request_id": request_id, "behavior": behavior},
-            ) as resp:
-                resp.raise_for_status()
+        http = self._http_session()
+        async with http.post(
+            f"http://127.0.0.1:{session.port}/permission",
+            json={"request_id": request_id, "behavior": behavior},
+            headers=self._channel_headers(),
+        ) as resp:
+            resp.raise_for_status()
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""

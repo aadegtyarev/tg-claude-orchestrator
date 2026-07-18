@@ -69,7 +69,7 @@ class Config:
 
         return cls(
             telegram_bot_token=token,
-            telegram_chat_id=int(chat_id_raw) if chat_id_raw else None,
+            telegram_chat_id=cls._parse_chat_id(chat_id_raw),
             # 0/не задано = авто: ОС выдаёт свободный localhost-порт на сессию.
             channel_port_start=int(os.getenv("CHANNEL_PORT_START", "0")),
             channel_port_end=int(os.getenv("CHANNEL_PORT_END", "0")),
@@ -107,6 +107,18 @@ class Config:
                 if k.startswith("CLAUDE_ENV_") and k != "CLAUDE_ENV_"
             },
         )
+
+    @staticmethod
+    def _parse_chat_id(raw: str) -> int | None:
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            raise SystemExit(
+                f"TELEGRAM_CHAT_ID={raw!r} — должно быть целое число (ID группы). "
+                "Узнать: добавь бота в группу и пошли /chat_id."
+            )
 
     @staticmethod
     def _parse_permission_mode(raw: str) -> str:
