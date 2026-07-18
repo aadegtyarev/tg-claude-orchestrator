@@ -91,12 +91,20 @@ CONTEXT_WINDOW = 200_000
 # сам Claude Code — мы не дублируем его каталог и не отстаём от переименований.
 MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 
-# Иконки инструментов для статус-бабла.
+# Иконки инструментов для статус-бабла. "Agent" — актуальное имя тула спавна
+# сабагента (Claude Code ≥2.1); "Task" — синоним для более старых версий,
+# оставлен для совместимости (проверять tool == "Task" or tool == "Agent"
+# было бы дублированием — см. _AGENT_SPAWN_TOOLS).
 TOOL_ICONS = {
     "Bash": "⚡", "Read": "📖", "Write": "✍️", "Edit": "✏️",
     "NotebookEdit": "✏️", "Grep": "🔍", "Glob": "🗂", "WebFetch": "🌐",
-    "WebSearch": "🔎", "Task": "🤖", "TodoWrite": "📝",
+    "WebSearch": "🔎", "Agent": "🤖", "Task": "🤖", "TodoWrite": "📝",
 }
+# Имена тула, которым Claude Code спавнит сабагента — менялось между версиями
+# (REVIEW: 2.1.214 использует "Agent", не "Task" — из-за этого бабл раньше не
+# распознавал спавн и падал в generic-фолбэк, показывая description без имени
+# агента). Держим оба, чтобы не отвалиться на следующем переименовании тоже.
+_AGENT_SPAWN_TOOLS = frozenset({"Agent", "Task"})
 # Из какого поля брать деталь и показывать ли её как имя файла (basename).
 # TaskCreate/TaskUpdate — тему/статус вместо сырого JSON-объекта целиком.
 _TOOL_DETAIL = {
@@ -1076,11 +1084,14 @@ class TelegramBot:
 
     async def _forward(self, session: Session, message: Message, text: str) -> None:
         context_id = f"tg:{self.chat_id}:{session.thread_id}:{message.message_id}"
-        # Новый бабл поверх старого, но с переносом строк: если Клод ещё не
-        # ответил, а пользователь уже шлёт следующее — список вызванных тулов
-        # не теряется, а переезжает в свежий бабл и дополняется дальше.
-        # Схлопывается бабл только финальным ответом (close в handle_reply).
-        await self.bubbles.fork(session.thread_id)
+        # Если Клод ещё не ответил на предыдущее, а пользователь уже шлёт
+        # следующее — старый бабл ЗАМОРАЖИВАЕТСЯ на месте (не удаляется, не
+        # редактируется дальше), новый открывается независимо. Линейная
+        # история в чате вместо «удалить-и-пересоздать» (было fork() — и
+        # прыгало, и гонка: см. bubble.freeze_and_open). Все замороженные
+        # сообщения этого цикла убираются разом финальным complete=True
+        # (close в handle_reply).
+        await self.bubbles.freeze_and_open(session.thread_id)
         try:
             await self.manager.send_to_claude(session, text, context_id)
         except Exception as e:
@@ -1391,8 +1402,22 @@ class TelegramBot:
         if "send_file_to_telegram" in tool:
             return  # тоже придёт сообщением — не считается «текстовым» ответом,
             # но и не фолбэчим на файл: реальная причина потерь — именно текст
+        tool_input = payload.get("tool_input") or {}
+        # agent_id/agent_type — на КАЖДОМ тул-вызове ВНУТРИ сабагента (Claude
+        # Code сам их проставляет; подтверждено эмпирически — см. коммит).
+        # Их нет на самом вызове Agent/Task (это сам спавн, ещё не «внутри»).
+        agent_id = payload.get("agent_id")
+        # Спавн сабагента (описание всегда разное — схлопывать вредно) и
+        # TodoWrite (состояние тудушки, а не повторяющееся действие) — не
+        # схлопываем; передаём tool=None. Остальные — схлопываем по (tool,
+        # agent_id): серия одинаковых Bash/Read/… одного агента → 1 строка
+        # со счётчиком и последней деталью (см. bubble.BubbleLine).
+        collapsible = tool not in _AGENT_SPAWN_TOOLS and tool != "TodoWrite"
         await self.bubbles.append(
-            session.thread_id, self._tool_line(tool, payload.get("tool_input") or {})
+            session.thread_id,
+            self._tool_line(tool, tool_input),
+            agent_id=str(agent_id) if agent_id else None,
+            tool=tool if collapsible else None,
         )
 
     async def handle_stop_event(self, session_name: str, payload: dict) -> None:
@@ -1432,7 +1457,7 @@ class TelegramBot:
         тему, у незнакомых тулов — первый строковый аргумент, а не весь JSON.
         """
         icon = TOOL_ICONS.get(tool, "🔧")
-        if tool == "Task":
+        if tool in _AGENT_SPAWN_TOOLS:
             # t("subagent") уже содержит иконку 🤖 — свою не добавляем.
             agent = html.escape(str(tool_input.get("subagent_type") or "agent"))
             desc = html.escape(self._shorten(str(tool_input.get("description") or "")))
