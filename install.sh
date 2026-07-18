@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 # Установка tg-claude-orchestrator: venv, зависимости, systemd user-сервис.
+# Повторный запуск безопасен (идемпотентен). Удаление: ./install.sh --uninstall
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR=$(pwd)
 SERVICE=tg-claude-orchestrator
+UNIT_DIR=$HOME/.config/systemd/user
+
+if [ "${1:-}" = "--uninstall" ]; then
+    echo "==> Удаляю systemd-сервис (репозиторий, .venv и .env не трогаю)"
+    systemctl --user disable --now "$SERVICE" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$SERVICE.service"
+    systemctl --user daemon-reload
+    echo "Готово."
+    exit 0
+fi
 
 echo "==> Проверки"
 command -v python3 >/dev/null || { echo "Нужен python3"; exit 1; }
 command -v claude >/dev/null || echo "ВНИМАНИЕ: claude не найден в PATH — установи Claude Code и залогинься"
+command -v bwrap >/dev/null || echo "ВНИМАНИЕ: bubblewrap не найден (apt install bubblewrap) — либо поставь его, либо SANDBOX=off в .env"
 
 echo "==> venv и зависимости"
 python3 -m venv .venv
@@ -20,20 +32,29 @@ if [ ! -f .env ]; then
 fi
 
 echo "==> systemd user-сервис"
-UNIT_DIR=$HOME/.config/systemd/user
+# PATH юнита: каталог с бинарём claude определяем по факту (npm-global,
+# ~/.local/bin, nvm — у всех по-разному), не хардкодим раскладку.
+CLAUDE_PATH=""
+if command -v claude >/dev/null; then
+    CLAUDE_PATH="$(dirname "$(command -v claude)"):"
+fi
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/$SERVICE.service" <<EOF
 [Unit]
 Description=tg-claude-orchestrator — Telegram wrapper for Claude Code
 After=network.target
+# Защита от рестарт-штопора: 5 падений за 5 минут — стоп до ручного
+# systemctl --user reset-failed (иначе цикл crash-restart молотит вечно).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=$DIR
-ExecStart=$DIR/.venv/bin/python $DIR/launcher.py
+ExecStart=$DIR/.venv/bin/python -m orchestrator
 Restart=on-failure
 RestartSec=5
-Environment=PATH=$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$CLAUDE_PATH$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -54,4 +75,5 @@ cat <<EOF
   2. Запусти:            systemctl --user enable --now $SERVICE
   3. Логи:               journalctl --user -u $SERVICE -f
   4. Перезапуск:         systemctl --user restart $SERVICE
+  5. Удалить сервис:     ./install.sh --uninstall
 EOF

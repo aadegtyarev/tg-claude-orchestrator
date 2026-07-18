@@ -4,7 +4,11 @@
 
 Запуск: .venv/bin/python tests/smoke_test.py
 """
-import asyncio, json, os, socket, sys
+import asyncio
+import json
+import os
+import socket
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -18,7 +22,7 @@ def free_port() -> int:
 
 
 def test_split_text():
-    from bot import split_text
+    from orchestrator.mdrender import split_text
     assert split_text("") == []
     assert split_text("a" * 5000) == ["a" * 4096, "a" * 904]
     chunks = split_text(("слово " * 100 + "\n") * 20)
@@ -27,7 +31,7 @@ def test_split_text():
 
 
 def test_texts():
-    from texts import MESSAGES
+    from orchestrator.texts import MESSAGES
     assert set(MESSAGES["ru"]) == set(MESSAGES["en"]), \
         set(MESSAGES["ru"]) ^ set(MESSAGES["en"])
     print("OK texts (ru/en паритет)")
@@ -35,7 +39,7 @@ def test_texts():
 
 def test_config():
     os.environ.update({"TELEGRAM_BOT_TOKEN": "x", "ALLOWED_USER_IDS": "1, 2,мусор,"})
-    from config import Config
+    from orchestrator.config import Config
     c = Config.from_env()
     assert c.allowed_user_ids == frozenset({1, 2})
     assert c.permission_mode == "auto" and c.bot_lang == "ru"
@@ -47,7 +51,7 @@ async def test_channel_server():
     env = {**os.environ, "CHANNEL_PORT": str(port), "SESSION_NAME": "smoke",
            "ORCH_HOST": "127.0.0.1", "ORCH_PORT": str(free_port())}
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, str(ROOT / "channel_server.py"),
+        sys.executable, str(ROOT / "orchestrator" / "channel_server.py"),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL, env=env)
 

@@ -18,8 +18,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from bot import TelegramBot  # noqa: E402
-from bubble import BubbleManager  # noqa: E402
+from orchestrator.bot import TelegramBot  # noqa: E402
+from orchestrator.bubble import BubbleManager  # noqa: E402
+from orchestrator.turn import TurnSupervisor  # noqa: E402
 
 
 class FakeBot:
@@ -53,7 +54,11 @@ def make_bot(bubbles: BubbleManager) -> TelegramBot:
     b.bubbles = bubbles
     b._texts = {"subagent": "🤖 {agent}"}
     b.t = lambda k, **kw: b._texts[k].format(**kw)
-    b._last_action_was_reply = {}
+    b.turns = TurnSupervisor(
+        b.manager, b.t,
+        lambda tid, text: asyncio.sleep(0),
+        lambda tid: asyncio.sleep(0),
+    )
     return b
 
 

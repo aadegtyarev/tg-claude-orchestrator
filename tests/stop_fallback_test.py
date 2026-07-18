@@ -6,7 +6,7 @@
 долетает (остаётся в TUI/транскрипте). Реальный кейс noos: reply_to_telegram
 был в СЕРЕДИНЕ хода, а после него ещё шли Bash/Edit, и именно текст ПОСЛЕ них
 терялся — поэтому гейт не «reply был в ходе», а «reply было последним
-действием перед Stop» (_last_action_was_reply, сбрасывается любым другим
+действием перед Stop» (turn.TurnSupervisor, сбрасывается любым другим
 тул-вызовом).
 
 Запуск: .venv/bin/python tests/stop_fallback_test.py
@@ -20,7 +20,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from bot import TelegramBot  # noqa: E402
+from orchestrator.bot import TelegramBot  # noqa: E402
+from orchestrator.turn import TurnSupervisor  # noqa: E402
 
 
 def make_bot():
@@ -35,7 +36,13 @@ def make_bot():
     b.chat_id = -100
     b._texts = {"stop_fallback_prefix": "💬 (fallback)"}
     b.t = lambda k, **kw: b._texts[k]
-    b._last_action_was_reply = {}
+    # Реальный TurnSupervisor: проверяем настоящий Stop-гейт (note_tool/
+    # pop_reply_flag), Telegram-колбэки — заглушки.
+    b.turns = TurnSupervisor(
+        b.manager, b.t,
+        lambda tid, text: asyncio.sleep(0),
+        lambda tid: asyncio.sleep(0),
+    )
     b.bubbles = SimpleNamespace(append=lambda *a, **kw: asyncio.sleep(0))
 
     async def fake_send(chat_id, thread_id, text, reply_to=None):

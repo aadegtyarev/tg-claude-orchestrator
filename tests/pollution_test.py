@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sessions import _block_snippet, _scan_pollution  # noqa: E402
+from orchestrator.transcript import block_snippet as _block_snippet, scan_pollution as _scan_pollution  # noqa: E402
 
 
 def _asst(content: list) -> dict:
