@@ -14,9 +14,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import bot  # noqa: E402
-from bot import (  # noqa: E402
-    TelegramBot, _bash_head, _first_meaningful, _file_suffix,
+from orchestrator.bot import TelegramBot  # noqa: E402
+from orchestrator.toolline import (  # noqa: E402
+    bash_head as _bash_head,
+    file_suffix as _file_suffix,
+    first_meaningful as _first_meaningful,
 )
 
 

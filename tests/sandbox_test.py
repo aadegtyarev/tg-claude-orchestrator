@@ -18,9 +18,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-import sandbox  # noqa: E402
-from bashshell import BashSession  # noqa: E402
-from sessions import SessionManager  # noqa: E402
+from orchestrator import sandbox  # noqa: E402
+from orchestrator.bashshell import BashSession  # noqa: E402
+from orchestrator.sessions import SessionManager  # noqa: E402
 
 
 def test_build_argv_order():

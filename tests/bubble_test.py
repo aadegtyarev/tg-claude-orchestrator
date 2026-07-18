@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bubble import BubbleManager  # noqa: E402
+from orchestrator.bubble import BubbleManager  # noqa: E402
 
 _TEXTS = {"bubble_working": "Работаю", "bubble_stop": "Стоп"}
 
@@ -104,7 +104,7 @@ async def main():
 
     # разные tool НЕ схлопываются друг с другом; разные agent_id — тоже
     await bm.append(8, "🔧 <b>Edit</b> <code>x.py</code>", agent_id="a1", tool="Edit")
-    await bm.append(8, f"⚡ <b>Bash</b> <code>ls</code>", agent_id="a2", tool="Bash")  # другой агент
+    await bm.append(8, "⚡ <b>Bash</b> <code>ls</code>", agent_id="a2", tool="Bash")  # другой агент
     await _settle(bm, 8)
     assert len(bm._bubbles[8].entries) == 4, [e.render() for e in bm._bubbles[8].entries]
     print("OK разные tool/agent_id не схлопываются друг с другом")

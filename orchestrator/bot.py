@@ -32,48 +32,23 @@ from aiogram.types import (
     ReactionTypeEmoji,
 )
 
-from ansi import strip_ansi
-from bashshell import BashShellManager, clean as bash_clean
-from bubble import BubbleManager
-from config import Config
-# logsignals/mdrender/slug/ansi вынесены из этого модуля (REVIEW.md D1/D2);
-# alias-имена с подчёркиванием сохранены для обратной совместимости с тестами
-# (error_relay_test импортирует _API_ERR_BANNER_RE и др. из bot).
-from logsignals import (
-    API_ERR_BANNER_RE as _API_ERR_BANNER_RE,
-    classify_api_error as _classify_api_error,
-    detect_log_signals as _detect_log_signals,
-)
-from mdrender import md_to_html, split_text
-from sessions import Session, SessionError, SessionManager
-from slug import slugify
-from texts import get_texts
+from . import cbdata
+from .bashshell import BashShellManager, clean as bash_clean
+from .bubble import BubbleManager
+from .config import Config
+from .mdrender import md_to_html, split_text
+from .sessions import Session, SessionManager
+from .slug import slugify
+from .texts import get_texts
+from .toolline import AGENT_SPAWN_TOOLS as _AGENT_SPAWN_TOOLS, shorten, tool_line
+from .turn import TurnSupervisor
 
 logger = logging.getLogger(__name__)
 
-# Обрезка одной строки бабла / промежуточного ответа.
-LINE_LIMIT = 100
 # Лимит превью команды в запросе разрешения: показываем почти полностью,
 # чтобы можно было прочитать и принять осмысленное решение. 4096 (лимит ТГ)
 # минус шапка/описание; остаток маркируем, если урезали.
 PERM_PREVIEW_LIMIT = 3500
-
-# Индикатор «печатает…»: Telegram гасит его через ~5 с, обновляем чаще.
-TYPING_INTERVAL = 4.0
-
-# Сторож зависаний: если после отправки Claude молчит и claude.log не растёт
-# STALL_CHECKS проверок подряд — предупреждаем в топик (рост лога = живой
-# ход/размышление, отсутствие роста = завис).
-WATCHDOG_GRACE = 20.0
-WATCHDOG_CHECK = 15.0
-# Ретранслятор ошибок API из claude.log: как часто нюхать хвост, как часто
-# писать в чат (между любыми двумя алертами), и сколько глушить ОДНУ И ТУ ЖЕ
-# ошибку — чтобы 10-минутная петля 400-х не родила 10 одинаковых сообщений.
-ERROR_RELAY_INTERVAL = 6.0
-ERROR_RELAY_COOLDOWN = 60.0
-ERROR_RELAY_REPEAT = 600.0
-# Живой сигнал ретраев: пере-файр при росте attempt, но не чаще раза в N сек.
-RETRY_SURFACE_INTERVAL = 30.0
 
 # /bash: как часто перечитывать вывод и перерисовывать статус-сообщение,
 # сколько ждать команду и сколько текста показывать (лимит Telegram — 4096,
@@ -81,7 +56,6 @@ RETRY_SURFACE_INTERVAL = 30.0
 BASH_POLL_INTERVAL = 1.5
 BASH_TIMEOUT = 600.0
 BASH_OUTPUT_LIMIT = 3500
-STALL_CHECKS = 2
 
 # Окно контекста для процента в /stats. Захардкожено грубо: у моделей с
 # 1M-окном цифра будет занижать реальный запас — это ориентир, не факт.
@@ -90,134 +64,6 @@ CONTEXT_WINDOW = 200_000
 # Синонимы моделей для кнопок /model. Маппинг на конкретные версии делает
 # сам Claude Code — мы не дублируем его каталог и не отстаём от переименований.
 MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
-
-# Иконки инструментов для статус-бабла. "Agent" — актуальное имя тула спавна
-# сабагента (Claude Code ≥2.1); "Task" — синоним для более старых версий,
-# оставлен для совместимости (проверять tool == "Task" or tool == "Agent"
-# было бы дублированием — см. _AGENT_SPAWN_TOOLS).
-TOOL_ICONS = {
-    "Bash": "⚡", "Read": "📖", "Write": "✍️", "Edit": "✏️",
-    "NotebookEdit": "✏️", "Grep": "🔍", "Glob": "🗂", "WebFetch": "🌐",
-    "WebSearch": "🔎", "Agent": "🤖", "Task": "🤖", "TodoWrite": "📝",
-}
-# Имена тула, которым Claude Code спавнит сабагента — менялось между версиями
-# (REVIEW: 2.1.214 использует "Agent", не "Task" — из-за этого бабл раньше не
-# распознавал спавн и падал в generic-фолбэк, показывая description без имени
-# агента). Держим оба, чтобы не отвалиться на следующем переименовании тоже.
-_AGENT_SPAWN_TOOLS = frozenset({"Agent", "Task"})
-# Из какого поля брать деталь и показывать ли её как имя файла (basename).
-# TaskCreate/TaskUpdate — тему/статус вместо сырого JSON-объекта целиком.
-_TOOL_DETAIL = {
-    "Bash": ("command", False), "Read": ("file_path", True),
-    "Write": ("file_path", True), "Edit": ("file_path", True),
-    "NotebookEdit": ("notebook_path", True), "Grep": ("pattern", False),
-    "Glob": ("pattern", False), "WebFetch": ("url", False),
-    "WebSearch": ("query", False),
-    "TaskCreate": ("subject", False), "TaskUpdate": ("status", False),
-}
-
-# Поля сторонних/незнакомых инструментов, из которых тянем осмысленную деталь —
-# по порядку предпочтения (имя файла/путь важнее «описания»).
-_MEANINGFUL_FIELDS = (
-    "file_path", "path", "notebook_path", "pattern", "query",
-    "url", "command", "subject", "description", "prompt", "text",
-)
-
-# Дробим bash-команду по конвейерам и связкам; «словесный» аргумент
-# (подкоманду: log/test/status) отличаем от флагов и путей.
-_BASH_SEP = re.compile(r"\s*(?:&&|\|\||\||;)\s*")
-_WORD_ARG = re.compile(r"^[A-Za-z][\w:-]*$")
-
-
-def _first_meaningful(tool_input: dict) -> str:
-    """Первый осмысленный строковый аргумент стороннего инструмента.
-
-    Сырой JSON в бабле не показываем — он не помещается в строку и шумит.
-    """
-    for key in _MEANINGFUL_FIELDS:
-        value = tool_input.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def _file_suffix(tool: str, tool_input: dict) -> str:
-    """Короткий контекст к имени файла: какие строки читаем/сколько правим.
-
-    Read c offset/limit → « L10–34»; Edit → « ±N строк»; замена по всему файлу
-    → « ×N». Ничего осмысленного нет — пустая строка.
-    """
-    if tool == "Read":
-        try:
-            off = int(tool_input.get("offset"))
-        except (TypeError, ValueError):
-            return ""
-        try:
-            lim = int(tool_input.get("limit"))
-            return f" L{off}–{off + lim}"
-        except (TypeError, ValueError):
-            return f" L{off}+"
-    if tool in ("Edit", "NotebookEdit"):
-        old = str(tool_input.get("old_string") or "")
-        if tool_input.get("replace_all"):
-            return " (все)"
-        n = old.count("\n") + 1 if old else 0
-        return f" ±{n} стр" if n else ""
-    return ""
-
-
-def _bash_head(command: str) -> str:
-    """Короткая «голова» bash-команды: куда cd + имя команды (+ подкоманда).
-
-    Ведущий `cd …` раньше выкидывали, но каталог работы — полезный контекст
-    (какой ворктREE/папка), поэтому показываем его basename. Флаги и длинные
-    аргументы отбрасываем: строчка должна помещаться в бабел в одну строку.
-    """
-    cmd = command.strip()
-    cd_dest = ""
-    head = ""
-    for segment in _BASH_SEP.split(cmd):
-        segment = segment.strip()
-        if not segment:
-            continue
-        if segment.startswith("cd "):
-            dest = segment[3:].strip().strip("\"'")
-            cd_dest = Path(dest).name or dest
-            continue
-        head = segment
-        break
-    if not head:
-        return cd_dest or cmd  # вся команда — это cd
-    parts = head.split()
-    main = parts[0] if parts else ""
-    sub = parts[1] if len(parts) > 1 else ""
-    if sub and not _WORD_ARG.match(sub):
-        sub = ""  # флаг (-n), путь (/x) или кавычка (") — не интересно
-    body = f"{main} {sub}".strip()
-    return f"{cd_dest} · {body}" if cd_dest else body
-
-
-# ── markdown → Telegram HTML ───────────────────────────────────
-# Рендер (md_to_html) и разбивка текста (split_text), а также разбор сигналов
-# claude.log (_detect_log_signals и др.) вынесены в mdrender.py и logsignals.py
-# (см. импорты вверху). alias-имена с подчёркиванием сохранены для обратной
-# совместимости с тестами (from bot import split_text / _API_ERR_BANNER_RE …).
-
-
-def _read_log_delta(path: Path, offset: int) -> tuple[bytes, int]:
-    """Прочитать приращение лога с offset: (сырой delta, новый offset=size).
-
-    Если файл стал меньше offset (resume/ротация/усечение) — читаем с начала.
-    Чистая функция над файлом — тестируется без петли/Telegram (REVIEW.md B5).
-    Бросает OSError наружу (вызывающий continue'ит).
-    """
-    size = path.stat().st_size
-    if offset > size:
-        offset = 0
-    with open(path, "rb") as fh:
-        fh.seek(offset)
-        delta = fh.read(size - offset)
-    return delta, size
 
 
 class TelegramBot:
@@ -231,26 +77,36 @@ class TelegramBot:
         self.bubbles = BubbleManager(
             self.bot, lambda: self.chat_id, self.t, config.delete_bubble
         )
-        # thread_id -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
-        self._typing: dict[int, asyncio.Task] = {}
-        # thread_id -> сторож зависаний (стартует/гаснет вместе с typing).
-        self._watchdogs: dict[int, asyncio.Task] = {}
-        # thread_id -> ретранслятор ошибок API (rate-limit/5xx) из claude.log.
-        self._error_relays: dict[int, asyncio.Task] = {}
-        # thread_id -> было ли ПОСЛЕДНЕЕ действие модели (до этого Stop-события)
-        # вызовом reply_to_telegram. Гейт для handle_stop_event: длинный ход
-        # часто заканчивается голым текстом вместо tool-вызова — этот текст
-        # канал не видит и он не долетает до Telegram (REVIEW.md: 9/9 длинных
-        # ходов в живой сессии теряли финал именно так). ВАЖНО: это не «reply
-        # был где-то в ходе» — reply мог случиться в середине, а потом ещё
-        # шли Bash/Edit и голый текст после них уже потерян. Поэтому флаг
-        # ставится True на reply_to_telegram и явно сбрасывается в False
-        # любым ДРУГИМ тул-вызовом — остаётся True только если reply был
-        # самым последним, что видел бот перед Stop.
-        self._last_action_was_reply: dict[int, bool] = {}
+        # Фоновые задачи хода (typing/watchdog/error-relay) и Stop-гейт —
+        # единым владельцем (turn.py). Telegram-специфика — колбэками.
+        self.turns = TurnSupervisor(
+            manager, self.t, self._send_to_topic, self._typing_action
+        )
         # /bash — постоянный терминал на топик, в обход Claude Code.
         self.bash = BashShellManager()
         self._register_handlers()
+
+    async def _send_to_topic(self, thread_id: int, text: str) -> None:
+        """Колбэк TurnSupervisor: сообщение в топик привязанного чата."""
+        if self.chat_id is None:
+            return
+        await self._send(self.chat_id, thread_id, text)
+
+    async def _typing_action(self, thread_id: int) -> bool:
+        """Колбэк TurnSupervisor: один chat-action «печатает…».
+
+        False — чат не привязан, циклу typing нет смысла жить.
+        """
+        chat_id = self.chat_id
+        if chat_id is None:
+            return False
+        try:
+            await self.bot.send_chat_action(
+                chat_id=chat_id, action="typing", message_thread_id=thread_id
+            )
+        except Exception as e:
+            logger.debug("typing (топик %s): %s", thread_id, e)
+        return True
 
     def t(self, key: str, **kwargs) -> str:
         return self._texts[key].format(**kwargs)
@@ -430,8 +286,9 @@ class TelegramBot:
             raw = raw[1:-1].strip()
         if not raw:
             return "", None
-        # Путь = токен, начинающийся с / или ~ (домашняя папка).
-        is_path = lambda tok: tok.startswith("/") or tok.startswith("~")
+        def is_path(tok: str) -> bool:
+            # Путь = токен, начинающийся с / или ~ (домашняя папка).
+            return tok.startswith("/") or tok.startswith("~")
         if is_path(raw):
             return Path(raw).name, raw
         tokens = raw.split()
@@ -467,10 +324,10 @@ class TelegramBot:
                 line += f"\n     📁 {s.linked_path}"
             lines.append(line)
             row = [InlineKeyboardButton(
-                text=f"📊 {s.title}", callback_data=f"sess:stats:{s.thread_id}")]
+                text=f"📊 {s.title}", callback_data=cbdata.sess_cb("stats", s.thread_id))]
             if s.running:
                 row.append(InlineKeyboardButton(
-                    text="⏸", callback_data=f"sess:close:{s.thread_id}"))
+                    text="⏸", callback_data=cbdata.sess_cb("close", s.thread_id)))
             rows.append(row)
         await message.reply(
             "\n".join(lines),
@@ -669,7 +526,7 @@ class TelegramBot:
         if session is None:
             await message.reply(self.t("only_topic"))
             return
-        self._stop_typing(session.thread_id)
+        self.turns.stop(session.thread_id)
         await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.close(session)
@@ -686,10 +543,10 @@ class TelegramBot:
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text=self.t("delete_confirm_yes"),
-                callback_data=f"del:{session.thread_id}:yes"),
+                callback_data=cbdata.delete_cb(session.thread_id, "yes")),
             InlineKeyboardButton(
                 text=self.t("delete_confirm_no"),
-                callback_data=f"del:{session.thread_id}:no"),
+                callback_data=cbdata.delete_cb(session.thread_id, "no")),
         ]])
         await message.reply(
             self.t("delete_confirm", title=session.title), reply_markup=markup
@@ -700,11 +557,11 @@ class TelegramBot:
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
-        try:
-            _, thread_raw, verdict = (callback.data or "").split(":", 2)
-            session = self.manager.get(int(thread_raw))
-        except ValueError:
+        parsed = cbdata.parse_delete(callback.data or "")
+        if parsed is None:
             session, verdict = None, "no"
+        else:
+            session, verdict = self.manager.get(parsed[0]), parsed[1]
         if session is None:
             await callback.answer(self.t("delete_gone"))
             await self._strip_markup(callback)
@@ -714,8 +571,7 @@ class TelegramBot:
             await self._edit_or_pass(callback, self.t("delete_canceled", title=session.title))
             return
         await callback.answer(self.t("delete_doing"))
-        self._stop_typing(session.thread_id)
-        self._last_action_was_reply.pop(session.thread_id, None)
+        self.turns.forget(session.thread_id)
         await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.delete(session)
@@ -882,7 +738,7 @@ class TelegramBot:
             await self._switch_model(session, arg, message)
             return
         buttons = [
-            InlineKeyboardButton(text=alias, callback_data=f"model:{session.thread_id}:{alias}")
+            InlineKeyboardButton(text=alias, callback_data=cbdata.model_cb(session.thread_id, alias))
             for alias in MODEL_ALIASES
         ]
         model = await asyncio.to_thread(self._model_display, session)
@@ -895,14 +751,12 @@ class TelegramBot:
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
-        try:
-            _, thread_raw, alias = (callback.data or "").split(":", 2)
-            session = self.manager.get(int(thread_raw))
-        except ValueError:
-            session = None
-        if session is None:
+        parsed = cbdata.parse_model(callback.data or "")
+        session = self.manager.get(parsed[0]) if parsed else None
+        if parsed is None or session is None:
             await callback.answer(self.t("stop_not_active"))
             return
+        alias = parsed[1]
         await callback.answer(self.t("model_switching_btn", model=alias))
         if isinstance(callback.message, Message):
             await self._switch_model(session, alias, callback.message)
@@ -913,7 +767,7 @@ class TelegramBot:
         status = await message.answer(
             self.t("model_switching", name=session.title, model=model)
         )
-        self._stop_typing(session.thread_id)
+        self.turns.stop(session.thread_id)
         await self.bubbles.close(session.thread_id)
         try:
             resumed = await self.manager.set_model(session, model)
@@ -929,19 +783,17 @@ class TelegramBot:
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
-        try:
-            _, action, thread_raw = (callback.data or "").split(":", 2)
-            session = self.manager.get(int(thread_raw))
-        except ValueError:
-            session = None
-        if session is None or not isinstance(callback.message, Message):
+        parsed = cbdata.parse_sess(callback.data or "")
+        session = self.manager.get(parsed[1]) if parsed else None
+        if parsed is None or session is None or not isinstance(callback.message, Message):
             await callback.answer(self.t("session_not_found"))
             return
+        action = parsed[0]
         if action == "stats":
             await callback.answer()
             await callback.message.answer(await asyncio.to_thread(self._stats_text, session))
         elif action == "close":
-            self._stop_typing(session.thread_id)
+            self.turns.stop(session.thread_id)
             await self.bubbles.close(session.thread_id)
             await self.manager.close(session)
             await callback.answer(self.t("sess_closed", name=session.title))
@@ -1108,172 +960,7 @@ class TelegramBot:
         # Для фото/документов текст живёт в caption, не в text — берём оба.
         snippet = html.escape(self._shorten(message.text or message.caption or "", 28))
         await self.bubbles.append(session.thread_id, f"📨 {snippet}")
-        self._start_typing(session.thread_id)
-
-    # ── индикатор «печатает…» ───────────────────────────────────
-
-    def _start_typing(self, thread_id: int) -> None:
-        """«печатает…» + сторож зависаний на время обработки запроса.
-
-        Оба гаснут финальным ответом (_stop_typing в handle_reply).
-        """
-        self._stop_typing(thread_id)
-        self._typing[thread_id] = asyncio.create_task(self._typing_loop(thread_id))
-        self._watchdogs[thread_id] = asyncio.create_task(self._watchdog_loop(thread_id))
-        self._error_relays[thread_id] = asyncio.create_task(self._error_relay_loop(thread_id))
-
-    def _stop_typing(self, thread_id: int) -> None:
-        for registry in (self._typing, self._watchdogs, self._error_relays):
-            task = registry.pop(thread_id, None)
-            if task is not None:
-                task.cancel()
-
-    async def _watchdog_loop(self, thread_id: int) -> None:
-        """Если Claude молчит И claude.log не растёт несколько проверок подряд —
-        это зависание (а не долгое размышление): предупреждаем в топик.
-        """
-        session = self.manager.get(thread_id)
-        if session is None:
-            return
-        log = session.session_dir / "claude.log"
-        await asyncio.sleep(WATCHDOG_GRACE)
-        try:
-            last_size = log.stat().st_size
-        except OSError:
-            last_size = 0
-        stalls = 0
-        while True:
-            await asyncio.sleep(WATCHDOG_CHECK)
-            try:
-                size = log.stat().st_size
-            except OSError:
-                size = last_size
-            # Жизнь = лог растёт ИЛИ claude (с потомками-тулами) ест CPU.
-            # Одних байт мало: спиннер «almost done» может на секунды замолчать
-            # в нормальной работе, и это не зависание.
-            alive = size != last_size or self.manager.is_busy(session)
-            last_size = size
-            stalls = 0 if alive else stalls + 1
-            if stalls < STALL_CHECKS:
-                continue
-            # Завис: снимаем «печатает», шлём диагностику один раз.
-            t = self._typing.pop(thread_id, None)
-            if t is not None:
-                t.cancel()
-            tail = await asyncio.to_thread(self.manager.tail_log, session, 10)
-            msg = self.t("stalled")
-            if tail:
-                msg += "\n\n" + self.t("session_died_tail", tail=tail[:1200])
-            await self._send(self.chat_id, thread_id, msg)
-            return
-
-    async def _error_relay_loop(self, thread_id: int) -> None:
-        """Транслировать в чат, что Claude делает, когда тулов ещё нет.
-
-        Сигналы нюхаем из ПРИРАЩЕНИЯ claude.log (отрисовка TUI) с момента старта
-        хода; разбирает их _detect_log_signals. Три класса:
-          1. «API Error: <код>» — настоящая ошибка API. Триггер — именно баннер с
-             кодом, не слова «rate-limit» в прозе ответов (раньше ловили ложное).
-             Класс задаёт действие: rate-limit→/model, 400-протокол→/clear,
-             прочее→«задерживается». Раз в ERROR_RELAY_COOLDOWN, та же — REPEAT.
-          2. Ретрай «attempt K/M» — ЖИВОЙ: пере-файр при росте K (видно прогресс
-             3/100 → 47/100), throttle RETRY_SURFACE_INTERVAL. Главное против
-             «5 минут тишины, непонятно что делает».
-          3. Краш-рестарт «Resume this session» mid-хода — Claude упал и поднялся.
-             Растёт счётчик → предупреждаем (раз в COOLDOWN), намекаем /close_session.
-        """
-        session = self.manager.get(thread_id)
-        if session is None or self.chat_id is None:
-            return
-        log = session.session_dir / "claude.log"
-        await asyncio.sleep(WATCHDOG_GRACE)
-        try:
-            offset = log.stat().st_size  # всё, что уже в логе до хода, — не наше
-        except OSError:
-            return
-        last_surfaced = -ERROR_RELAY_COOLDOWN
-        last_sig: str | None = None
-        last_sig_at = -ERROR_RELAY_REPEAT
-        last_retry_k = 0
-        last_retry_at = -RETRY_SURFACE_INTERVAL
-        restart_count = 0
-        last_restart_at = -ERROR_RELAY_COOLDOWN
-        loop_time = asyncio.get_running_loop().time
-
-        async def _surf(text: str) -> None:
-            try:
-                await self._send(self.chat_id, thread_id, text)
-            except Exception as e:
-                logger.debug("error_relay: не удалось отправить: %s", e)
-
-        while True:
-            await asyncio.sleep(ERROR_RELAY_INTERVAL)
-            # Читаем ТОЛЬКО приращение с прошлого тика (seek), а не весь лог
-            # целиком каждый тик (REVIEW.md B5). _read_log_delta — чистая функция
-            # (тестируется отдельно), сама разруливает усечение/ротацию.
-            try:
-                delta, offset = _read_log_delta(log, offset)
-            except OSError:
-                continue
-            chunk = strip_ansi(delta)
-            sig = _detect_log_signals(chunk)
-            now = loop_time()
-
-            # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
-            if sig["api_error"]:
-                code, klass = sig["api_error"]
-                s = f"{code.decode()}:{klass}"
-                cooled = now - last_surfaced >= ERROR_RELAY_COOLDOWN
-                fresh = not (s == last_sig and now - last_sig_at < ERROR_RELAY_REPEAT)
-                if cooled and fresh:
-                    last_surfaced = now
-                    last_sig, last_sig_at = s, now
-                    msg = self.t(f"api_error_{klass}")
-                    if klass == "protocol":
-                        # Прочитать загрязнённый контекст и приложить эксцепт —
-                        # чтобы было видно, ЧТО именно отравлено (чужой бэкенд).
-                        try:
-                            excerpt = await asyncio.to_thread(
-                                self.manager.read_pollution_excerpt, session
-                            )
-                        except Exception as e:  # релей не должен падать на чтении
-                            excerpt = None
-                            logger.debug("error_relay: pollution excerpt: %s", e)
-                        if excerpt:
-                            msg += "\n\n" + self.t(
-                                "api_error_pollution_tail", excerpt=excerpt
-                            )
-                    await _surf(msg)
-
-            # 2. Живой ретрай: пере-файр, когда attempt вырос — чтобы было видно
-            #    прогресс (3/100 → 47/100), а не одна тишина. Throttle — RETRY_SURFACE_INTERVAL.
-            if sig["retry"]:
-                k, total = sig["retry"]
-                if k > last_retry_k and now - last_retry_at >= RETRY_SURFACE_INTERVAL:
-                    last_retry_k = k
-                    last_retry_at = now
-                    await _surf(self.t("api_retrying", attempt=k, total=total))
-
-            # 3. Краш-рестарт-луп: баннер «Resume this session» mid-хода = Claude
-            #    упал и поднялся. Растёт счётчик — предупреждаем (раз в COOLDOWN).
-            if sig["restarts"]:
-                restart_count += sig["restarts"]
-                if now - last_restart_at >= ERROR_RELAY_COOLDOWN:
-                    last_restart_at = now
-                    await _surf(self.t("session_restart_loop", count=restart_count))
-
-    async def _typing_loop(self, thread_id: int) -> None:
-        while True:
-            chat_id = self.chat_id
-            if chat_id is None:
-                return
-            try:
-                await self.bot.send_chat_action(
-                    chat_id=chat_id, action="typing", message_thread_id=thread_id
-                )
-            except Exception as e:
-                logger.debug("typing (топик %s): %s", thread_id, e)
-            await asyncio.sleep(TYPING_INTERVAL)
+        self.turns.start(session.thread_id)
 
     # ── ответы: Claude -> Telegram ──────────────────────────────
 
@@ -1289,7 +976,7 @@ class TelegramBot:
 
         if data.get("file_path"):
             if thread_id is not None:
-                self._stop_typing(thread_id)
+                self.turns.stop(thread_id)
             await self._send_file(
                 chat_id, thread_id,
                 str(data["file_path"]), str(data.get("caption", "")), reply_to,
@@ -1313,7 +1000,7 @@ class TelegramBot:
         # не крутился вечно. Сначала уведомляющее сообщение (тянет чат вниз),
         # потом чистка тихого бабла — окна «ответа ещё нет» не остаётся.
         if thread_id is not None:
-            self._stop_typing(thread_id)
+            self.turns.stop(thread_id)
         if text:
             await self._send(chat_id, thread_id, text, reply_to)
         if thread_id is not None:
@@ -1395,8 +1082,8 @@ class TelegramBot:
         tool = str(payload.get("tool_name") or "?")
         # reply_to_telegram — единственное действие, после которого «до Stop
         # больше ничего не потерять» истинно; ЛЮБОЙ другой тул (в т.ч.
-        # send_file_to_telegram) сбрасывает флаг — см. _last_action_was_reply.
-        self._last_action_was_reply[session.thread_id] = "reply_to_telegram" in tool
+        # send_file_to_telegram) сбрасывает флаг — см. turn.TurnSupervisor.
+        self.turns.note_tool(session.thread_id, "reply_to_telegram" in tool)
         if "reply_to_telegram" in tool:
             return  # результат и так придёт сообщением — в бабле это шум
         if "send_file_to_telegram" in tool:
@@ -1440,8 +1127,7 @@ class TelegramBot:
         if session is None or self.chat_id is None:
             return
         thread_id = session.thread_id
-        last_was_reply = self._last_action_was_reply.get(thread_id, False)
-        self._last_action_was_reply[thread_id] = False  # новое окно до следующего Stop
+        last_was_reply = self.turns.pop_reply_flag(thread_id)
         if last_was_reply:
             return
         text = str(payload.get("last_assistant_message") or "").strip()
@@ -1450,45 +1136,10 @@ class TelegramBot:
         await self._send(self.chat_id, thread_id, f"{self.t('stop_fallback_prefix')}\n{text}")
 
     def _tool_line(self, tool: str, tool_input: dict) -> str:
-        """HTML-строка бабла: иконка + имя жирным + короткая деталь моноширинно.
+        """HTML-строка бабла для вызова инструмента (логика — toolline.py)."""
+        return tool_line(tool, tool_input, self.t)
 
-        Деталь режем до осмысленного кусочка в одну строку: длинные bash-команды
-        показываем «головой» (имя команды + подкоманда), у TaskCreate берём
-        тему, у незнакомых тулов — первый строковый аргумент, а не весь JSON.
-        """
-        icon = TOOL_ICONS.get(tool, "🔧")
-        if tool in _AGENT_SPAWN_TOOLS:
-            # t("subagent") уже содержит иконку 🤖 — свою не добавляем.
-            agent = html.escape(str(tool_input.get("subagent_type") or "agent"))
-            desc = html.escape(self._shorten(str(tool_input.get("description") or "")))
-            base = f"<b>{self.t('subagent', agent=agent)}</b>"
-            return f"{base}: <i>{desc}</i>" if desc else base
-
-        if tool == "TodoWrite":
-            todos = tool_input.get("todos")
-            detail = f"{len(todos)} задач" if isinstance(todos, list) else ""
-        elif tool == "Bash":
-            detail = _bash_head(str(tool_input.get("command") or ""))
-        else:
-            field, as_name = _TOOL_DETAIL.get(tool, (None, False))
-            if field:
-                detail = str(tool_input.get(field, "")).strip()
-                if as_name and detail:
-                    detail = Path(detail).name  # длинный путь → имя файла
-                    suffix = _file_suffix(tool, tool_input)  # строки/диапазон
-                    if suffix:
-                        detail += suffix
-            else:
-                detail = _first_meaningful(tool_input)  # сторонний тул — не JSON
-
-        detail = html.escape(self._shorten(detail))
-        head = f"{icon} <b>{html.escape(tool)}</b>"
-        return f"{head} <code>{detail}</code>" if detail else head
-
-    @staticmethod
-    def _shorten(text: str, limit: int = LINE_LIMIT) -> str:
-        text = " ".join(text.split())
-        return text[:limit] + "…" if len(text) > limit else text
+    _shorten = staticmethod(shorten)
 
     # ── permission relay: Claude Code -> Telegram -> Claude Code ──
 
@@ -1511,10 +1162,10 @@ class TelegramBot:
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text=self.t("perm_allow"),
-                callback_data=f"perm:{session.thread_id}:{request_id}:allow"),
+                callback_data=cbdata.perm_cb(session.thread_id, request_id, "allow")),
             InlineKeyboardButton(
                 text=self.t("perm_deny"),
-                callback_data=f"perm:{session.thread_id}:{request_id}:deny"),
+                callback_data=cbdata.perm_cb(session.thread_id, request_id, "deny")),
         ]])
         try:
             await self.bot.send_message(
@@ -1531,15 +1182,12 @@ class TelegramBot:
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
-        try:
-            prefix, behavior = (callback.data or "").rsplit(":", 1)
-            _, thread_raw, request_id = prefix.split(":", 2)
-            session = self.manager.get(int(thread_raw))
-        except ValueError:
-            session = None
-        if session is None:
+        parsed = cbdata.parse_perm(callback.data or "")
+        session = self.manager.get(parsed[0]) if parsed else None
+        if parsed is None or session is None:
             await callback.answer(self.t("stop_not_active"))
             return
+        _, request_id, behavior = parsed
         try:
             await self.manager.send_permission(session, request_id, behavior)
         except Exception as e:
@@ -1566,9 +1214,8 @@ class TelegramBot:
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
-        try:
-            thread_id = int((callback.data or "").split(":", 1)[1])
-        except (IndexError, ValueError):
+        thread_id = cbdata.parse_stop(callback.data or "")
+        if thread_id is None:
             await callback.answer()
             return
         session = self.manager.get(thread_id)
@@ -1588,7 +1235,7 @@ class TelegramBot:
                         inline_keyboard=[[
                             InlineKeyboardButton(
                                 text=self.t("bubble_stopping"),
-                                callback_data=f"stop:{thread_id}")]]))
+                                callback_data=cbdata.stop_cb(thread_id))]]))
                 except Exception:
                     pass
         except Exception as e:
@@ -1624,7 +1271,7 @@ class TelegramBot:
         """Колбэк SessionManager: Claude умер сам по себе."""
         if self.chat_id is None:
             return
-        self._stop_typing(session.thread_id)
+        self.turns.stop(session.thread_id)
         await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         text = self.t("session_died", name=session.title, code=code)
@@ -1638,7 +1285,7 @@ class TelegramBot:
         if self.chat_id is None:
             return
         for session in sessions:
-            self._stop_typing(session.thread_id)
+            self.turns.stop(session.thread_id)
             await asyncio.to_thread(self.bash.close, session.thread_id)
             await self.bubbles.close(session.thread_id)
             await self._send(
@@ -1680,14 +1327,14 @@ class TelegramBot:
                 sent = False
                 if use_html:
                     try:
-                        msg = await self.bot.send_message(text=hchunk, parse_mode="HTML", **kwargs)
+                        await self.bot.send_message(text=hchunk, parse_mode="HTML", **kwargs)
                         sent = True
                     except Exception as e:
                         logger.warning("HTML-отправка не удалась, фолбэк на plain: %s", e)
                         use_html = False
                 if not sent:
                     try:
-                        msg = await self.bot.send_message(text=plain, **kwargs)
+                        await self.bot.send_message(text=plain, **kwargs)
                         sent = True
                     except Exception:
                         if "reply_to_message_id" in kwargs:

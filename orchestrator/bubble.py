@@ -31,6 +31,8 @@ from typing import Callable
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from . import cbdata
+
 logger = logging.getLogger(__name__)
 
 # Лимит текста бабла и минимальный интервал редактирования сообщения.
@@ -151,7 +153,7 @@ class BubbleManager:
         # reply_markup нужен и при edit — иначе Telegram снимает кнопку.
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text=self._t("bubble_stop"), callback_data=f"stop:{thread_id}"
+                text=self._t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)
             )
         ]])
         try:
