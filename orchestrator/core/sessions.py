@@ -849,6 +849,21 @@ class SessionManager:
         ) as resp:
             resp.raise_for_status()
 
+    def interrupt_turn(self, session: Session) -> None:
+        """Жёстко прервать текущий ход: Esc прямо в PTY-терминал Claude.
+
+        В channels-протоколе прерывания нет, но интерактивный claude живёт под
+        нашим PTY — байт \\x1b эквивалентен нажатию Esc в TUI и обрывает ход
+        немедленно (в отличие от «мягкого стопа» push-сообщением, которое
+        модель прочитает только когда доберётся). Контекст сессии сохраняется.
+        """
+        if session.pty_master is None or not session.running:
+            raise SessionError("Сессия не запущена.")
+        try:
+            os.write(session.pty_master, b"\x1b")
+        except OSError as e:
+            raise SessionError(f"Терминал сессии недоступен: {e}") from e
+
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""
         if session.pty_master is None or not session.running:

@@ -230,10 +230,15 @@ class TelegramAdapter:
     # ── Transport: статус-бабл ──────────────────────────────────
 
     def _stop_markup(self, thread_id: int) -> InlineKeyboardMarkup:
+        # ⏹ — мягкий стоп (push «сверни работу и отчитайся»);
+        # ⛔ — жёсткое прерывание: Esc в PTY, как в TUI (ход обрывается сразу).
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)
-            )
+            ),
+            InlineKeyboardButton(
+                text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)
+            ),
         ]])
 
     async def bubble_post(
@@ -371,6 +376,7 @@ class TelegramAdapter:
         # Последним: неизвестные /команды уходят в терминал Claude.
         dp.message.register(self.on_slash, F.text.startswith("/"))
         dp.callback_query.register(self.on_stop_button, F.data.startswith("stop:"))
+        dp.callback_query.register(self.on_esc_button, F.data.startswith("esc:"))
         dp.callback_query.register(self.on_model_button, F.data.startswith("model:"))
         dp.callback_query.register(self.on_session_button, F.data.startswith("sess:"))
         dp.callback_query.register(self.on_perm_button, F.data.startswith("perm:"))
@@ -940,6 +946,25 @@ class TelegramAdapter:
                     pass
         except Exception as e:
             logger.error("Сессия %s: не удалось отправить стоп: %s", session.name, e)
+            await callback.answer(self.t("stop_fail"))
+
+    async def on_esc_button(self, callback: CallbackQuery) -> None:
+        """Жёсткое прерывание хода — Esc в PTY-терминал сессии (как в TUI)."""
+        if not self._user_allowed(callback.from_user):
+            await callback.answer()
+            return
+        thread_id = cbdata.parse_esc(callback.data or "")
+        session = self._session_by_thread(thread_id) if thread_id is not None else None
+        if session is None:
+            await callback.answer(self.t("stop_not_active"))
+            return
+        try:
+            await self.core.hard_stop(session)
+            await callback.answer(self.t("esc_requested"))
+        except UserError as e:
+            await callback.answer(str(e))
+        except Exception as e:
+            logger.error("Сессия %s: не удалось прервать: %s", session.name, e)
             await callback.answer(self.t("stop_fail"))
 
     # ── отправка ────────────────────────────────────────────────

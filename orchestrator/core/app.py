@@ -306,6 +306,21 @@ class OrchestratorCore:
         )
         await self.bubbles.append(session.name, self.t("bubble_stop_requested"))
 
+    async def hard_stop(self, session: Session) -> None:
+        """Жёсткое прерывание хода: Esc в PTY (см. sessions.interrupt_turn).
+
+        Ход обрывается сразу, финального ответа не будет — гасим сторожей и
+        бабл здесь же, иначе индикаторы висели бы до таймаута.
+        """
+        try:
+            self.manager.interrupt_turn(session)
+        except SessionError as e:
+            raise UserError(str(e)) from e
+        self.turns.stop(session.name)
+        await self.bubbles.close(session.name)
+        self._record(session, "status", status="interrupted")
+        await self.notice(session, self.t("esc_done"))
+
     async def slash_command(self, session: Session, cmd: str) -> None:
         """Неизвестные /команды — прямо в терминал Claude (команды Claude Code)."""
         try:

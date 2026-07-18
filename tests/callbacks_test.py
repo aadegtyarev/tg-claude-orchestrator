@@ -67,6 +67,9 @@ class FakeCore:
     async def soft_stop(self, s, origin):
         calls.append(("stop_sent",))
 
+    async def hard_stop(self, s):
+        calls.append(("esc_sent",))
+
     def stats_text(self, s):
         return "stats"
 
@@ -128,9 +131,20 @@ async def main():
     assert ("stop_sent",) in calls
     print("OK on_stop_button")
 
+    calls.clear()
+    await a.on_esc_button(cb("esc:7"))
+    assert ("esc_sent",) in calls
+    print("OK on_esc_button (жёсткое прерывание)")
+
+    calls.clear()
+    await a.on_esc_button(cb("esc:7", uid=999))  # чужой
+    assert not calls
+    print("OK on_esc_button denies stranger")
+
     # несуществующая сессия — все хендлеры не должны падать
     for data, h in [("model:5:o", a.on_model_button), ("sess:close:5", a.on_session_button),
-                    ("perm:5:abcde:allow", a.on_perm_button), ("stop:5", a.on_stop_button)]:
+                    ("perm:5:abcde:allow", a.on_perm_button), ("stop:5", a.on_stop_button),
+                    ("esc:5", a.on_esc_button)]:
         await h(cb(data))
     print("OK missing session handled")
 
