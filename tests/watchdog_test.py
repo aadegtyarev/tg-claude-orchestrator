@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.proctree import proc_tree_signals as _proc_tree_signals  # noqa: E402
-from orchestrator.sessions import Session, SessionManager  # noqa: E402
+from orchestrator.core.proctree import proc_tree_signals as _proc_tree_signals  # noqa: E402
+from orchestrator.core.sessions import Session, SessionManager  # noqa: E402
 
 
 def _burn(n: int = 3_000_000) -> int:
@@ -39,7 +39,7 @@ def main():
     # ── is_busy: после CPU-нагрузки — True (сессия жива) ──
     mgr = SessionManager(config=object())
     sess = Session(
-        name="t", thread_id=1, port=0, session_dir=Path("/tmp"),
+        name="t", port=0, session_dir=Path("/tmp"),
         claude_session_id="x",
         process=SimpleNamespace(pid=me, returncode=None),
     )

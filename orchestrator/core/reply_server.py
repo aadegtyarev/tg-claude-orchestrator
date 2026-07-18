@@ -1,6 +1,6 @@
 """HTTP-сервер оркестратора.
 
-POST /reply         — ответы Claude (тул reply_to_telegram через channel_server)
+POST /reply         — ответы Claude (тул reply_to_user через channel_server)
 POST /event/{name}  — события PreToolUse-хука Claude Code (вызовы инструментов)
 POST /stop/{name}   — конец хода (Stop-хук) — фолбэк на «потерянный финал»
 """
@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from .config import Config
+from ..config import Config
 
 logger = logging.getLogger(__name__)
 

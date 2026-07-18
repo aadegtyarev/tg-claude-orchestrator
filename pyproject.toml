@@ -2,8 +2,8 @@
 # устанавливается клоном репозитория (install.sh), поэтому build-system нет.
 
 [project]
-name = "tg-claude-orchestrator"
-description = "Telegram-обёртка над параллельными сессиями Claude Code (форум-топики, статус-бабл, песочница)"
+name = "claude-orchestrator"
+description = "Оркестратор параллельных сессий Claude Code: ядро + адаптеры (Telegram, Web), песочница, модули"
 requires-python = ">=3.10"
 dependencies = [
     "aiogram>=3.16,<4",
@@ -21,6 +21,8 @@ select = ["E", "F", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 # Каталог сообщений — длинные строки текстов естественны.
-"orchestrator/texts.py" = ["E501"]
+"orchestrator/core/texts.py" = ["E501"]
+# Инструкции канала для модели — длинные английские строки.
+"orchestrator/channel_server.py" = ["E501"]
 # Тесты содержат длинные литералы-фикстуры (реальные строки логов/баблов).
 "tests/*" = ["E501"]

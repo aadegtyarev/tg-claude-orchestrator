@@ -1,5 +1,5 @@
-"""Статус-бабл: редактируемое сообщение (или цепочка сообщений) в топике с
-ходом работы Claude.
+"""Статус-бабл: редактируемое сообщение (или цепочка сообщений) с ходом
+работы Claude.
 
 Строки (🔧 инструменты, 🤖 сабагенты, 💬 промежуточные ответы) дописываются по
 мере событий; сообщение редактируется на месте с троттлингом. Подряд идущие
@@ -12,12 +12,14 @@
 Если пользователь шлёт следующее сообщение до ответа модели (сессия ещё
 работает над предыдущим), старый бабл ЗАМОРАЖИВАЕТСЯ на месте (кнопка «Стоп»
 снимается, дальше не редактируется), а новый открывается независимо и копит
-уже новые события с нуля — история в чате остаётся линейной, ничего не прыгает
-(в отличие от прежнего fork(), который удалял старое сообщение и создавал
-новое — а на короткой дистанции это ещё и гонка: см. freeze_and_open).
+уже новые события с нуля — история в чате остаётся линейной, ничего не прыгает.
 Когда модель отвечает complete=True — close() разом убирает (удаляет/оставляет
 журналом, DELETE_BUBBLE) все замороженные сообщения этого диалогового цикла
 плюс текущий активный бабл.
+
+Состояние бабла (строки, схлопывание, троттлинг) — здесь, в ядре; доставка —
+через Transport-адаптеры: у каждого адаптера своё сообщение-бабл (Bubble.refs),
+ядро правит их все. Ключ — имя сессии.
 """
 
 from __future__ import annotations
@@ -26,12 +28,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
-from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-from . import cbdata
+if TYPE_CHECKING:
+    from .sessions import Session
+    from .transport import Transport
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +62,10 @@ class BubbleLine:
 
 @dataclass
 class Bubble:
-    """Состояние бабла одной сессии."""
+    """Состояние бабла одной сессии (общее для всех адаптеров)."""
 
-    message_id: int | None = None
+    # Ссылки на материализованные сообщения: имя адаптера -> ref адаптера.
+    refs: dict[str, str] = field(default_factory=dict)
     entries: list[BubbleLine] = field(default_factory=list)
     sent_text: str = ""
     flush_task: asyncio.Task | None = None
@@ -76,32 +78,32 @@ class Bubble:
 class BubbleManager:
     def __init__(
         self,
-        bot: Bot,
-        get_chat_id: Callable[[], int | None],
+        transports: Callable[[], "list[Transport]"],
+        get_session: Callable[[str], "Session | None"],
         t: Callable[..., str],
         delete_after: bool,
     ):
-        self._bot = bot
-        self._get_chat_id = get_chat_id
+        self._transports = transports
+        self._get_session = get_session
         self._t = t
         self._delete_after = delete_after
-        self._bubbles: dict[int, Bubble] = {}  # thread_id -> активный Bubble
-        # thread_id -> замороженные Bubble этого диалогового цикла (см. модуль
+        self._bubbles: dict[str, Bubble] = {}  # имя сессии -> активный Bubble
+        # имя сессии -> замороженные Bubble этого диалогового цикла (см. модуль
         # docstring) — убираются все разом на финальном close().
-        self._frozen: dict[int, list[Bubble]] = {}
-        self._active: set[int] = set()  # топики, где сейчас идёт ход Claude
+        self._frozen: dict[str, list[Bubble]] = {}
+        self._active: set[str] = set()  # сессии, где сейчас идёт ход Claude
 
-    def has(self, thread_id: int) -> bool:
+    def has(self, name: str) -> bool:
         """Есть ли активный бабл (используется как признак «работает»)."""
-        return thread_id in self._bubbles
+        return name in self._bubbles
 
-    def open(self, thread_id: int) -> None:
+    def open(self, name: str) -> None:
         """Начало хода: с этого момента append создаёт/наполняет бабл."""
-        self._active.add(thread_id)
+        self._active.add(name)
 
     async def append(
         self,
-        thread_id: int,
+        name: str,
         html: str,
         *,
         agent_id: str | None = None,
@@ -110,14 +112,14 @@ class BubbleManager:
         """Добавить строку (или схлопнуть с предыдущей, если tool задан и
         совпадает с последней строкой по (tool, agent_id) — см. BubbleLine).
 
-        tool=None — строка никогда не схлопывается (📨 сообщение юзера, 💬 стоп
+        tool=None — строка никогда не схлопывается (📨 сообщение юзера, ⏹ стоп
         запрошен и т.п.), agent_id=None — главный поток (без отступа).
         """
         # Событие после финала (запоздавший хук, «Стоп») не должно рождать
         # бабл-сироту — принимаем только внутри активного хода.
-        if thread_id not in self._active:
+        if name not in self._active:
             return
-        bubble = self._bubbles.setdefault(thread_id, Bubble())
+        bubble = self._bubbles.setdefault(name, Bubble())
         last = bubble.entries[-1] if bubble.entries else None
         if tool is not None and last is not None and last.tool == tool and last.agent_id == agent_id:
             last.html = html
@@ -129,7 +131,7 @@ class BubbleManager:
         while len(bubble.entries) > 1 and len(self._render_text(bubble)) > TEXT_LIMIT:
             bubble.entries.pop(0)
         if bubble.flush_task is None or bubble.flush_task.done():
-            bubble.flush_task = asyncio.create_task(self._flush(thread_id))
+            bubble.flush_task = asyncio.create_task(self._flush(name))
 
     def _render_text(self, bubble: Bubble) -> str:
         updated = time.strftime("%H:%M:%S", time.localtime(bubble.updated_at))
@@ -140,46 +142,30 @@ class BubbleManager:
             text += f"\n🕐 {updated}"
         return text
 
-    async def _flush(self, thread_id: int) -> None:
+    async def _flush(self, name: str) -> None:
         # Коалесцируем всплеск событий в одну правку сообщения.
         await asyncio.sleep(EDIT_INTERVAL)
-        bubble = self._bubbles.get(thread_id)
-        chat_id = self._get_chat_id()
-        if bubble is None or not bubble.entries or chat_id is None:
+        bubble = self._bubbles.get(name)
+        session = self._get_session(name)
+        if bubble is None or not bubble.entries or session is None:
             return
         text = self._render_text(bubble)
         if text == bubble.sent_text:
             return
-        # reply_markup нужен и при edit — иначе Telegram снимает кнопку.
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=self._t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)
-            )
-        ]])
-        try:
-            if bubble.message_id is None:
-                msg = await self._bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    message_thread_id=thread_id,
-                    disable_notification=True,
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                )
-                bubble.message_id = msg.message_id
-            else:
-                await self._bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=bubble.message_id,
-                    text=text,
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                )
-            # Фиксируем только после успешной отправки — иначе бабл
-            # «залипнет» на неотправленном тексте.
-            bubble.sent_text = text
-        except Exception as e:
-            logger.debug("Бабл (топик %s): %s", thread_id, e)
+        for tr in self._transports():
+            try:
+                ref = bubble.refs.get(tr.name)
+                if ref is None:
+                    new_ref = await tr.bubble_post(session, text, stop_button=True)
+                    if new_ref is not None:
+                        bubble.refs[tr.name] = new_ref
+                else:
+                    await tr.bubble_edit(session, ref, text, stop_button=True)
+            except Exception as e:
+                logger.debug("Бабл (%s/%s): %s", name, tr.name, e)
+        # Фиксируем после попытки доставки — следующий flush сравнит с этим
+        # текстом; неизменившийся текст не редактируется повторно.
+        bubble.sent_text = text
 
     async def _await_flush(self, bubble: Bubble) -> None:
         """Дождаться отложенной правки (или отправки), если она в очереди —
@@ -190,68 +176,63 @@ class BubbleManager:
             except Exception:
                 pass
 
-    async def _finish_message(self, bubble: Bubble, chat_id: int) -> None:
-        """Закрыть сообщение бабла: дождаться flush, удалить/оставить журналом."""
+    async def _finish_message(self, bubble: Bubble, session: "Session") -> None:
+        """Закрыть сообщения бабла: дождаться flush, удалить/оставить журналом."""
         await self._await_flush(bubble)
-        if bubble.message_id is None:
-            return
-        try:
-            if self._delete_after:
-                await self._bot.delete_message(chat_id=chat_id, message_id=bubble.message_id)
-            else:
-                # Бабл остаётся как журнал работы — снимаем только кнопку Стоп.
-                await self._bot.edit_message_reply_markup(
-                    chat_id=chat_id, message_id=bubble.message_id, reply_markup=None
-                )
-        except Exception as e:
-            logger.debug("Не удалось закрыть бабл: %s", e)
+        for tr in self._transports():
+            ref = bubble.refs.get(tr.name)
+            if ref is None:
+                continue
+            try:
+                await tr.bubble_finish(session, ref, delete=self._delete_after)
+            except Exception as e:
+                logger.debug("Не удалось закрыть бабл (%s): %s", tr.name, e)
 
-    async def _freeze_message(self, bubble: Bubble, chat_id: int) -> None:
-        """Заморозить сообщение на месте: дождаться последней правки, снять
-        кнопку «Стоп» (её контекст — устаревший ход), само сообщение НЕ
+    async def _freeze_message(self, bubble: Bubble, session: "Session") -> None:
+        """Заморозить сообщения на месте: дождаться последней правки, снять
+        кнопку «Стоп» (её контекст — устаревший ход), сами сообщения НЕ
         трогать (ни удалять, ни редактировать дальше) — история остаётся
         линейной. Удаление/журнал — только на финальном close()."""
         await self._await_flush(bubble)
-        if bubble.message_id is None:
-            return
-        try:
-            await self._bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=bubble.message_id, reply_markup=None
-            )
-        except Exception as e:
-            logger.debug("Не удалось заморозить бабл: %s", e)
+        for tr in self._transports():
+            ref = bubble.refs.get(tr.name)
+            if ref is None:
+                continue
+            try:
+                await tr.bubble_freeze(session, ref)
+            except Exception as e:
+                logger.debug("Не удалось заморозить бабл (%s): %s", tr.name, e)
 
-    async def close(self, thread_id: int) -> None:
+    async def close(self, name: str) -> None:
         """Конец диалогового цикла (complete=True): разом убрать текущий
         активный бабл и все замороженные сообщения, накопленные с начала
         цикла (см. freeze_and_open) — «групповое схлопывание на финале»."""
-        self._active.discard(thread_id)  # ход завершён — append больше не создаёт бабл
-        bubble = self._bubbles.pop(thread_id, None)
-        frozen = self._frozen.pop(thread_id, [])
-        chat_id = self._get_chat_id()
-        if chat_id is None:
+        self._active.discard(name)  # ход завершён — append больше не создаёт бабл
+        bubble = self._bubbles.pop(name, None)
+        frozen = self._frozen.pop(name, [])
+        session = self._get_session(name)
+        if session is None:
             return
         for old in frozen:
-            await self._finish_message(old, chat_id)
+            await self._finish_message(old, session)
         if bubble is not None:
-            await self._finish_message(bubble, chat_id)
+            await self._finish_message(bubble, session)
 
-    async def freeze_and_open(self, thread_id: int) -> None:
+    async def freeze_and_open(self, name: str) -> None:
         """Пользователь шлёт новое сообщение, пока сессия ещё работает над
         предыдущим: заморозить текущий бабл на месте, открыть новый независимо.
 
         Новый Bubble ставится в self._bubbles СИНХРОННО, до единого await —
         поэтому окна, в котором tool-событие (handle_tool_event → append →
         setdefault) могло бы создать «паразитный» бабл и потерять его при
-        последующей записи, физически не существует (в отличие от прежнего
-        fork(), где new ставился ПОСЛЕ await старого close — гонка, найденная
-        разбором живого инцидента: бабл пропал, ответ пришёл без индикации).
+        последующей записи, физически не существует (гонка, найденная разбором
+        живого инцидента: бабл пропал, ответ пришёл без индикации).
         """
-        old = self._bubbles.get(thread_id)
-        self._bubbles[thread_id] = Bubble()
-        self.open(thread_id)
+        old = self._bubbles.get(name)
+        self._bubbles[name] = Bubble()
+        self.open(name)
         if old is not None:
-            self._frozen.setdefault(thread_id, []).append(old)
-            chat_id = self._get_chat_id()
-            if chat_id is not None:
-                await self._freeze_message(old, chat_id)
+            self._frozen.setdefault(name, []).append(old)
+            session = self._get_session(name)
+            if session is not None:
+                await self._freeze_message(old, session)

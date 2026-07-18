@@ -1,9 +1,9 @@
 """Регрессия Stop-хука: фолбэк на «потерянный финал» хода.
 
 Найдено разбором живых транскриптов (noos + эта сессия): 19/19 длинных ходов
-за день заканчивались ОБЫЧНЫМ ТЕКСТОМ вместо вызова reply_to_telegram — канал
-ретранслирует только явные tool-call'ы, голый ассистент-текст до Telegram не
-долетает (остаётся в TUI/транскрипте). Реальный кейс noos: reply_to_telegram
+за день заканчивались ОБЫЧНЫМ ТЕКСТОМ вместо вызова reply_to_user — канал
+ретранслирует только явные tool-call'ы, голый ассистент-текст до пользователя
+не долетает (остаётся в TUI/транскрипте). Реальный кейс noos: reply_to_user
 был в СЕРЕДИНЕ хода, а после него ещё шли Bash/Edit, и именно текст ПОСЛЕ них
 терялся — поэтому гейт не «reply был в ходе», а «reply было последним
 действием перед Stop» (turn.TurnSupervisor, сбрасывается любым другим
@@ -12,90 +12,92 @@
 Запуск: .venv/bin/python tests/stop_fallback_test.py
 """
 import asyncio
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from orchestrator.bot import TelegramBot  # noqa: E402
-from orchestrator.turn import TurnSupervisor  # noqa: E402
+from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.turn import TurnSupervisor  # noqa: E402
+
+SESSION = SimpleNamespace(name="noos")
 
 
-def make_bot():
+def make_core():
     sent = []
 
     class FakeMgr:
-        def get_by_name(self, name):
-            return SimpleNamespace(thread_id=204, name="noos") if name == "noos" else None
+        def get(self, name):
+            return SESSION if name == "noos" else None
 
-    b = TelegramBot.__new__(TelegramBot)
-    b.manager = FakeMgr()
-    b.chat_id = -100
-    b._texts = {}
-    b.t = lambda k, **kw: b._texts[k]
+        get_by_name = get
+
+    core = OrchestratorCore.__new__(OrchestratorCore)
+    core.manager = FakeMgr()
+    core._texts = {}
+    core._history = {}
+    core.adapters = {}
     # Реальный TurnSupervisor: проверяем настоящий Stop-гейт (note_tool/
-    # pop_reply_flag), Telegram-колбэки — заглушки.
-    b.turns = TurnSupervisor(
-        b.manager, b.t,
-        lambda tid, text: asyncio.sleep(0),
-        lambda tid: asyncio.sleep(0),
+    # pop_reply_flag), доставка — заглушки.
+    core.turns = TurnSupervisor(
+        core.manager, core.t,
+        lambda session, text: asyncio.sleep(0),
+        lambda session: asyncio.sleep(0),
     )
-    b.bubbles = SimpleNamespace(append=lambda *a, **kw: asyncio.sleep(0))
+    core.bubbles = SimpleNamespace(append=lambda *a, **kw: asyncio.sleep(0))
 
-    async def fake_send(chat_id, thread_id, text, reply_to=None):
-        sent.append((chat_id, thread_id, text))
-    b._send = fake_send
-    return b, sent
+    async def fake_deliver(session, text, origin, intermediate):
+        sent.append((session.name, text, intermediate))
+    core._deliver_text = fake_deliver
+    return core, sent
 
 
 async def main():
-    b, sent = make_bot()
+    core, sent = make_core()
 
     # Реальный кейс noos: reply в середине хода, потом ЕЩЁ работа (Bash/Edit),
     # затем Stop без reply — финал должен быть перехвачен.
-    await b.handle_tool_event("noos", {"tool_name": "mcp__tg-channel-noos__reply_to_telegram"})
-    await b.handle_tool_event("noos", {"tool_name": "Bash", "tool_input": {"command": "git commit"}})
-    await b.handle_tool_event("noos", {"tool_name": "Edit", "tool_input": {"file_path": "/x.py"}})
-    await b.handle_stop_event("noos", {"last_assistant_message": "PR открыт, жду CI green"})
-    assert len(sent) == 1 and "PR открыт" in sent[0][2] and sent[0][1] == 204, sent
-    print("OK: reply в середине + работа после → fallback сработал (реальный кейс noos)")
+    await core.handle_tool_event("noos", {"tool_name": "mcp__channel-noos__reply_to_user"})
+    await core.handle_tool_event("noos", {"tool_name": "Bash", "tool_input": {"command": "git commit"}})
+    await core.handle_tool_event("noos", {"tool_name": "Edit", "tool_input": {"file_path": "/x.py"}})
+    await core.handle_stop_event("noos", {"last_assistant_message": "PR открыт, жду CI green"})
+    assert len(sent) == 1 and "PR открыт" in sent[0][1] and sent[0][0] == "noos", sent
+    print("OK reply в середине + работа после → fallback сработал (реальный кейс noos)")
 
     sent.clear()
     # reply — самое последнее действие перед Stop → фолбэк не нужен (не дублируем).
-    await b.handle_tool_event("noos", {"tool_name": "mcp__tg-channel-noos__reply_to_telegram"})
-    await b.handle_stop_event("noos", {"last_assistant_message": "тот же текст что уже ушёл"})
+    await core.handle_tool_event("noos", {"tool_name": "mcp__channel-noos__reply_to_user"})
+    await core.handle_stop_event("noos", {"last_assistant_message": "тот же текст что уже ушёл"})
     assert sent == [], sent
-    print("OK: reply последним перед Stop → fallback не сработал")
+    print("OK reply последним перед Stop → fallback не сработал")
 
     sent.clear()
     # несколько Stop подряд без reply — каждый фолбэчит отдельно (окно сбрасывается).
-    await b.handle_stop_event("noos", {"last_assistant_message": "ход 1"})
-    await b.handle_stop_event("noos", {"last_assistant_message": "ход 2"})
-    assert len(sent) == 2 and sent[0][2].endswith("ход 1") and sent[1][2].endswith("ход 2"), sent
-    print("OK: несколько Stop подряд без reply → каждый фолбэчит отдельно")
+    await core.handle_stop_event("noos", {"last_assistant_message": "ход 1"})
+    await core.handle_stop_event("noos", {"last_assistant_message": "ход 2"})
+    assert len(sent) == 2 and sent[0][1].endswith("ход 1") and sent[1][1].endswith("ход 2"), sent
+    print("OK несколько Stop подряд без reply → каждый фолбэчит отдельно")
 
     sent.clear()
     # пустой last_assistant_message — не спамим тишиной.
-    await b.handle_stop_event("noos", {"last_assistant_message": ""})
+    await core.handle_stop_event("noos", {"last_assistant_message": ""})
     assert sent == []
-    print("OK: пустой last_assistant_message → тишина")
+    print("OK пустой last_assistant_message → тишина")
 
     sent.clear()
     # неизвестная сессия — тихо игнорируется, не падает.
-    await b.handle_stop_event("ghost", {"last_assistant_message": "x"})
+    await core.handle_stop_event("ghost", {"last_assistant_message": "x"})
     assert sent == []
-    print("OK: неизвестная сессия → тихо игнорируется")
+    print("OK неизвестная сессия → тихо игнорируется")
 
     sent.clear()
-    # send_file_to_telegram — НЕ reply, тоже сбрасывает флаг.
-    await b.handle_tool_event("noos", {"tool_name": "mcp__tg-channel-noos__reply_to_telegram"})
-    await b.handle_tool_event("noos", {"tool_name": "mcp__tg-channel-noos__send_file_to_telegram"})
-    await b.handle_stop_event("noos", {"last_assistant_message": "текст после отправки файла"})
+    # send_file_to_user — НЕ reply, тоже сбрасывает флаг.
+    await core.handle_tool_event("noos", {"tool_name": "mcp__channel-noos__reply_to_user"})
+    await core.handle_tool_event("noos", {"tool_name": "mcp__channel-noos__send_file_to_user"})
+    await core.handle_stop_event("noos", {"last_assistant_message": "текст после отправки файла"})
     assert len(sent) == 1, sent
-    print("OK: send_file между reply и Stop → флаг сброшен, fallback сработал")
+    print("OK send_file между reply и Stop → флаг сброшен, fallback сработал")
 
     print("ALL STOP-FALLBACK OK")
 
