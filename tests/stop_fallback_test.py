@@ -34,7 +34,7 @@ def make_bot():
     b = TelegramBot.__new__(TelegramBot)
     b.manager = FakeMgr()
     b.chat_id = -100
-    b._texts = {"stop_fallback_prefix": "💬 (fallback)"}
+    b._texts = {}
     b.t = lambda k, **kw: b._texts[k]
     # Реальный TurnSupervisor: проверяем настоящий Stop-гейт (note_tool/
     # pop_reply_flag), Telegram-колбэки — заглушки.

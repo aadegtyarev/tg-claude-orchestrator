@@ -1133,7 +1133,7 @@ class TelegramBot:
         text = str(payload.get("last_assistant_message") or "").strip()
         if not text:
             return
-        await self._send(self.chat_id, thread_id, f"{self.t('stop_fallback_prefix')}\n{text}")
+        await self._send(self.chat_id, thread_id, text)
 
     def _tool_line(self, tool: str, tool_input: dict) -> str:
         """HTML-строка бабла для вызова инструмента (логика — toolline.py)."""
