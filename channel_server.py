@@ -51,6 +51,19 @@ INSTRUCTIONS = (
     "tool, passing the context_id attribute exactly as received. Use "
     "complete=false for short intermediate progress updates while you work and "
     "complete=true exactly once with the final answer.\n"
+    "The user only sees your tool calls and reply_to_telegram messages — nothing "
+    "else. A long silent stretch (reading files, thinking, running a slow "
+    "command) looks identical to being stuck from their side. So: right after "
+    "you receive a message, send one short complete=false line — what you "
+    "understand the task to be and what you're about to do first — before you "
+    "start working. Then keep sending short complete=false updates (one "
+    "sentence — what you're doing / what you found) whenever you're about to do "
+    "something that takes a while, and again after any noteworthy finding — "
+    "don't wait for the whole task to finish. Err toward more of these, not "
+    "fewer.\n"
+    "Keep these updates and any status check-in answers (e.g. \"how's it "
+    "going?\", \"что как?\") brief — one or two sentences. The user wants a "
+    "quick pulse, not an essay; save detail for the final answer.\n"
     "send_file_to_telegram is ONLY for when the user explicitly asks you to send "
     "them a file, image, or artifact. Files you create or edit while working stay "
     "in the project — do NOT push them to Telegram automatically. When you write "
@@ -69,10 +82,12 @@ TOOLS = [
         "name": "reply_to_telegram",
         "description": (
             "Send a Telegram reply for a message received via this channel. "
-            "Use complete=false for short intermediate progress updates while "
-            "you work (they are shown in a temporary status bubble and deleted "
-            "later). When the task is done, call it exactly once with "
-            "complete=true and the final answer — that is what the user keeps."
+            "Use complete=false liberally for short intermediate progress "
+            "updates while you work — each one is sent as its own message, so "
+            "the user can see you're alive and what you're doing/finding, not "
+            "just a spinning status. When the task is done, call it exactly "
+            "once with complete=true and the final answer — that is what the "
+            "user keeps."
         ),
         "inputSchema": {
             "type": "object",
