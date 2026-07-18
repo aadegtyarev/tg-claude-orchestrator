@@ -183,8 +183,16 @@ class TelegramBot:
         ]
         # Бот работает в группах — меню «/» там берёт команды из группового
         # scope; без него список часто пуст. Ставим и default, и для групп.
-        await self.bot.set_my_commands(commands)
-        await self.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+        # SHOW_COMMAND_MENU=false — скрываем меню целиком (в группе Telegram
+        # всё равно печатает «/команда@бот», что не всем нравится).
+        if self.config.show_command_menu:
+            await self.bot.set_my_commands(commands)
+            await self.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+        else:
+            try:
+                await self.bot.delete_my_commands()
+            except Exception as e:
+                logger.warning("Не удалось очистить меню команд: %s", e)
         await self.dp.start_polling(self.bot)
 
     async def close(self) -> None:

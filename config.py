@@ -26,6 +26,7 @@ class Config:
     allowed_user_ids: frozenset[int]
     show_tool_calls: bool
     delete_bubble: bool
+    show_command_menu: bool
     claude_config_dir: Path | None
     incoming_dir: str
     permission_mode: str
@@ -60,6 +61,9 @@ class Config:
             allowed_user_ids=cls._parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
             show_tool_calls=cls._parse_bool(os.getenv("SHOW_TOOL_CALLS", "true")),
             delete_bubble=cls._parse_bool(os.getenv("DELETE_BUBBLE", "true")),
+            # Меню команд (кнопка «/»). В группе Telegram всё равно показывает
+            # «/команда@бот» (клиентский роутинг) — false скрывает меню целиком.
+            show_command_menu=cls._parse_bool(os.getenv("SHOW_COMMAND_MENU", "true")),
             claude_config_dir=(
                 Path(raw).expanduser() if (raw := os.getenv("CLAUDE_CONFIG_DIR", "").strip()) else None
             ),
