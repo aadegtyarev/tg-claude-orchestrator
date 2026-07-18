@@ -32,7 +32,9 @@ from typing import IO, Awaitable, Callable
 
 import aiohttp
 
+from ansi import strip_ansi
 from config import Config
+from slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
 
 logger = logging.getLogger(__name__)
 
@@ -101,33 +103,8 @@ def _scan_pollution(entries) -> str | None:
 
 
 class SessionError(Exception):
-    """Ошибка создания/работы сессии — текст показывается пользователю."""
+    """Ошибка создания/работы сессией — текст показывается пользователю."""
 
-
-# Транслитерация кириллицы в латиницу для slug (ГОСТ-подобная, упрощённая).
-_TRANSLIT = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "j", "к": "k", "л": "l", "м": "m",
-    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
-    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
-}
-
-
-def slugify(title: str) -> str:
-    """Безопасный непустой идентификатор из отображаемого имени.
-
-    Название топика может быть любым (пробелы, эмодзи, кириллица), но папка,
-    ключ MCP-сервера (`tg-channel-<slug>`), CLI-аргумент `server:...` и URL
-    хука `/event/<slug>` требуют [A-Za-z0-9_-]. Кириллица транслитерируется;
-    если после этого не осталось латиницы/цифр (эмодзи, иероглифы) — автослаг.
-    """
-    translit = "".join(_TRANSLIT.get(ch, _TRANSLIT.get(ch.lower(), ch)) for ch in title)
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", translit).strip("-")[:32]
-    return slug or f"session-{uuid.uuid4().hex[:6]}"
-
-
-_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 
 # Стартовые диалоги интерактивного claude и клавиши-ответы.
 # Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
@@ -212,7 +189,7 @@ def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
             except ValueError:  # лог уже закрыт при остановке сессии
                 pass
             buf = (buf + chunk)[-16384:]
-            screen = _ANSI_RE.sub(b"", buf).replace(b"\r", b"").replace(b" ", b"")
+            screen = strip_ansi(buf).replace(b" ", b"")
             screen_text = screen.decode(errors="replace").lower()
             for marker, keys in _DIALOGS:
                 if marker in screen_text and marker not in answered:
@@ -843,7 +820,7 @@ class SessionManager:
             raw = path.read_bytes()[-16384:]
         except OSError:
             return ""
-        clean = _ANSI_RE.sub(b"", raw).replace(b"\r", b"")
+        clean = strip_ansi(raw)
         text = clean.decode(errors="replace")
         tail = [ln for ln in text.splitlines() if ln.strip()][-lines:]
         return "\n".join(tail)
@@ -885,7 +862,7 @@ class SessionManager:
             raw = log.read_bytes()[before:]
         except OSError:
             return ""
-        return _ANSI_RE.sub(b"", raw).replace(b"\r", b"").decode(errors="replace")
+        return strip_ansi(raw).decode(errors="replace")
 
     async def close_idle(self) -> list[Session]:
         """Остановить работающие сессии, простаивавшие дольше IDLE_TIMEOUT_H.
