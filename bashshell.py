@@ -15,21 +15,23 @@ from __future__ import annotations
 import logging
 import os
 import pty
-import re
 import signal
 import subprocess
 import threading
 from pathlib import Path
 
+from ansi import strip_ansi
+
 logger = logging.getLogger(__name__)
 
-_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 _BUF_CAP = 200_000  # держим только хвост — на случай болтливой команды
 
 
 def clean(raw: bytes) -> bytes:
-    """Снять ANSI-раскраску/управляющие коды и \\r — для показа в <pre>."""
-    return _ANSI_RE.sub(b"", raw).replace(b"\r", b"")
+    """Снять ANSI-раскраску/управляющие коды и \\r — для показа в <pre>.
+
+    Тонкая обёртка над общим ansi.strip_ansi (раньше свой дубликат regex)."""
+    return strip_ansi(raw)
 
 
 class BashSession:
