@@ -6,8 +6,10 @@
 в тот же PTY — ответ на «y/n» интерактивной команды, которая всё ещё крутится
 в текущем /bash.
 
-Права и cwd — как у процесса бота (никакого --dangerously-skip-permissions):
-пользователь явно просил «мимо Claude Code, сразу в систему».
+Права и cwd — как у процесса бота (мимо Claude Code, без permission relay), но
+при SANDBOX=bwrap оболочка запускается в той же файловой песочнице, что и
+claude: видит только папку сессии/проекта и конфиг Claude Code, не остальную ФС
+(обёртка передаётся параметром wrapper из bot.py, см. sandbox.py).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def clean(raw: bytes) -> bytes:
 class BashSession:
     """Один PTY с интерактивным bash и потоком, дренирующим его вывод."""
 
-    def __init__(self, cwd: Path):
+    def __init__(self, cwd: Path, wrapper: list[str] | None = None):
         self.cwd = cwd
         self.busy = False  # активен ли /bash (для /bashin — не проверяется)
         self._buf = bytearray()
@@ -45,9 +47,11 @@ class BashSession:
         master, slave = pty.openpty()
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
+        # wrapper — префикс песочницы (bwrap … --), пусто если SANDBOX=off.
+        argv = [*(wrapper or []), "/bin/bash", "-i"]
         try:
             self.proc = subprocess.Popen(
-                ["/bin/bash", "-i"],
+                argv,
                 stdin=slave, stdout=slave, stderr=slave,
                 cwd=str(cwd), env=env, start_new_session=True,
             )
@@ -117,10 +121,12 @@ class BashShellManager:
     def __init__(self) -> None:
         self._sessions: dict[int, BashSession] = {}
 
-    def get_or_create(self, thread_id: int, cwd: Path) -> BashSession:
+    def get_or_create(
+        self, thread_id: int, cwd: Path, wrapper: list[str] | None = None
+    ) -> BashSession:
         sess = self._sessions.get(thread_id)
         if sess is None or not sess.running:
-            sess = BashSession(cwd)
+            sess = BashSession(cwd, wrapper)
             self._sessions[thread_id] = sess
             logger.info("bash-терминал открыт (топик %s, cwd %s)", thread_id, cwd)
         return sess

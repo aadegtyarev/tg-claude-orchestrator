@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import sandbox
 from bot import TelegramBot
 from config import Config
 from reply_server import start_reply_server
@@ -30,6 +31,18 @@ async def main() -> None:
     config = Config.from_env()
     config.sessions_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Сессии: %s, максимум %d", config.sessions_dir, config.max_instances)
+
+    if config.sandbox == "bwrap":
+        ok, why = sandbox.available()
+        if not ok:
+            raise SystemExit(
+                f"SANDBOX=bwrap, но песочница недоступна: {why}\n"
+                "Установи bubblewrap (apt install bubblewrap) либо запусти без "
+                "изоляции — SANDBOX=off в .env (менее безопасно)."
+            )
+        logger.info("Песочница: bwrap — claude и /bash заперты в allowlist ФС")
+    else:
+        logger.warning("Песочница отключена (SANDBOX=off): claude имеет доступ ко всей ФС")
 
     if not config.allowed_user_ids:
         logger.warning(

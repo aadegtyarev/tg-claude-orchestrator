@@ -56,6 +56,8 @@ class Config:
     default_model: str | None  # --model по умолчанию (None = решение Claude/профиля/проекта)
     default_effort: str | None  # --effort по умолчанию (low/medium/high/xhigh/max)
     claude_env: dict[str, str]  # доп. env для процесса claude (CLAUDE_ENV_*)
+    sandbox: str  # "bwrap" (файловая песочница) | "off"
+    sandbox_extra_rw: tuple[Path, ...]  # доп. пути, доступные из песочницы на запись
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -106,7 +108,33 @@ class Config:
                 for k, v in os.environ.items()
                 if k.startswith("CLAUDE_ENV_") and k != "CLAUDE_ENV_"
             },
+            # Файловая песочница (bubblewrap). По умолчанию включена: процесс
+            # claude и /bash видят только папку сессии/проекта и конфиг Claude
+            # Code, всё остальное в $HOME и системе — недоступно. SANDBOX=off
+            # отключает (нужно на машинах без bwrap/без unprivileged userns).
+            sandbox=cls._parse_sandbox(os.getenv("SANDBOX", "bwrap")),
+            sandbox_extra_rw=cls._parse_paths(os.getenv("SANDBOX_EXTRA_RW", "")),
         )
+
+    @staticmethod
+    def _parse_sandbox(raw: str) -> str:
+        mode = raw.strip().lower() or "bwrap"
+        # Синонимы «выключено».
+        if mode in ("off", "none", "0", "false", "no"):
+            return "off"
+        if mode == "bwrap":
+            return "bwrap"
+        raise SystemExit(f"SANDBOX={raw!r} — допустимо: bwrap | off")
+
+    @staticmethod
+    def _parse_paths(raw: str) -> tuple[Path, ...]:
+        """Список путей из PATH-подобной строки (разделитель ':')."""
+        out: list[Path] = []
+        for part in raw.split(":"):
+            part = part.strip()
+            if part:
+                out.append(Path(part).expanduser())
+        return tuple(out)
 
     @staticmethod
     def _parse_chat_id(raw: str) -> int | None:
