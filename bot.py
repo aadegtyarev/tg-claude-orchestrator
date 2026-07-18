@@ -338,6 +338,9 @@ class TelegramBot:
         await self.dp.start_polling(self.bot)
 
     async def close(self) -> None:
+        # Останавливаем launcher: прибираем и постоянные bash-оболочки топиков,
+        # иначе они осиротеют и переживут процесс бота (REVIEW.md B1).
+        self.bash.close_all()
         await self.bot.session.close()
 
     # ── регистрация и доступ ────────────────────────────────────
@@ -659,6 +662,10 @@ class TelegramBot:
                 if code is not None:
                     break
             else:
+                # Таймаут: прерываем убежавшую команду (Ctrl-C), чтобы она не
+                # гадила в общий буфер следующему /bash. Сама оболочка живёт —
+                # дослать ввод/посмотреть статус можно /bashin.
+                shell.interrupt()
                 await status.edit_text(
                     self._bash_render(cmd, out, None, timeout=True), parse_mode="HTML"
                 )
@@ -705,6 +712,7 @@ class TelegramBot:
             await message.reply(self.t("only_topic"))
             return
         self._stop_typing(session.thread_id)
+        self.bash.close(session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.close(session)
         await message.reply(self.t("close_done"))
@@ -749,6 +757,7 @@ class TelegramBot:
             return
         await callback.answer(self.t("delete_doing"))
         self._stop_typing(session.thread_id)
+        self.bash.close(session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.delete(session)
         try:
@@ -1598,6 +1607,7 @@ class TelegramBot:
         if self.chat_id is None:
             return
         self._stop_typing(session.thread_id)
+        self.bash.close(session.thread_id)
         await self.bubbles.close(session.thread_id)
         text = self.t("session_died", name=session.title, code=code)
         tail = await asyncio.to_thread(self.manager.tail_log, session)
@@ -1611,6 +1621,7 @@ class TelegramBot:
             return
         for session in sessions:
             self._stop_typing(session.thread_id)
+            self.bash.close(session.thread_id)
             await self.bubbles.close(session.thread_id)
             await self._send(
                 self.chat_id, session.thread_id,
