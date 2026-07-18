@@ -64,7 +64,7 @@ class FakeBubbles:
     async def close(self, tid):
         pass
 
-    async def append(self, tid, line):
+    async def append(self, tid, line, **kw):
         pass
 
 
