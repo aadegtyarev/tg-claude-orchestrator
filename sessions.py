@@ -75,12 +75,63 @@ def slugify(title: str) -> str:
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 
 # Стартовые диалоги интерактивного claude и клавиши-ответы.
-# Маркеры ищутся в тексте экрана без пробелов и в нижнем регистре.
+# Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
 _DIALOGS = [
     ("trustthisfolder", b"\r"),        # «Yes, I trust this folder» — пункт по умолчанию
     ("bypasspermissions", b"2\r"),     # «Yes, I accept» — пункт 2
     ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
 ]
+
+
+# ── живость процесса claude по /proc (Linux) ──────────────────
+# Вотчдог судит «завис/не завис» не только по байтам лога: спиннер «almost
+# done» может на секунды замолчать в нормальной работе — это не зависание.
+# Надёжный сигнал — CPU-время дерева процессов claude (он сам + запущенные
+# им тулы): если сумма utime+stime не растёт и дочерних процессов нет,
+# процесс правда стоит на месте.
+
+
+def _proc_tree_signals(root: int) -> tuple[int, bool]:
+    """(сумма CPU-тиков дерева root, есть ли у root живые дочерние процессы).
+
+    Один проход по /proc: для каждого процесса берём PPID (поле 4) и
+    utime+stime (поля 14+15). Поле comm (2) может содержать пробелы и скобки,
+    поэтому режем по последней ')' и нумеруем поля от неё.
+    """
+    by_ppid: dict[int, list[int]] = {}
+    ticks: dict[int, int] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0, False
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as fh:
+                raw = fh.read()
+            after = raw[raw.rindex(b")") + 1:].split()
+            ppid = int(after[1])              # поле 4 (ppid)
+            tick = int(after[11]) + int(after[12])  # поля 14+15 (utime+stime)
+        except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+            continue
+        by_ppid.setdefault(ppid, []).append(int(name))
+        ticks[int(name)] = tick
+    if root not in ticks:
+        return 0, False
+    total = 0
+    frontier = [root]
+    seen: set[int] = set()
+    while frontier:
+        nxt: list[int] = []
+        for pid in frontier:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += ticks.get(pid, 0)
+            nxt.extend(by_ppid.get(pid, ()))
+        frontier = nxt
+    return total, bool(by_ppid.get(root))
 
 
 def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
@@ -162,6 +213,8 @@ class SessionManager:
         self.config = config
         self._lock = asyncio.Lock()  # защищает _by_thread и выдачу портов
         self._by_thread: dict[int, Session] = {}
+        # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
+        self._cpu: dict[str, int] = {}
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
@@ -504,6 +557,7 @@ class SessionManager:
         async with session.ops:
             async with self._lock:
                 self._by_thread.pop(session.thread_id, None)
+                self._cpu.pop(session.name, None)
             await self._stop_process(session)
             self.save_state()
 
@@ -706,6 +760,30 @@ class SessionManager:
         text = clean.decode(errors="replace")
         tail = [ln for ln in text.splitlines() if ln.strip()][-lines:]
         return "\n".join(tail)
+
+    def is_busy(self, session: Session) -> bool:
+        """Делает ли сессия работу прямо сейчас — признак жизни для вотчдога.
+
+        Жив, если CPU-время дерева процессов claude (он сам + запущенные тулы)
+        выросло с прошлой проверки ИЛИ у него есть живые дочерние процессы
+        (идёт тул — Bash/сборка и т.п.). Если /proc недоступен — считаем
+        живым: лучше пропустить редкое реальное зависание, чем спамить ложным.
+
+        Вызывать из единственного места (_watchdog_loop): метод хранит
+        предыдущий отсчёт CPU по имени сессии между вызовами.
+        """
+        pid = session.process.pid if session.running and session.process else None
+        if pid is None:
+            return False
+        try:
+            cpu, has_kids = _proc_tree_signals(pid)
+        except Exception:  # /proc недоступен — перестраховочно «жив»
+            logger.debug("is_busy: /proc недоступен для pid=%s", pid)
+            return True
+        prev = self._cpu.get(session.name)
+        self._cpu[session.name] = cpu
+        grew = prev is not None and cpu > prev
+        return grew or has_kids
 
     async def run_and_capture(self, session: Session, cmd: str, wait: float = 6.0) -> str:
         """Ввести слэш-команду в PTY и вернуть новый вывод claude.log без ANSI.
