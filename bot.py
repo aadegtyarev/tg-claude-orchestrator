@@ -218,7 +218,7 @@ _LOG_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][
 _API_ERR_BANNER_RE = re.compile(rb"API Error:\s*(\d{3})\b([^\n]{0,140})", re.IGNORECASE)
 # Класс ошибки по деталям баннера (код разбираем отдельно).
 _RL_DETAIL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\bcapacity\b", re.IGNORECASE)
-_PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d", re.IGNORECASE)
+_PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d|thinking", re.IGNORECASE)
 # Живые сигналы из claude.log (когда тулов нет, но что-то происходит):
 #  • ретрай API-ошибки — Claude Code пишет «Retrying … attempt K/M»;
 #  • краш-рестарт — баннер «Resume this session with» / «Welcome back».
@@ -1257,7 +1257,22 @@ class TelegramBot:
                 if cooled and fresh:
                     last_surfaced = now
                     last_sig, last_sig_at = s, now
-                    await _surf(self.t(f"api_error_{klass}"))
+                    msg = self.t(f"api_error_{klass}")
+                    if klass == "protocol":
+                        # Прочитать загрязнённый контекст и приложить эксцепт —
+                        # чтобы было видно, ЧТО именно отравлено (чужой бэкенд).
+                        try:
+                            excerpt = await asyncio.to_thread(
+                                self.manager.read_pollution_excerpt, session
+                            )
+                        except Exception as e:  # релей не должен падать на чтении
+                            excerpt = None
+                            logger.debug("error_relay: pollution excerpt: %s", e)
+                        if excerpt:
+                            msg += "\n\n" + self.t(
+                                "api_error_pollution_tail", excerpt=excerpt
+                            )
+                    await _surf(msg)
 
             # 2. Живой ретрай: пере-файр, когда attempt вырос — чтобы было видно
             #    прогресс (3/100 → 47/100), а не одна тишина. Throttle — RETRY_SURFACE_INTERVAL.
