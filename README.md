@@ -1,372 +1,309 @@
-# tg-claude-orchestrator
+# claude-orchestrator
 
-Telegram-обёртка для Claude Code через [channels](https://code.claude.com/docs/en/channels)
-(research preview).
+Оркестратор N параллельных сессий [Claude Code](https://code.claude.com/docs)
+через [channels](https://code.claude.com/docs/en/channels) (research preview):
+ядро + подключаемые интерфейсы (Telegram-бот, локальный веб) + песочницы
+исполнения + модули (кошелёк секретов).
 
-N параллельных сессий Claude Code в форум-топиках Telegram. Каждый топик —
-отдельный экземпляр Claude со своим контекстом и рабочей директорией.
+Каждая сессия — отдельный экземпляр Claude со своим контекстом и рабочей
+директорией проекта; наблюдаемость (статус-бабл, события инструментов,
+permission-кнопки) работает в каждом интерфейсе.
 
-> Есть и официальный Telegram-плагин (`/plugin install telegram@claude-plugins-official`),
-> но он — мост «один чат ↔ одна сессия». Этот проект решает другую задачу:
-> много именованных сессий в топиках, привязка к папкам проектов, статус-баблы,
-> resume, статистика.
+> Ранее проект назывался **tg-claude-orchestrator**. Официальный
+> Telegram-плагин (`/plugin install telegram@claude-plugins-official`) — мост
+> «один чат ↔ одна сессия»; этот проект решает другую задачу: много именованных
+> сессий, привязка к папкам проектов, статус-баблы, resume, песочница,
+> несколько интерфейсов параллельно.
 
 ## Архитектура
 
 ```
-Telegram Group (Topics)
-  ├── 🧵 data-analyst → claude #1 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18761
-  ├── 🧵 devops       → claude #2 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18762
-  └── 🧵 coder        → claude #3 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18763
-
-launcher (один процесс)
-  ├── бот aiogram: команды, файлы, статус-баблы
-  ├── HTTP :18080 /reply        <── ответы Claude (тул reply_to_telegram)
-  ├── HTTP :18080 /event/<имя>  <── вызовы инструментов (PreToolUse-хук)
-  └── HTTP POST :1876x /notify  ──> push сообщений в Claude
+                    ┌───────────── адаптеры (ADAPTERS) ─────────────┐
+ Telegram (топики)◄─┤ adapters/telegram │ adapters/web ├─► Браузер (SPA+WS)
+                    └───────▲───────────┴──────▲───────┘
+                            │   Transport-протокол (core/transport.py)
+                    ┌───────┴──────────────────┴───────┐
+                    │ core/app.py  OrchestratorCore    │  команды, роутинг,
+                    │ core/bubble  core/turn  core/... │  бабл, сторожа, jail
+                    └───────▲──────────────────▲───────┘
+                            │                  │ HTTP :18080 (/reply /event
+                    ┌───────┴────────┐         │  /permission /stop, токен)
+                    │ core/sessions  │         │
+                    │ SessionManager │  ┌──────┴────────────┐
+                    └───┬────────────┘  │ channel_server.py │◄─ спавнит сам
+                        │ PTY + раннер  │ (в песочке, stdio)│   Claude Code
+                ┌───────┴───────┐       └───────────────────┘
+                │ runners/      │  bwrap | agent-vm | off
+                └───────────────┘
+ modules/wallet ── демон секретов на хосте + CLI `wallet` в песочнице
 ```
 
-**Кто кого запускает:** launcher запускает только процессы `claude` (под PTY).
-`channel_server.py` запускает **сам Claude Code** — по `.mcp.json`, который
-передан флагом `--mcp-config` (лежит в папке сессии). Оркестратор общается с
-channel-сервером только по HTTP.
+**Кто кого запускает:** оркестратор запускает только процессы `claude`
+(под PTY, через раннер-изоляцию). `channel_server.py` запускает **сам Claude
+Code** — по `.mcp.json`, переданному флагом `--mcp-config`. Ядро общается с
+channel-сервером только по HTTP; все внутренние эндпоинты — под bearer-токеном
+(`ORCH_TOKEN`).
 
-**cwd = папка проекта:** если сессия создана с путём (`/new имя /path`), claude
-запускается прямо в проекте — грузит его `CLAUDE.md`, `.mcp.json`, `.claude/`
-(натуральное поведение «cd в проект и claude»). Канал-сервер и настройки бота
-подсасываются флагами (`--mcp-config`, `--settings`) и consent не просят;
-профиль (`CLAUDE_CONFIG_DIR`) и проект остаются нетронутыми.
+**Одна сессия — все интерфейсы.** Сессия принадлежит ядру; каждый адаптер
+хранит свой адрес (binding): у Telegram — форум-топик, у веба адрес не нужен.
+Ответы, статус-бабл и permission-запросы доставляются во все активные
+адаптеры; применяется первый ответ на permission (как с параллельным
+TUI-диалогом).
 
 **Почему PTY:** headless-запуск не работает — без TTY claude уходит в
-`--print` и завершается, а в `-p`/stream-json режиме channel-события не будят
-ход (проверено). Интерактивная сессия под PTY — документированный сценарий
-«persistent terminal»: пуш сам запускает ход. Стартовые диалоги (trust folder,
-bypass permissions, dev channels) отвечает автоматика (`_pty_driver`).
+`--print`, а в stream-json режиме channel-события не будят ход (проверено).
+Интерактивная сессия под PTY — документированный сценарий «persistent
+terminal»; стартовые диалоги отвечает автоматика. Бонус PTY: кнопка «⛔
+Прервать» — настоящий Esc в терминал (жёсткое прерывание хода, которого нет
+в channels-протоколе).
 
-## Структура и модули
-
-Весь код — в пакете `orchestrator/`, запуск `python -m orchestrator`
-(в корне остаётся `launcher.py`-шим для старых systemd-юнитов).
+## Структура пакета
 
 ```
-orchestrator/   — пакет приложения (см. таблицу ниже)
-tests/          — офлайн-тесты (run_all.sh гоняет все)
-docs/           — дизайн-документы будущих интеграций
-install.sh      — установка: venv + systemd user-unit (+ --uninstall)
-.env.example    — образец конфигурации
+orchestrator/
+  __main__.py        — сборка: config → runner.preflight → core → адаптеры/модули
+  config.py          — .env → неизменяемый Config (ADAPTERS, MODULES, SANDBOX…)
+  channel_server.py  — MCP-канал (raw JSON-RPC + HTTP; проектных импортов нет)
+  core/              — ядро (транспорт-независимое):
+    app.py           — OrchestratorCore: команды, роутинг ответов, jail, bash,
+                       журнал событий, permission relay, подтверждения модулей
+    transport.py     — протокол Transport + Origin/PermissionRequest
+    sessions.py      — SessionManager: PTY-процессы, resume/clear/model,
+                       персистентный дом сессии, состояние на диске
+    turn.py          — TurnSupervisor: typing, вотчдог зависаний, релей ошибок
+    bubble.py        — статус-бабл: строки, схлопывание, заморозка (мульти-адаптер)
+    bashshell.py     — постоянные bash-терминалы (мимо Claude)
+    reply_server.py  — HTTP-приёмник от channel-серверов и хуков
+    toolline/texts/transcript/mdrender/logsignals/ansi/slug/proctree/hookscript
+  adapters/
+    telegram/        — aiogram: топики, кнопки, реакции, файлы
+    web/             — aiohttp: SPA (vanilla JS) + WebSocket, REST API
+  runners/           — изоляция: direct | bwrap (+sandbox.py) | agentvm
+  modules/
+    wallet/          — кошелёк секретов (демон + policy); CLI — bin/wallet
+tests/               — офлайн-тесты (run_all.sh гоняет все)
+docs/                — дизайн-доки (agent-vm, secrets-wallet, коннекторы)
+install.sh           — venv + systemd user-unit (+ --uninstall, миграция имени)
 ```
-
-| Модуль | Ответственность |
-|--------|-----------------|
-| `__main__.py` | Точка входа: сборка компонентов, graceful shutdown |
-| `config.py` | Чтение `.env` в неизменяемый `Config` |
-| `bot.py` | Telegram-транспорт: команды, файлы, permission-кнопки, отправка |
-| `turn.py` | `TurnSupervisor`: фоновые задачи хода (typing, вотчдог зависаний, ретранслятор ошибок API) + Stop-гейт «потерянного финала» |
-| `bubble.py` | Статус-бабл: буфер строк, схлопывание, заморозка, троттлинг правок |
-| `toolline.py` | Рендер вызова инструмента в компактную строку бабла |
-| `cbdata.py` | Сборка/разбор callback-данных inline-кнопок |
-| `sessions.py` | `SessionManager`: PTY-процессы Claude, жизненный цикл, resume, авто-close, ротация логов |
-| `transcript.py` | Чтение транскриптов: статистика `/stats`, скан загрязнения чужим бэкендом |
-| `proctree.py` | Сигналы живости дерева процессов по `/proc` (для вотчдога) |
-| `hookscript.py` | Шаблон хук-диспетчера (PreToolUse + Stop → POST оркестратору) |
-| `runner.py` | Шов изоляции: как заворачивать процессы (`bwrap` / без; будущий agent-vm) |
-| `sandbox.py` | Файловая песочница (bubblewrap): сборка argv-обёртки, проверка доступности |
-| `reply_server.py` | aiohttp: `POST /reply`, `/event/{имя}`, `/stop/{имя}`, `/permission/{имя}` |
-| `channel_server.py` | MCP-канал: raw JSON-RPC на stdio + HTTP `/notify`, `/ping`, `/permission` (запускается самим Claude, проектных импортов нет) |
-| `bashshell.py` | Постоянный `/bash`-терминал топика (PTY мимо Claude) |
-| `texts.py` | Все сообщения бота на ru/en (`BOT_LANG`) |
-| `mdrender.py`, `logsignals.py`, `ansi.py`, `slug.py` | Чистые утилиты: markdown→HTML, сигналы claude.log, ANSI, слаги |
 
 ## Требования
 
 - Python ≥ 3.10
-- [Claude Code](https://code.claude.com/docs) ≥ 2.1 в PATH, залогинен
-  (channels требуют claude.ai / Console-аутентификацию)
-- Telegram-бот от [@BotFather](https://t.me/BotFather)
-- Группа с включёнными Topics, бот — админ с правом «Manage Topics»
-  (создаёт и удаляет темы сам)
-- `bubblewrap` (`apt install bubblewrap`) для файловой песочницы —
-  включена по умолчанию; можно отключить `SANDBOX=off` (см. ниже)
+- Claude Code ≥ 2.1 в PATH, залогинен (channels требуют claude.ai / Console)
+- Для Telegram-адаптера: бот от [@BotFather](https://t.me/BotFather), группа
+  с Topics, бот — админ с правом «Manage Topics»
+- `bubblewrap` (`apt install bubblewrap`) для песочницы по умолчанию
+  (`SANDBOX=off` — отключить; `SANDBOX=agent-vm` — microVM, нужен KVM)
 
 ⚠️ Channels — research preview: синтаксис флагов и протокол могут меняться.
-Кастомные каналы загружаются через `--dangerously-load-development-channels`.
 
 ## Установка и запуск
 
 ```bash
 ./install.sh      # venv + зависимости + systemd user-unit + linger
-nano .env         # TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS
-systemctl --user enable --now tg-claude-orchestrator
-journalctl --user -u tg-claude-orchestrator -f
+nano .env         # TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS; ADAPTERS=telegram,web
+systemctl --user enable --now claude-orchestrator
+journalctl --user -u claude-orchestrator -f
 ```
 
-Вручную: `.venv/bin/python -m orchestrator`.
-Удалить сервис: `./install.sh --uninstall` (репозиторий и `.env` не трогает).
+Вручную: `.venv/bin/python -m orchestrator`. Старый юнит
+`tg-claude-orchestrator` install.sh снимает автоматически.
 
-Тесты офлайновые (без Telegram и Claude): контракт channel-сервера, логика
-кнопок, бабл, вотчдог, песочница, Stop-фолбэк и т.д. Всё разом:
-
-```bash
-tests/run_all.sh                  # каждый тест можно гонять и отдельно:
-.venv/bin/python tests/smoke_test.py
-```
-
-Линт (конфиг в `pyproject.toml`, инструменты — `requirements-dev.txt`):
-
-```bash
-.venv/bin/ruff check .
-```
-
-CI (GitHub Actions, `.github/workflows/ci.yml`) гоняет линт и все тесты
-на Python 3.10/3.12.
-
-Сервис — user-unit (`Restart=on-failure` + `StartLimitBurst` от
-рестарт-штопора), `install.sh` включает `loginctl enable-linger`: работает
-в фоне и переживает разлогин. При остановке оркестратора записи сессий
-сохраняются в `SESSIONS_DIR/.sessions.json` — после перезапуска сессии
-возобновляются по первому сообщению в топике.
+Тесты офлайновые (без Telegram и Claude): `tests/run_all.sh`.
+Линт: `.venv/bin/ruff check .` CI (GitHub Actions) гоняет оба на 3.10/3.12.
 
 ## Конфигурация (.env)
 
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
-| `TELEGRAM_BOT_TOKEN` | — | **Обязательно.** Токен бота |
-| `TELEGRAM_CHAT_ID` | автопривязка | ID группы; узнать — команда `/chat_id`. Лучше задать явно |
+| `ADAPTERS` | `telegram` | Интерфейсы через запятую: `telegram`, `web` (можно оба) |
+| `MODULES` | — | Модули: `wallet` |
+| `TELEGRAM_BOT_TOKEN` | — | Токен бота (обязателен при telegram в ADAPTERS) |
+| `TELEGRAM_CHAT_ID` | автопривязка | ID группы; узнать — `/chat_id` |
 | `ALLOWED_USER_IDS` | пусто (никто) | **Обязательно.** Белый список, через запятую |
-| `CHANNEL_PORT_START` / `_END` | авто | Пул портов channel-серверов. Не задано — ОС выдаёт свободный localhost-порт на сессию; задать диапазон только для предсказуемых портов |
-| `SESSIONS_DIR` | `~/tg-claude-sessions` | Директория сессий |
+| `WEB_HOST` / `WEB_PORT` | `127.0.0.1:8180` | Адрес веб-интерфейса |
+| `WEB_TOKEN` | автогенерация | Токен доступа к вебу; пуст — печатается URL в лог |
+| `WALLET_SECRETS_FILE` | `~/.config/claude-orchestrator/secrets.toml` | Секреты кошелька (0600) |
+| `CHANNEL_PORT_START`/`_END` | авто | Пул портов channel-серверов |
+| `SESSIONS_DIR` | `~/tg-claude-sessions` | Директория сессий (дефолт прежний — совместимость) |
 | `MAX_INSTANCES` | 5 | Лимит одновременных сессий |
 | `CLAUDE_BIN` | `claude` | Путь к бинарнику Claude Code |
-| `DEFAULT_MODEL` | — | Модель по умолчанию для новых сессий (псевдоним `opus`/`sonnet`/… или точное имя). Не задано — дефолт Claude/профиля/проекта. `/model` перекрывает |
-| `DEFAULT_EFFORT` | — | Effort по умолчанию: `low`/`medium`/`high`/`xhigh`/`max`. Не задано — решает Claude/профиль/проект |
+| `DEFAULT_MODEL` / `DEFAULT_EFFORT` | — | Модель/effort новых сессий; `/model` перекрывает |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Свой профиль Claude Code |
-| `CLAUDE_ENV_<ИМЯ>` | — | Проброс env в процесс claude: `CLAUDE_ENV_ANTHROPIC_BASE_URL=…` → claude получит `ANTHROPIC_BASE_URL=…` |
-| `ORCH_PORT` | 18080 | HTTP-порт оркестратора |
-| `ORCH_HOST` | 127.0.0.1 | Хост оркестратора для channel-серверов |
+| `CLAUDE_ENV_<ИМЯ>` | — | Проброс env в процесс claude |
+| `ORCH_PORT` / `ORCH_HOST` | `18080` / `127.0.0.1` | Внутренний HTTP ядра |
+| `ORCH_TOKEN` | автогенерация | Секрет внутреннего API (зафиксируй для стабильности) |
 | `SHOW_TOOL_CALLS` | `true` | Вызовы инструментов в статус-бабле |
-| `DELETE_BUBBLE` | `true` | Удалять бабл после ответа (`false` — оставить как журнал) |
-| `INCOMING_DIR` | `incoming` | Куда класть присланные файлы (отн. путь — в папке сессии) |
-| `PERMISSION_MODE` | `auto` | Режим разрешений: `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan` |
-| `SANDBOX` | `bwrap` | Файловая песочница: `bwrap` (изоляция ФС через bubblewrap) / `off` (без изоляции) |
-| `SANDBOX_EXTRA_RW` | — | Доп. пути, открытые из песочницы на запись (через `:`) |
-| `BOT_LANG` | `ru` | Язык сообщений бота: `ru` / `en` |
-| `IDLE_TIMEOUT_H` | 6 | Авто-останов сессии после N ч простоя (0 — выкл.) |
-| `LOG_MAX_MB` | 10 | Ротация `claude.log` при превышении размера (0 — выкл.) |
+| `DELETE_BUBBLE` | `true` | Удалять бабл после ответа (`false` — журнал) |
+| `SHOW_COMMAND_MENU` | `true` | Меню «/» в Telegram |
+| `INCOMING_DIR` | `incoming` | Куда класть присланные файлы |
+| `PERMISSION_MODE` | `auto` | `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan` |
+| `SANDBOX` | `bwrap` | `bwrap` / `agent-vm` (эксперимент) / `off` |
+| `SANDBOX_EXTRA_RW` | — | Доп. RW-пути из песочницы (через `:`) |
+| `AGENT_VM_MEMORY_GIB`/`_CPUS`/`_IMAGE` | — | Ресурсы/пин образа microVM |
+| `BOT_LANG` | `ru` | Язык сообщений: `ru` / `en` |
+| `IDLE_TIMEOUT_H` | 6 | Авто-останов после N ч простоя (0 — выкл.) |
+| `LOG_MAX_MB` | 10 | Ротация `claude.log` (0 — выкл.) |
 
 ⚠️ **Безопасность.** Доступ строго по белому списку: пустой
-`ALLOWED_USER_IDS` = бот игнорирует всех. Кто в списке — тот и одобряет
-запросы разрешений (permission relay), доверяй его только себе.
+`ALLOWED_USER_IDS` = все сообщения игнорируются. Кто в списке — тот и
+одобряет permission-запросы. Веб-интерфейс защищён токеном, но наружу
+(не localhost) выставляй только за reverse-proxy с TLS.
+
+## Веб-интерфейс (`ADAPTERS=…,web`)
+
+Локальная SPA (vanilla JS, без CDN) на `http://127.0.0.1:8180/?token=…`
+(URL с токеном печатается в лог при старте, как у Jupyter):
+
+- список сессий со статусами, создание (имя + путь проекта), остановка/удаление;
+- чат сессии: история (журнал ядра) + живые события по WebSocket;
+- статус-бабл в реальном времени с кнопками «⏹ Стоп» и «⛔ Прервать»;
+- permission-запросы карточками ✅/❌ (первый ответ побеждает — хоть из веба,
+  хоть из Telegram);
+- файлы в обе стороны (drag&drop / скрепка; от Claude — ссылки на скачивание,
+  строго внутри workspace сессии);
+- `/stats`, `/usage`, смена модели, `/compact`, `/clear`, bash-панель.
+
+Работает отдельно (`ADAPTERS=web` — без Telegram вообще) или параллельно.
 
 ## Файловая песочница (`SANDBOX`)
 
 По умолчанию (`SANDBOX=bwrap`) процесс `claude` и `/bash`-терминал каждой
-сессии запускаются в изолированном mount-namespace через
-[bubblewrap](https://github.com/containers/bubblewrap) — без root, на
-unprivileged user namespaces. Внутри `$HOME` подменён пустым tmpfs, и наружу
-видны **только** явно разрешённые пути:
+сессии заперты в mount-namespace ([bubblewrap](https://github.com/containers/bubblewrap),
+без root). Наружу видны **только**:
 
 | Что | Доступ | Зачем |
 |-----|--------|-------|
-| Папка сессии + папка проекта (`linked_path`) | чтение/запись | собственно работа |
-| `CLAUDE_CONFIG_DIR` (`~/.claude`) + `~/.claude.json` | чтение/запись | токены, скиллы, plugins, транскрипты |
-| Бинарь claude (`~/.local/share/claude`, `~/.local/bin`) | чтение | запуск |
-| Репозиторий оркестратора (`channel_server.py` + `.venv`) | чтение | MCP-канал и хуки |
-| Системный рантайм (`/usr`, `/etc`, …) | чтение | библиотеки, TLS-сертификаты, DNS |
-| `SANDBOX_EXTRA_RW` | чтение/запись | доп. рабочие каталоги |
+| Папка сессии + папка проекта | чтение/запись | собственно работа |
+| Приватный дом сессии (`SESSIONS_DIR/.homes/<имя>`) | как `$HOME` | venv/кэши агента, **переживают рестарт** |
+| `CLAUDE_CONFIG_DIR` + `~/.claude.json` | чтение/запись | токены, скиллы, транскрипты |
+| Бинарь claude, репозиторий оркестратора | чтение | запуск, MCP-канал, `wallet` CLI |
+| Системный рантайм (`/usr`, `/etc`, `/run/systemd/resolve`) | чтение | библиотеки, TLS, **DNS при systemd-resolved** |
+| `SANDBOX_EXTRA_RW` | чтение/запись | доп. каталоги |
 
-Всё остальное — другие проекты, `~/.ssh`, `~/.aws`, история shell, системные
-каталоги — **не видно** ни на чтение, ни на запись. Запись в подменённый
-`$HOME` уходит в эфемерный tmpfs и на диск не попадает.
+Всё остальное — другие проекты, `~/.ssh`, `~/.aws`, реальный `$HOME` — не
+видно ни на чтение, ни на запись. В отличие от нативного `/sandbox` Claude
+Code (только Bash-тул), обёртка накрывает все инструменты разом. Сеть общая
+с хостом (нужна для API и localhost-ядра).
 
-В отличие от нативного `/sandbox` Claude Code (он ограничивает только
-Bash-тул, а `Read`/`Write`/`Edit`, MCP и хуки оставляет на хосте), обёртка
-вокруг всего процесса накрывает **все** инструменты сразу. Это дополняет
-app-level jail для `send_file_to_telegram` (проверка путей от промпт-инъекций)
-ОС-уровневой изоляцией.
+`SANDBOX=agent-vm` — сессии в microVM через
+[wirenboard/agent-vm](https://github.com/wirenboard/agent-vm): жёсткая
+изоляция ядра ОС, креды через host-side прокси. Каркас готов
+(`runners/agentvm.py`), живой прогон — см. `docs/agent-vm-integration.md`;
+одна сессия на каталог (гвард в ядре). `SANDBOX=off` — без изоляции.
 
-Сеть — общая с хостом (нужна для API Anthropic и localhost-оркестратора);
-фильтрации по доменам bubblewrap не делает. Требуется пакет `bubblewrap` и
-разрешённые unprivileged user namespaces (Ubuntu 24.04+ — см.
-`kernel.apparmor_restrict_unprivileged_userns`). Если песочница включена, но
-недоступна, бот **не стартует** с понятной ошибкой — молча без изоляции не
-запускается. `SANDBOX=off` отключает изоляцию (менее безопасно; для машин без
-bwrap).
+## Кошелёк секретов (`MODULES=wallet`)
+
+Токены/пароли для CLI-тулз (gh, git push, kubectl…) **без доступа модели к
+значениям** — секрет не существует в адресном пространстве песочницы:
+
+- секреты и policy — `WALLET_SECRETS_FILE` (TOML, 0600, вне allowlist
+  песочницы): каким сессиям доступен, шаблоны разрешённых команд, нужен ли
+  confirm;
+- в сессии доступен CLI: `wallet ls`, `wallet run <имя> -- gh pr list` —
+  демон ядра исполняет команду **на хосте** с секретом в env ребёнка;
+- известные значения секретов вымарываются из stdout/stderr (`•••`);
+- каждый запуск виден: строка `🔐 wallet: …` в бабле, при `confirm=true` —
+  кнопки подтверждения во всех адаптерах до исполнения.
+
+Формат и модель угроз: `docs/secrets-wallet.md`. С `SANDBOX=off` кошелёк
+бессмыслен (модель прочитает файл секретов напрямую) — модуль предупредит.
 
 ## Режимы разрешений и permission relay
 
-`PERMISSION_MODE` управляет тем, что Claude может делать без вопросов:
+`PERMISSION_MODE` — как в прежних версиях (`auto` по умолчанию; `bypass` =
+`--dangerously-skip-permissions`). Во всех режимах, кроме `bypass`, запросы
+разрешений прилетают кнопками ✅/❌ во все интерфейсы; применяется первый
+ответ (параллельно остаётся и локальный TUI-диалог). Канальные тулы
+(`reply_to_user`, `send_file_to_user`) предразрешены. `AskUserQuestion`
+запрещён (виснет без TUI) — Claude спрашивает через канал нумерованными
+вариантами.
 
-| Режим | Поведение |
-|-------|-----------|
-| `auto` (по умолчанию) | Классификатор Claude Code решает по каждому вызову; сомнительное — спрашивает |
-| `bypass` | Без ограничений (`--dangerously-skip-permissions`) — ничего не спрашивает |
-| `acceptEdits` | Правки файлов без вопросов, остальное спрашивает |
-| `manual` | Спрашивает всё, что не разрешено правилами |
-| `dontAsk` | Запрещает всё неразрешённое, не спрашивая |
-| `plan` | Только чтение; правки и команды спрашивает |
+## Команды (Telegram)
 
-Во всех режимах, кроме `bypass`, запросы разрешений прилетают **в топик
-кнопками ✅/❌** (официальный permission relay из контракта каналов):
+Меню команд регистрируется автоматически. В основном чате: `/new <имя>`,
+`/new [имя] /путь`, `/list`, `/ls [путь]`, `/skills`, `/chat_id`, `/help`.
 
-```
-🔐 Запрос разрешения
-Bash: Установить зависимости проекта
-npm install
-[✅ Разрешить] [❌ Отклонить]
-```
-
-Параллельно остаётся открытым и локальный TUI-диалог — применяется тот
-ответ, который пришёл первым. Тулы самого канала (`reply_to_telegram`,
-`send_file_to_telegram`) предразрешены в настройках сессии — на каждое
-сообщение кнопка не выскакивает.
-
-**Интерактивные вопросы Claude.** Plan mode и инструмент AskUserQuestion
-всплывали бы в терминале сессии, невидимо для Telegram. Инструкция канала
-явно запрещает их: когда Claude нужно решение, он задаёт вопрос через
-`reply_to_telegram` нумерованными вариантами и ждёт следующего сообщения
-(проверено вживую). Так «слепых» зависаний в терминале не возникает.
-
-## Команды
-
-Меню команд регистрируется в Telegram автоматически (кнопка «/»).
-
-**В основном чате:**
-
-| Команда | Описание |
-|---------|----------|
-| `/new <имя>` | Новая сессия. Имя может быть с пробелами/эмодзи (`/new Мой проект` или `/new "Data Analyst"`) — это название топика; для папки/портов берётся безопасный slug |
-| `/new /путь` | Сессия с привязкой папки (создастся, если нет); имя = basename |
-| `/new имя /путь` | То же, со своим именем (путь — токен, начинающийся с `/`) |
-| `/list` | Сессии со статусами (🔄 работает / 🟢 ожидает / ⏸ остановлена) и кнопками |
-| `/ls [путь]` | Файлы (по умолчанию `SESSIONS_DIR`; `~` разворачивается) |
-| `/skills` | Список скиллов профиля (работает и в топике) |
-| `/chat_id` | Показать ID чата и привязать бота (работает в любой группе) |
-| `/help` | Справка |
-
-**В топике сессии:**
-
-| Команда | Описание |
-|---------|----------|
-| Текст | Отправляется в Claude; остановленная сессия возобновится сама |
-| Фото/файл | Скачивается в `INCOMING_DIR`, путь передаётся Claude |
-| `/stats` | Модель, контекст (токены), сгенерировано, ходы, аптайм (из транскрипта) |
-| `/usage` | Расходы и лимиты плана: стоимость сессии, % лимита 5ч и недели, сброс (парсит `/cost` Claude Code) |
-| `/model [имя]` | Модель: кнопки-синонимы fable/opus/sonnet/haiku или точное имя. Перезапуск с resume |
-| `/compact` | Сжать контекст (печатается в терминал сессии) |
-| `/clear` | Чистый контекст: перезапуск с новым UUID, топик остаётся |
-| `/close_session` | Остановить процесс; топик и запись остаются |
-| `/delete_session` | Удалить сессию вместе с топиком |
-| `/что-угодно` | Неизвестные команды печатаются в терминал Claude — работают команды Claude Code (`/context`, `/mcp`, `/usage`…). Их вывод остаётся в `claude.log` |
-
-**Файлы в обе стороны:** присланное в топик фото/документ сохраняется в
-`INCOMING_DIR` и путь передаётся Claude (картинки он читает инструментом
-Read); обратно Claude присылает файлы сам — тулом
-`send_file_to_telegram(context_id, file_path, caption)` (до 50 МБ).
+В топике сессии: текст/фото/файл — Claude (остановленная сессия возобновится
+сама); `/stats`, `/usage`, `/model [имя]`, `/compact`, `/clear`,
+`/close_session`, `/delete_session`, `/bash <cmd>` и `/bashin <ввод>`
+(постоянный терминал мимо Claude, в той же песочнице и с тем же домом
+сессии); прочие `/команды` печатаются в терминал Claude Code.
 
 ## Жизненный цикл сессии
 
 ```
 /new ──> работает ──/close_session──> остановлена ──сообщение──> resume
-                    (или падение,     (топик жив)      │
-                     или рестарт                       ├─ claude --resume <uuid> — контекст продолжен
-                     launcher'а)                       └─ не вышло → чистый старт (честно сообщается)
+                    (или падение,     (топик/запись живы)  │
+                     или рестарт                           ├─ claude --resume — контекст продолжен
+                     оркестратора)                         └─ не вышло → чистый старт (честно сообщается)
 ```
 
-- Готовность = channel-сервер Claude отвечает на `/ping` (до 60 с).
-- За процессом следит watcher; при смерти Claude сессия помечается
-  остановленной, в топик приходит уведомление с хвостом `claude.log`.
-- Простаивающие сессии (> `IDLE_TIMEOUT_H`) авто-останавливаются, освобождая
-  память; топик и контекст сохраняются, resume — по сообщению.
-- При старте бот постит в чат «онлайн, восстановлено N сессий».
-- При остановке убивается вся группа процессов (иначе channel_server
-  осиротеет и продолжит держать порт).
-- `stdout/stderr` (вывод PTY) — в `SESSIONS_DIR/<имя>/claude.log`.
+- Готовность = channel-сервер отвечает на `/ping` (до 60 с).
+- Смерть Claude ловит watcher → уведомление с хвостом `claude.log` во все
+  интерфейсы; простой > `IDLE_TIMEOUT_H` — авто-останов с сохранением записи.
+- Состояние в `SESSIONS_DIR/.sessions.json` (атомарно); старый формат
+  (thread_id) мигрирует в bindings автоматически.
 
 ## Статус-бабл
 
-Пока Claude работает, в топике живёт одно редактируемое сообщение:
+Пока Claude работает, в каждом интерфейсе живёт обновляемый статус:
 
 ```
 ⏳ Работаю…
+📨 почини тесты
 ⚡ Bash: pytest -x
-📖 Read: test_api.py
+  ↳ 5× 📖 Read: conftest.py     ← тулы сабагента, схлопнуто
 💬 Нашёл причину, чиню conftest.py
-🤖 Сабагент reviewer: проверяю дифф
-[⏹ Стоп]
+[⏹ Стоп-отчёт] [⛔ Прервать]
 ```
 
-- Вызовы инструментов (PreToolUse-хук → `POST /event/<имя>`): иконка под
-  инструмент (⚡ Bash, 📖 Read, ✏️ Edit, 🔍 Grep, 🌐 WebFetch…), имя жирным,
-  деталь моноширинно (для файловых — только имя файла). Спавн сабагента —
-  строкой `🤖 Сабагент <тип>`. Отключается `SHOW_TOOL_CALLS=false`.
-- 💬 — промежуточные ответы (`reply_to_telegram` с `complete=false`), курсивом.
-- Редактирование не чаще раза в ~1.5 с, без уведомлений; при переполнении
-  старые строки вытесняются. Событие после завершения хода игнорируется
-  (не создаёт бабл-сироту).
-- **⏹ Стоп** — мягкая остановка (push «прекрати и отчитайся»); это не Esc:
-  жёсткого прерывания текущего хода в channels нет. Зависшую bash-команду
-  надёжно обрывает только `/close_session` (kill группы процессов + resume).
-- Финальный ответ (`complete=true`) — обычным сообщением, бабл удаляется.
-- Токенового стриминга нет: ответ приходит целиком через вызов тула.
+- События — из PreToolUse-хука; серии одинаковых вызовов схлопываются
+  (`N×`), сабагенты — с отступом. `SHOW_TOOL_CALLS=false` отключает.
+- **⏹ Стоп-отчёт** — мягкая остановка (push «сверни работу и отчитайся»).
+- **⛔ Прервать** — настоящий Esc в PTY: ход обрывается немедленно, контекст
+  сессии сохраняется (эквивалент Esc в TUI; в самом channels-протоколе
+  прерывания нет).
+- Финал (`complete=true`) приходит обычным сообщением, бабл удаляется
+  (`DELETE_BUBBLE=false` — остаётся журналом).
+- Stop-хук страхует «потерянный финал»: если ход кончился голым текстом без
+  reply-тула, текст доотправляется.
 
 ## Протокол (по [channels-reference](https://code.claude.com/docs/en/channels-reference))
 
-- Capability: `capabilities.experimental["claude/channel"] = {}` + `tools: {}`;
-  `instructions` в initialize объясняет Claude формат событий и reply-тул.
-- Push: `notifications/claude/channel` c `params = {content, meta: {context_id}}`;
-  Claude видит `<channel source="tg-channel-<имя>" context_id="tg:...">текст</channel>`.
-- Ответ: тул `reply_to_telegram(context_id, text, complete)` →
-  `POST /reply` оркестратора → сообщение в нужный топик.
-- Слэш-команды (`/compact`, `/context`…) печатаются прямо в PTY сессии,
-  не через канал.
-- Запуск: `claude --session-id=<uuid> [--model <имя>] [--effort <уровень>]
+- Capability `claude/channel` + `claude/channel/permission`; push
+  `notifications/claude/channel` c `{content, meta:{context_id}}`.
+- `context_id = <адаптер>:<имя-сессии>:<токен-адаптера>` — по нему ядро
+  находит сессию и отдаёт адаптеру-источнику reply-цитату.
+- Ответ: тул `reply_to_user(context_id, text, complete)`; файлы —
+  `send_file_to_user` (только по явной просьбе пользователя; jail по
+  workspace). MCP-сервер сессии называется `channel-<имя>`.
+- Запуск: `claude --session-id=<uuid> [--model …] [--effort …]
   --mcp-config <сессия>/.mcp.json --settings <сессия>/.claude/settings.local.json
-  --dangerously-load-development-channels server:tg-channel-<имя>
-  (--permission-mode <mode> | --dangerously-skip-permissions при bypass)`,
-  `cwd` = папка проекта. Dev-флаг ссылается на сервер из `--mcp-config`;
-  `--session-id` требует UUID. `--model`/`--effort` — только если заданы
-  `DEFAULT_MODEL`/`DEFAULT_EFFORT` (или `/model` на сессию).
-- Согласие на MCP-сервер предодобрено `enableAllProjectMcpServers` в
-  `.claude/settings.local.json` сессии (подаётся через `--settings`, мержится
-  с профилем и проектом). `AskUserQuestion` запрещён в `permissions.deny`
-  (интерактивное меню виснет без TTY); в bypass-режиме страж — системный промпт.
+  --dangerously-load-development-channels server:channel-<имя>`, cwd = папка
+  проекта; изоляция — через раннер.
+- Хуки (PreToolUse + Stop) — один скрипт-диспетчер с токеном в 0600-файле.
 
-- Permission relay: capability `claude/channel/permission`; запрос
-  (`notifications/claude/channel/permission_request`) пересылается на
-  `POST /permission/<имя>` оркестратора, вердикт возвращается через
-  `POST /permission` channel-сервера уведомлением
-  `notifications/claude/channel/permission {request_id, behavior}`.
+## Как расширять
 
-Проверено вживую (claude 2.1.205): спавн channel-сервера, handshake,
-push→ход→ответ, хуки инструментов, close/resume с fallback,
-`send_file_to_telegram`, смена модели (`--model sonnet`), проброс
-слэш-команд в PTY (`/context`), permission relay в режиме `default`
-(запрос → allow → выполнение → ответ).
+Принцип проекта — **наблюдаемость**: всё, что модель делает в фоне, должно
+быть видно пользователю в каждом интерфейсе.
 
-## Как добавить фичу
-
-Принцип проекта — **наблюдаемость**: всё, что модель делает в фоне (тулы,
-сабагенты, ретраи, зависания), должно быть видно пользователю. Новые фичи
-при развилках дизайна выбирают наблюдаемый вариант.
-
-Типовые расширения:
-
-- **Новая команда бота** — хендлер в `bot.py` (`cmd_*` + регистрация в
-  `_register_handlers` + пункт меню в `start_polling`), тексты — парой
-  ru/en в `texts.py` (паритет ключей проверяет `smoke_test`). Inline-кнопки —
-  формат в `cbdata.py` (build+parse рядом), регресс — в `callbacks_test.py`.
-- **Новый способ изоляции / запуска процессов** — класс с методом
-  `wrap(argv, chdir, extra_rw)` в `runner.py` + ветка в `make_runner()` +
-  значение `SANDBOX` в `config._parse_sandbox`. Больше ничего трогать не
-  надо: и `claude`, и `/bash` запускаются через раннер.
-- **Новая логика хода** (индикаторы, сторожа) — в `TurnSupervisor`
-  (`turn.py`): он единственный владелец фоновых задач между «сообщение
-  ушло в Claude» и «пришёл финальный ответ».
-- **Рендер строк бабла** — `toolline.py` (чистые функции, регресс —
-  `tool_line_test.py`).
-- **Новый транспорт (Matrix, …)** — пока не абстрагирован: Telegram-специфика
-  сосредоточена в `bot.py`/`bubble.py`, остальные модули транспорта не знают.
-  Направление — `docs/messaging-connector.md`.
+- **Новый интерфейс (Matrix, …)** — подпакет в `adapters/` с реализацией
+  `Transport` + ветка в `adapters.make_adapters` + имя в
+  `config._parse_adapters`. Ядро трогать не нужно
+  (см. `docs/messaging-connector.md`).
+- **Новый способ изоляции** — модуль в `runners/` (протокол `Runner`:
+  `wrap`, `preflight`, `unique_cwd`) + ветка в `make_runner` + значение
+  `SANDBOX`.
+- **Новый модуль** — подпакет в `modules/` (объект с `name`,
+  `start(core)`, `stop()`) + ветка в `modules.make_modules` + имя в
+  `config._parse_modules`. В ядре для модулей есть `core.session_hooks`
+  (обвязка новых сессий) и `core.request_confirmation()` (кнопки ✅/❌ во
+  всех интерфейсах).
+- **Новая команда** — логика в `core/app.py`, тонкие обработчики в
+  адаптерах; тексты — парой ru/en в `core/texts.py` (паритет проверяет
+  smoke-тест).
 
 После правок: `tests/run_all.sh` и `.venv/bin/ruff check .`.
 
@@ -374,9 +311,10 @@ push→ход→ответ, хуки инструментов, close/resume с f
 
 | Документ | Что описывает |
 |----------|----------------|
-| [`docs/agent-vm-integration.md`](docs/agent-vm-integration.md) | Замена bwrap-песочницы на microVM ([wirenboard/agent-vm](https://github.com/wirenboard/agent-vm)): сессии в изолированных ВМ, управление ими из Telegram |
-| [`docs/secrets-wallet.md`](docs/secrets-wallet.md) | «Кошелёк секретов»: токены/пароли доступны CLI-инструментам, но не видны модели |
-| [`docs/messaging-connector.md`](docs/messaging-connector.md) | Путь к нескольким мессенджерам (Matrix) через выделение транспорт-коннектора |
+| [`docs/agent-vm-integration.md`](docs/agent-vm-integration.md) | Сессии в microVM (wirenboard/agent-vm): каркас готов, план живого прогона |
+| [`docs/secrets-wallet.md`](docs/secrets-wallet.md) | Кошелёк секретов: модель угроз, policy, этапы (этап 1 реализован) |
+| [`docs/messaging-connector.md`](docs/messaging-connector.md) | Транспорт-коннектор: реализован; памятка для новых адаптеров |
+| [`docs/archive/`](docs/archive/) | Исторические ревью |
 
 ## Лицензия
 
