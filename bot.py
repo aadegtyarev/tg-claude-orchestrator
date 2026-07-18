@@ -270,29 +270,9 @@ class TelegramBot:
         self._watchdogs: dict[int, asyncio.Task] = {}
         # thread_id -> ретранслятор ошибок API (rate-limit/5xx) из claude.log.
         self._error_relays: dict[int, asyncio.Task] = {}
-        # thread_id -> [message_id] сообщения топика (входящие юзера + ответы
-        # Claude), чтобы /clear мог снести саму переписку, оставив топик.
-        self._topic_msgs: dict[int, list[int]] = {}
         # /bash — постоянный терминал на топик, в обход Claude Code.
         self.bash = BashShellManager()
         self._register_handlers()
-
-    def _track_msg(self, thread_id: int | None, msg_id: int | None) -> None:
-        if thread_id and msg_id:
-            self._topic_msgs.setdefault(thread_id, []).append(msg_id)
-
-    async def _clear_topic_msgs(self, thread_id: int) -> None:
-        """Удалить все отслеженные сообщения топика (сам топик оставить).
-
-        Best-effort: боты не умеют ни перечислять, ни удалять пачкой — только
-        по известным id. Неотслеженное (системные статусы, старое до старта)
-        остаётся. Ошибки игнорируем (уже удалено / старше 48 ч).
-        """
-        for mid in self._topic_msgs.pop(thread_id, []):
-            try:
-                await self.bot.delete_message(self.chat_id, mid)
-            except Exception:
-                pass
 
     def t(self, key: str, **kwargs) -> str:
         return self._texts[key].format(**kwargs)
@@ -784,9 +764,6 @@ class TelegramBot:
             await self.manager.close(session)
             await status.edit_text(self.t("clear_fail", error=e))
             return
-        # Чистая переписка в топике (сам топик остаётся). Статус clear_done не
-        # трекается — остаётся как отметка нового старта.
-        await self._clear_topic_msgs(session.thread_id)
         await status.edit_text(self.t("clear_done"))
 
     async def cmd_compact(self, message: Message) -> None:
@@ -1006,7 +983,6 @@ class TelegramBot:
             return
         if not await self._ensure_running(session, message):
             return
-        self._track_msg(message.message_thread_id, message.message_id)
         await self._forward(session, message, self._with_quote(message))
 
     def _with_quote(self, message: Message) -> str:
@@ -1044,7 +1020,6 @@ class TelegramBot:
         if not self._accept(message):
             return
         await self._react(message, "👀")
-        self._track_msg(message.message_thread_id, message.message_id)
         session = self._topic_session(message)
         if session is None:
             return
@@ -1581,7 +1556,6 @@ class TelegramBot:
                             logger.error("Не удалось отправить сообщение в чат %s", chat_id)
                             return
                 if sent:
-                    self._track_msg(kwargs.get("message_thread_id"), getattr(msg, "message_id", None))
                     break
 
     @staticmethod
