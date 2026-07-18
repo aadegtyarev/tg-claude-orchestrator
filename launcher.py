@@ -48,6 +48,7 @@ async def main() -> None:
         bot.handle_reply,
         bot.handle_tool_event,
         bot.handle_permission_request,
+        bot.handle_stop_event,
     )
 
     sweeper = asyncio.create_task(_idle_sweeper(config, manager, bot))

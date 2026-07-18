@@ -229,6 +229,17 @@ class TelegramBot:
         self._watchdogs: dict[int, asyncio.Task] = {}
         # thread_id -> ретранслятор ошибок API (rate-limit/5xx) из claude.log.
         self._error_relays: dict[int, asyncio.Task] = {}
+        # thread_id -> было ли ПОСЛЕДНЕЕ действие модели (до этого Stop-события)
+        # вызовом reply_to_telegram. Гейт для handle_stop_event: длинный ход
+        # часто заканчивается голым текстом вместо tool-вызова — этот текст
+        # канал не видит и он не долетает до Telegram (REVIEW.md: 9/9 длинных
+        # ходов в живой сессии теряли финал именно так). ВАЖНО: это не «reply
+        # был где-то в ходе» — reply мог случиться в середине, а потом ещё
+        # шли Bash/Edit и голый текст после них уже потерян. Поэтому флаг
+        # ставится True на reply_to_telegram и явно сбрасывается в False
+        # любым ДРУГИМ тул-вызовом — остаётся True только если reply был
+        # самым последним, что видел бот перед Stop.
+        self._last_action_was_reply: dict[int, bool] = {}
         # /bash — постоянный терминал на топик, в обход Claude Code.
         self.bash = BashShellManager()
         self._register_handlers()
@@ -690,6 +701,7 @@ class TelegramBot:
             return
         await callback.answer(self.t("delete_doing"))
         self._stop_typing(session.thread_id)
+        self._last_action_was_reply.pop(session.thread_id, None)
         await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.delete(session)
@@ -1364,11 +1376,47 @@ class TelegramBot:
         if session is None or self.chat_id is None:
             return
         tool = str(payload.get("tool_name") or "?")
-        if "reply_to_telegram" in tool or "send_file_to_telegram" in tool:
+        # reply_to_telegram — единственное действие, после которого «до Stop
+        # больше ничего не потерять» истинно; ЛЮБОЙ другой тул (в т.ч.
+        # send_file_to_telegram) сбрасывает флаг — см. _last_action_was_reply.
+        self._last_action_was_reply[session.thread_id] = "reply_to_telegram" in tool
+        if "reply_to_telegram" in tool:
             return  # результат и так придёт сообщением — в бабле это шум
+        if "send_file_to_telegram" in tool:
+            return  # тоже придёт сообщением — не считается «текстовым» ответом,
+            # но и не фолбэчим на файл: реальная причина потерь — именно текст
         await self.bubbles.append(
             session.thread_id, self._tool_line(tool, payload.get("tool_input") or {})
         )
+
+    async def handle_stop_event(self, session_name: str, payload: dict) -> None:
+        """Вызывается reply-сервером на Stop-хук — конец хода Claude Code.
+
+        Фолбэк против «потерянного финала»: если последним действием модели
+        перед этим Stop был НЕ reply_to_telegram (т.е. ход закончился на
+        Bash/Edit/… + голый текст, или reply был раньше, а потом ещё шла
+        работа), а last_assistant_message непустой — этот текст канал не
+        ретранслировал, он не долетел до Telegram (REVIEW.md: 9/9 длинных
+        ходов в живой сессии теряли финал именно так). Шлём его сами,
+        отдельной строкой-пометкой, чтобы не выглядело как обычный ответ
+        модели через канал.
+
+        Не закрывает бабл/typing: Stop не означает «ход окончательно завершён
+        для пользователя» — часто это пауза перед автопродолжением (ждём CI,
+        фоновый шелл), и _watchdog_loop/_error_relay_loop уже это покрывают.
+        """
+        session = self.manager.get_by_name(session_name)
+        if session is None or self.chat_id is None:
+            return
+        thread_id = session.thread_id
+        last_was_reply = self._last_action_was_reply.get(thread_id, False)
+        self._last_action_was_reply[thread_id] = False  # новое окно до следующего Stop
+        if last_was_reply:
+            return
+        text = str(payload.get("last_assistant_message") or "").strip()
+        if not text:
+            return
+        await self._send(self.chat_id, thread_id, f"{self.t('stop_fallback_prefix')}\n{text}")
 
     def _tool_line(self, tool: str, tool_input: dict) -> str:
         """HTML-строка бабла: иконка + имя жирным + короткая деталь моноширинно.

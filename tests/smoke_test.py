@@ -64,6 +64,9 @@ async def test_channel_server():
     assert caps["experimental"]["claude/channel"] == {}
     assert caps["experimental"]["claude/channel/permission"] == {}
     assert caps["tools"] == {} and r["result"]["instructions"]
+    # Регресс: инструкция явно предупреждает, что голый текст невидим —
+    # источник «потерянных финалов» (см. REVIEW.md, tests/stop_fallback_test.py).
+    assert "INVISIBLE" in r["result"]["instructions"]
     await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     # битая строка не роняет цикл
