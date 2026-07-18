@@ -1,0 +1,26 @@
+# Метаданные и конфиг инструментов. Проект не собирается в пакет —
+# устанавливается клоном репозитория (install.sh), поэтому build-system нет.
+
+[project]
+name = "tg-claude-orchestrator"
+description = "Telegram-обёртка над параллельными сессиями Claude Code (форум-топики, статус-бабл, песочница)"
+requires-python = ">=3.10"
+dependencies = [
+    "aiogram>=3.16,<4",
+    "aiohttp>=3.9,<4",
+    "python-dotenv>=1,<2",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/W — pycodestyle, F — pyflakes (неиспользуемые импорты/имена и т.п.).
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Каталог сообщений — длинные строки текстов естественны.
+"orchestrator/texts.py" = ["E501"]
+# Тесты содержат длинные литералы-фикстуры (реальные строки логов/баблов).
+"tests/*" = ["E501"]

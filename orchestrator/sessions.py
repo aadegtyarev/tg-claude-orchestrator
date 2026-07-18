@@ -20,7 +20,6 @@ import json
 import logging
 import os
 import pty
-import re
 import socket
 import sys
 import threading
@@ -32,75 +31,26 @@ from typing import IO, Awaitable, Callable
 
 import aiohttp
 
-import sandbox
-from ansi import strip_ansi
-from config import Config
-from slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
+from . import hookscript
+from . import runner as runner_mod
+from . import transcript
+from .ansi import strip_ansi
+from .config import Config
+from .proctree import proc_tree_signals
+from .slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
 
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).parent
+# Каталог пакета (channel_server.py) и корень репозитория (.venv, RO-бинд
+# песочницы) — после раскладки по папкам это разные пути.
+PKG_DIR = Path(__file__).resolve().parent
+ROOT = PKG_DIR.parent
 
 # Сколько ждать, пока Claude стартует и поднимет channel-сервер.
 READY_TIMEOUT = 60.0
 # Пауза после resume: «claude --resume» без транскрипта умирает не сразу,
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
-
-# id «честного» server_tool_use от Anthropic — srvtoolu_<base>; чужой бэкенд
-# (z.ai/GLM) лепит id другого формата, на нём реальный Anthropic падает с 400.
-_SRVTOOLU_RE = re.compile(r"^srvtoolu_[A-Za-z0-9_]+$")
-
-
-def _block_snippet(block: dict, limit: int = 280) -> str:
-    """Сжатый человекочитаемый обрезок содержимого блока транскрипта."""
-    t = block.get("type")
-    if t in ("text", "thinking"):
-        body = str(block.get("text") or block.get("thinking") or "")
-    elif t in ("tool_use", "server_tool_use"):
-        body = f"{block.get('name', '?')}({json.dumps(block.get('input', {}), ensure_ascii=False)})"
-    elif t == "tool_result":
-        c = block.get("content")
-        body = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
-    else:
-        body = json.dumps(block, ensure_ascii=False)
-    body = " ".join(body.split())
-    return body[:limit] + ("…" if len(body) > limit else "")
-
-
-def _scan_pollution(entries) -> str | None:
-    """Найти загрязнение чужим бэкендом в записях транскрипта (новейшие — в конце).
-
-    Возвращает 'роль: маркер → обрезок' для самого свежего загрязнённого блока
-    либо None. Чистая функция — тестируется без файла/Telegram. Маркеры:
-      • thinking без signature — настоящий Anthropic ВСЕГДА подписывает thinking,
-        неподписанный = история пришла с другого бэкенда (z.ai/GLM);
-      • server_tool_use с id не формата srvtoolu_…;
-      • tool_result внутри assistant-сообщения (смещённый/чужой).
-    """
-    for entry in reversed(entries):
-        msg = entry.get("message")
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role") or entry.get("type") or "?"
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for b in content:
-            if not isinstance(b, dict):
-                continue
-            btype = b.get("type")
-            marker = None
-            if btype == "thinking" and not b.get("signature"):
-                marker = "thinking без подписи (чужой бэкенд)"
-            elif btype == "server_tool_use":
-                if not _SRVTOOLU_RE.match(str(b.get("id", ""))):
-                    marker = "server_tool_use с чужим id (не srvtoolu_…)"
-            elif btype == "tool_result" and role == "assistant":
-                marker = "tool_result в assistant-сообщении (чужой бэкенд)"
-            if marker:
-                return f"{role}: {marker} → {_block_snippet(b)}"
-    return None
 
 
 class SessionError(Exception):
@@ -114,115 +64,6 @@ _DIALOGS = [
     ("bypasspermissions", b"2\r"),     # «Yes, I accept» — пункт 2
     ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
 ]
-
-
-# Единый хук-диспетчер (PreToolUse + Stop) как отдельный python-скрипт (а не
-# curl с токеном в аргументах). Токен встроен константой в этот 0600-файл — НЕ
-# в cmdline (иначе виден в /proc/<pid>/cmdline любому локальному пользователю)
-# и НЕ в settings.local.json (0644). Раньше curl -H 'Authorization: Bearer …'
-# тёк в оба места (REVIEW S1, найдено адверсариальным ревью).
-#
-# Stop-хук — fallback против «потерянного финала» (REVIEW: модель нередко
-# завершает длинный ход обычным текстом вместо tool-вызова reply_to_telegram;
-# канал ретранслирует только явные tool-call'ы, голый текст остаётся в
-# транскрипте и не долетает до Telegram — 9/9 длинных ходов в живой сессии).
-# hook_event_name различает событие: PreToolUse → POST /event/<имя> (бабл),
-# Stop → POST /stop/<имя> с last_assistant_message (боту решать, нужен ли
-# fallback — см. bot.py handle_stop_event/_reply_seen_since_stop).
-#
-# __PORT__/__NAME__/__TOKEN__ подставляются обычным replace (без .format-
-# скобок, чтобы безопасно для любого значения токена).
-_HOOK_SCRIPT = '''#!/usr/bin/env python3
-"""Хук-диспетчер Claude Code (PreToolUse + Stop) → POST оркестратору.
-
-Токен встроен константой сюда (файл 0600), НЕ в cmdline/настройки — иначе
-ORCH_TOKEN виден локальному процессу через /proc/<pid>/cmdline (REVIEW.md S1).
-Читает событие из stdin, всегда выходит 0 — хук не должен блокировать Claude."""
-import json
-import sys
-import urllib.request
-
-_ORCH = "http://127.0.0.1:__PORT__"
-_NAME = "__NAME__"
-_TOKEN = "__TOKEN__"
-
-
-def main():
-    try:
-        raw = sys.stdin.read()
-        try:
-            event = json.loads(raw).get("hook_event_name", "")
-        except ValueError:
-            event = ""
-        path = "/stop/" + _NAME if event == "Stop" else "/event/" + _NAME
-        req = urllib.request.Request(
-            _ORCH + path,
-            data=raw.encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + _TOKEN,
-            },
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=3).read()
-    except Exception:
-        pass
-
-
-main()
-sys.exit(0)
-'''
-
-
-# ── живость процесса claude по /proc (Linux) ──────────────────
-# Вотчдог судит «завис/не завис» не только по байтам лога: спиннер «almost
-# done» может на секунды замолчать в нормальной работе — это не зависание.
-# Надёжный сигнал — CPU-время дерева процессов claude (он сам + запущенные
-# им тулы): если сумма utime+stime не растёт и дочерних процессов нет,
-# процесс правда стоит на месте.
-
-
-def _proc_tree_signals(root: int) -> tuple[int, bool]:
-    """(сумма CPU-тиков дерева root, есть ли у root живые дочерние процессы).
-
-    Один проход по /proc: для каждого процесса берём PPID (поле 4) и
-    utime+stime (поля 14+15). Поле comm (2) может содержать пробелы и скобки,
-    поэтому режем по последней ')' и нумеруем поля от неё.
-    """
-    by_ppid: dict[int, list[int]] = {}
-    ticks: dict[int, int] = {}
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return 0, False
-    for name in entries:
-        if not name.isdigit():
-            continue
-        try:
-            with open(f"/proc/{name}/stat", "rb") as fh:
-                raw = fh.read()
-            after = raw[raw.rindex(b")") + 1:].split()
-            ppid = int(after[1])              # поле 4 (ppid)
-            tick = int(after[11]) + int(after[12])  # поля 14+15 (utime+stime)
-        except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
-            continue
-        by_ppid.setdefault(ppid, []).append(int(name))
-        ticks[int(name)] = tick
-    if root not in ticks:
-        return 0, False
-    total = 0
-    frontier = [root]
-    seen: set[int] = set()
-    while frontier:
-        nxt: list[int] = []
-        for pid in frontier:
-            if pid in seen:
-                continue
-            seen.add(pid)
-            total += ticks.get(pid, 0)
-            nxt.extend(by_ppid.get(pid, ()))
-        frontier = nxt
-    return total, bool(by_ppid.get(root))
 
 
 def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
@@ -478,7 +319,7 @@ class SessionManager:
             "mcpServers": {
                 f"tg-channel-{session.name}": {
                     "command": sys.executable,
-                    "args": [str(ROOT / "channel_server.py")],
+                    "args": [str(PKG_DIR / "channel_server.py")],
                     "env": {
                         "CHANNEL_PORT": str(session.port),
                         "SESSION_NAME": session.name,
@@ -510,7 +351,7 @@ class SessionManager:
           last_assistant_message → фолбэк, если ход завершился голым текстом
           вместо reply_to_telegram (REVIEW: 9/9 длинных ходов в живой сессии
           теряли финал именно так — см. bot.py handle_stop_event).
-          Оба события ловит один скрипт-диспетчер (_HOOK_SCRIPT), никогда не
+          Оба события ловит один скрипт-диспетчер (hookscript.py), никогда не
           блокирует Claude (except+exit 0).
         """
         settings: dict = {}
@@ -532,15 +373,12 @@ class SessionManager:
             ]
         settings["permissions"] = perms
 
-        # Токен уходит в 0600-скрипт (см. _HOOK_SCRIPT), команда хука = только
+        # Токен уходит в 0600-скрипт (см. hookscript.py), команда хука = только
         # путь к интерпретатору и скрипту — ничего секретного в
         # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
         hook_script = settings_dir / "hook_dispatch.py"
         hook_script.write_text(
-            _HOOK_SCRIPT
-            .replace("__PORT__", str(self.config.orch_port))
-            .replace("__NAME__", session.name)
-            .replace("__TOKEN__", self.config.orch_token)
+            hookscript.render(self.config.orch_port, session.name, self.config.orch_token)
         )
         os.chmod(hook_script, 0o600)
         hook_cmd = {"type": "command", "command": f'"{sys.executable}" "{hook_script}"'}
@@ -606,18 +444,23 @@ class SessionManager:
                 extra += ["--settings", str(settings_file)]
             # dev-записи каналов передаются --dangerously-load-development-channels
             # (server:<имя>; определено в .mcp.json из --mcp-config).
-            # Файловая песочница (если включена): claude и все его дети
-            # (channel_server, хуки, Bash-тул) заперты в mount-namespace —
+            # Изоляция — через раннер (runner.py): при bwrap claude и все его
+            # дети (channel_server, хуки, Bash-тул) заперты в mount-namespace —
             # видны только папка сессии, папка проекта и конфиг Claude Code.
             extra_rw = [session.session_dir, Path(cwd)]
-            prefix = self.sandbox_prefix(chdir=Path(cwd), extra_rw=extra_rw)
+            argv = self.runner.wrap(
+                [
+                    self.config.claude_bin,
+                    *session_arg,
+                    *extra,
+                    "--dangerously-load-development-channels",
+                    f"server:tg-channel-{session.name}",
+                ],
+                chdir=Path(cwd),
+                extra_rw=extra_rw,
+            )
             session.process = await asyncio.create_subprocess_exec(
-                *prefix,
-                self.config.claude_bin,
-                *session_arg,
-                *extra,
-                "--dangerously-load-development-channels",
-                f"server:tg-channel-{session.name}",
+                *argv,
                 cwd=cwd,
                 stdin=slave,
                 stdout=slave,
@@ -916,7 +759,7 @@ class SessionManager:
         if pid is None:
             return False
         try:
-            cpu, has_kids = _proc_tree_signals(pid)
+            cpu, has_kids = proc_tree_signals(pid)
         except Exception:  # /proc недоступен — перестраховочно «жив»
             logger.debug("is_busy: /proc недоступен для pid=%s", pid)
             return True
@@ -996,108 +839,36 @@ class SessionManager:
                 return session.session_dir
         return session.session_dir
 
-    def sandbox_prefix(self, chdir: Path, extra_rw: list[Path]) -> list[str]:
-        """Префикс argv для запуска команды в файловой песочнице (bwrap).
+    @property
+    def runner(self) -> runner_mod.Runner:
+        """Раннер процессов (bwrap | direct) — ленивый, см. runner.py."""
+        r = getattr(self, "_runner", None)
+        if r is None:
+            r = runner_mod.make_runner(self.config, ROOT)
+            self._runner = r
+        return r
 
-        Пусто, если SANDBOX=off. Общий allowlist для claude и /bash: конфиг
-        Claude Code (токены/скиллы/plugins/транскрипты) — RW, бинарь claude и
-        репозиторий оркестратора (channel_server + .venv) — RO, плюс переданные
-        рабочие каталоги (папка сессии/проекта) — RW.
+    def sandbox_prefix(self, chdir: Path, extra_rw: list[Path]) -> list[str]:
+        """Префикс argv для запуска команды в изоляции текущего раннера.
+
+        Пусто при SANDBOX=off. Политика allowlist — в runner.BwrapRunner.
         """
-        if self.config.sandbox != "bwrap":
-            return []
-        home = Path.home()
-        config_dir = self.config.claude_config_dir or (home / ".claude")
-        rw = [
-            *extra_rw,
-            config_dir,
-            home / ".claude.json",  # глобальное состояние claude (может писаться)
-            *self.config.sandbox_extra_rw,
-        ]
-        ro = [
-            home / ".local" / "share" / "claude",  # бинарь и versions/
-            home / ".local" / "bin",               # симлинк claude
-            ROOT,                                   # channel_server.py + .venv
-        ]
-        return sandbox.build_argv(home=home, chdir=chdir, rw_paths=rw, ro_paths=ro)
+        return self.runner.wrap([], chdir=chdir, extra_rw=extra_rw)
 
     def transcript_path(self, session: Session) -> Path:
-        """Транскрипт сессии в профиле Claude Code.
-
-        Путь проекта (= cwd Claude) кодируется заменой '/' и '.' на '-'.
-        """
+        """Транскрипт сессии в профиле Claude Code (см. transcript.py)."""
         config_dir = self.config.claude_config_dir or Path.home() / ".claude"
-        encoded = str(self.effective_cwd(session)).replace("/", "-").replace(".", "-")
-        return config_dir / "projects" / encoded / f"{session.claude_session_id}.jsonl"
+        return transcript.transcript_path(
+            config_dir, self.effective_cwd(session), session.claude_session_id
+        )
 
     def read_stats(self, session: Session) -> dict | None:
-        """Статистика из транскрипта. None — транскрипт ещё не создан.
-
-        Блокирующее чтение файла — вызывать через asyncio.to_thread.
-        """
-        path = self.transcript_path(session)
-        if not path.exists():
-            return None
-        turns = 0
-        total_output = 0
-        last_usage: dict = {}
-        model = ""
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if entry.get("type") == "user":
-                    content = (entry.get("message") or {}).get("content")
-                    # tool_result тоже приходит user-записью — не считаем его.
-                    if isinstance(content, str) or (
-                        isinstance(content, list)
-                        and not any(
-                            isinstance(b, dict) and b.get("type") == "tool_result"
-                            for b in content
-                        )
-                    ):
-                        turns += 1
-                elif entry.get("type") == "assistant":
-                    message = entry.get("message") or {}
-                    usage = message.get("usage") or {}
-                    if usage:
-                        last_usage = usage
-                        total_output += usage.get("output_tokens", 0)
-                    model = message.get("model") or model
-        context = (
-            last_usage.get("input_tokens", 0)
-            + last_usage.get("cache_read_input_tokens", 0)
-            + last_usage.get("cache_creation_input_tokens", 0)
-        )
-        return {
-            "model": model,
-            "context_tokens": context,
-            "output_tokens": total_output,
-            "turns": turns,
-            "transcript_bytes": path.stat().st_size,
-        }
+        """Статистика из транскрипта (None — ещё не создан). Блокирующее
+        чтение — вызывать через asyncio.to_thread. Логика — transcript.py."""
+        return transcript.read_stats(self.transcript_path(session))
 
     def read_pollution_excerpt(self, session: Session, max_entries: int = 25) -> str | None:
         """Эксцепт загрязнения чужим бэкендом из хвоста транскрипта (или None).
-
-        Мусор лежит в недавнем хвосте, поэтому смотрим последние записи и
-        отдаём результат _scan_pollution. Блокирующее чтение — вызывать через
-        asyncio.to_thread (как read_stats).
-        """
-        path = self.transcript_path(session)
-        if not path.exists():
-            return None
-        try:
-            with open(path, encoding="utf-8") as f:
-                lines = f.readlines()[-max_entries * 2:]
-        except OSError:
-            return None
-        entries = []
-        for line in lines:
-            try:
-                entries.append(json.loads(line))
-            except ValueError:
-                continue
-        return _scan_pollution(entries)
+        Блокирующее чтение — вызывать через asyncio.to_thread. Логика —
+        transcript.py."""
+        return transcript.read_pollution_excerpt(self.transcript_path(session), max_entries)

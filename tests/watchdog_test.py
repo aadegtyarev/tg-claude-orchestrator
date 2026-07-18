@@ -13,7 +13,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sessions import Session, SessionManager, _proc_tree_signals  # noqa: E402
+from orchestrator.proctree import proc_tree_signals as _proc_tree_signals  # noqa: E402
+from orchestrator.sessions import Session, SessionManager  # noqa: E402
 
 
 def _burn(n: int = 3_000_000) -> int:
