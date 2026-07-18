@@ -431,6 +431,9 @@ class SessionManager:
         """
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        # CLI-обвязка оркестратора (bin/wallet и т.п.): репозиторий RO-виден
+        # и в песочнице, поэтому PATH работает и там.
+        env["PATH"] = f"{ROOT / 'bin'}:{env.get('PATH', '')}"
         if self.config.claude_config_dir is not None:
             env["CLAUDE_CONFIG_DIR"] = str(self.config.claude_config_dir)
         # Явные переменные для Claude Code (CLAUDE_ENV_ANTHROPIC_BASE_URL=…

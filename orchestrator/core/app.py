@@ -85,6 +85,11 @@ class OrchestratorCore:
         # Ожидающие permission-запросы: (имя сессии, request_id) — от повторного
         # вердикта из второго адаптера (применяется первый ответ).
         self._pending_perms: set[tuple[str, str]] = set()
+        # Локальные подтверждения (request_confirmation): вердикт остаётся в
+        # ядре (Future), а не уходит в Claude Code. Используют модули (wallet).
+        self._local_perms: dict[tuple[str, str], asyncio.Future] = {}
+        # Хуки «сессия создана» — модули дописывают свою обвязку в папку сессии.
+        self.session_hooks: list[Callable[[Session], Awaitable[None]]] = []
         manager.on_dead = self.notify_session_dead
 
     def t(self, key: str, **kwargs) -> str:
@@ -211,6 +216,11 @@ class OrchestratorCore:
             if address is not None:
                 session.bindings[tr.name] = address
         self.manager.save_state()
+        for hook in self.session_hooks:
+            try:
+                await hook(session)
+            except Exception:
+                logger.exception("session_hook для %s", session.name)
         return session
 
     async def close_session(self, session: Session) -> None:
@@ -481,11 +491,62 @@ class OrchestratorCore:
             except Exception:
                 logger.exception("permission_prompt через %s", tr.name)
 
+    async def request_confirmation(
+        self,
+        session: Session,
+        tool: str,
+        description: str,
+        preview: str,
+        timeout: float = 300.0,
+    ) -> bool:
+        """Спросить пользователя «разрешить?» кнопками во всех адаптерах и
+        дождаться ответа (для модулей: wallet и т.п. — вердикт остаётся в ядре,
+        в Claude Code не уходит). Таймаут/ошибка = отказ (deny по умолчанию)."""
+        request_id = f"local-{uuid.uuid4().hex[:12]}"
+        key = (session.name, request_id)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._local_perms[key] = fut
+        request = PermissionRequest(
+            request_id=request_id, tool=tool, description=description,
+            preview=preview[:PERM_PREVIEW_LIMIT],
+        )
+        self._record(
+            session, "perm_request",
+            request_id=request_id, tool=tool, description=description,
+            preview=request.preview,
+        )
+        for tr in self._transports():
+            try:
+                await tr.permission_prompt(session, request)
+            except Exception:
+                logger.exception("permission_prompt (local) через %s", tr.name)
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._local_perms.pop(key, None)
+
     async def permission_verdict(
         self, session: Session, request_id: str, behavior: str, via: str
     ) -> bool:
         """Вердикт из адаптера via. False — запрос уже разрешён другим ответом."""
         key = (session.name, request_id)
+        # Локальное подтверждение (request_confirmation): будим ожидающего,
+        # в Claude Code ничего не шлём.
+        local = self._local_perms.get(key)
+        if local is not None:
+            if not local.done():
+                local.set_result(behavior == "allow")
+            self._record(
+                session, "perm_resolved", request_id=request_id, behavior=behavior
+            )
+            for tr in self._transports():
+                try:
+                    await tr.permission_resolved(session, request_id, behavior, via)
+                except Exception:
+                    logger.exception("permission_resolved через %s", tr.name)
+            return True
         if key not in self._pending_perms:
             return False
         try:
