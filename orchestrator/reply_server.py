@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from config import Config
+from .config import Config
 
 logger = logging.getLogger(__name__)
 

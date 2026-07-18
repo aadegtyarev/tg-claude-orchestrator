@@ -1,0 +1,72 @@
+"""Хук-диспетчер Claude Code: шаблон скрипта и его рендер.
+
+Единый хук (PreToolUse + Stop) как отдельный python-скрипт (а не curl с
+токеном в аргументах). Токен встроен константой в этот 0600-файл — НЕ в
+cmdline (иначе виден в /proc/<pid>/cmdline любому локальному пользователю)
+и НЕ в settings.local.json (0644). Раньше curl -H 'Authorization: Bearer …'
+тёк в оба места (REVIEW S1, найдено адверсариальным ревью).
+
+Stop-хук — fallback против «потерянного финала» (REVIEW: модель нередко
+завершает длинный ход обычным текстом вместо tool-вызова reply_to_telegram;
+канал ретранслирует только явные tool-call'ы, голый текст остаётся в
+транскрипте и не долетает до Telegram — 9/9 длинных ходов в живой сессии).
+hook_event_name различает событие: PreToolUse → POST /event/<имя> (бабл),
+Stop → POST /stop/<имя> с last_assistant_message (боту решать, нужен ли
+fallback — см. bot.py handle_stop_event).
+
+__PORT__/__NAME__/__TOKEN__ подставляются обычным replace (без .format-
+скобок, чтобы безопасно для любого значения токена).
+"""
+
+from __future__ import annotations
+
+HOOK_SCRIPT = '''#!/usr/bin/env python3
+"""Хук-диспетчер Claude Code (PreToolUse + Stop) → POST оркестратору.
+
+Токен встроен константой сюда (файл 0600), НЕ в cmdline/настройки — иначе
+ORCH_TOKEN виден локальному процессу через /proc/<pid>/cmdline (REVIEW.md S1).
+Читает событие из stdin, всегда выходит 0 — хук не должен блокировать Claude."""
+import json
+import sys
+import urllib.request
+
+_ORCH = "http://127.0.0.1:__PORT__"
+_NAME = "__NAME__"
+_TOKEN = "__TOKEN__"
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        try:
+            event = json.loads(raw).get("hook_event_name", "")
+        except ValueError:
+            event = ""
+        path = "/stop/" + _NAME if event == "Stop" else "/event/" + _NAME
+        req = urllib.request.Request(
+            _ORCH + path,
+            data=raw.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + _TOKEN,
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:
+        pass
+
+
+main()
+sys.exit(0)
+'''
+
+
+def render(port: int, name: str, token: str) -> str:
+    """Скрипт хука с подставленными портом/именем сессии/токеном."""
+    return (
+        HOOK_SCRIPT
+        .replace("__PORT__", str(port))
+        .replace("__NAME__", name)
+        .replace("__TOKEN__", token)
+    )

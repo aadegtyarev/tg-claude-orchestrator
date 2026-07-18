@@ -100,7 +100,9 @@ class Config:
             # берёт свои дефолты (или то, что в профиле/проекте). /model на
             # сессию перекрывает DEFAULT_MODEL.
             default_model=(raw.strip() or None) if (raw := os.getenv("DEFAULT_MODEL", "")).strip() else None,
-            default_effort=(raw.strip() or None) if (raw := os.getenv("DEFAULT_EFFORT", "")).strip() else None,
+            default_effort=(
+                (raw.strip() or None) if (raw := os.getenv("DEFAULT_EFFORT", "")).strip() else None
+            ),
             # CLAUDE_ENV_ANTHROPIC_BASE_URL=... → в процесс claude уйдёт
             # ANTHROPIC_BASE_URL=... (префикс снимается).
             claude_env={

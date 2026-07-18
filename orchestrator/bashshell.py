@@ -22,7 +22,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from ansi import strip_ansi
+from .ansi import strip_ansi
 
 logger = logging.getLogger(__name__)
 
