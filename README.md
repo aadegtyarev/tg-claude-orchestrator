@@ -49,7 +49,7 @@ bypass permissions, dev channels) отвечает автоматика (`_pty_d
 |------|-----------------|
 | `launcher.py` | Точка входа: сборка, graceful shutdown |
 | `config.py` | Чтение `.env` в неизменяемый `Config` |
-| `bot.py` | Бот: команды, файлы, permission-кнопки, отправка |
+| `bot.py` | Бот: команды, файлы, permission-кнопки, отправка, ретранслятор ошибок API, вотчдог зависаний |
 | `bubble.py` | Статус-бабл: буфер строк, троттлинг правок, закрытие |
 | `sessions.py` | `SessionManager`: PTY-процессы Claude, жизненный цикл, resume, авто-close, ротация логов, статистика |
 | `reply_server.py` | aiohttp: `POST /reply`, `/event/{имя}`, `/permission/{имя}` |
@@ -86,6 +86,9 @@ journalctl --user -u tg-claude-orchestrator -f
 .venv/bin/python tests/smoke_test.py       # протокол канала, конфиг, тексты
 .venv/bin/python tests/callbacks_test.py   # inline-кнопки: парсинг, гварды
 .venv/bin/python tests/bubble_test.py      # статус-бабл: гейт от сирот
+.venv/bin/python tests/watchdog_test.py    # вотчдог: живая работа vs зависание
+.venv/bin/python tests/tool_line_test.py   # компактные строки тулов, reply-цитаты
+.venv/bin/python tests/error_relay_test.py # ретранслятор ошибок API: строгий баннер, без ложных
 ```
 
 Сервис — user-unit (`Restart=on-failure`), `install.sh` включает

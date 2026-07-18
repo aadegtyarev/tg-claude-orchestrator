@@ -1,0 +1,62 @@
+"""Регрессия ретранслятора ошибок API: строгий баннер + классификация, без ложных алертов.
+
+Раньше ретранслятор грепел claude.log по словам «rate-limit»/«api error» и ловил
+собственный текст Клода — диагностику чужой сессии («9× ratelimit»), описание
+самой фичи («ретрансляция ошибок API/rate-limit») — как ложный алерт о лимите.
+Теперь триггер — только настоящий баннер TUI «API Error: <код> <детали>»,
+класс определяет текст подсказки (rate-limit→/model, 400-протокол→/clear).
+
+Запуск: .venv/bin/python tests/error_relay_test.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from bot import _API_ERR_BANNER_RE, _classify_api_error  # noqa: E402
+
+
+def _hit(chunk: str) -> tuple[str, str] | None:
+    """Сымитировать шаг ретранслятора: (code, klass) либо None (нет баннера)."""
+    m = _API_ERR_BANNER_RE.search(chunk.encode())
+    if not m:
+        return None
+    return m.group(1).decode(), _classify_api_error(m.group(1), m.group(2))
+
+
+def main():
+    # ── Реальные баннеры из TUI классифицируются верно ──
+    assert _hit("●API Error: 400 messages.7.content.2.server_tool_use.id: "
+                "String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'") == ("400", "protocol")
+    assert _hit("●API Error: 400 messages.5: `tool_result` blocks can only be "
+                "in `user` messages") == ("400", "protocol")
+    assert _hit("●API Error: 429 {\"type\":\"rate_limit_error\"}") == ("429", "ratelimit")
+    assert _hit("●API Error: 529 {\"type\":\"overloaded_error\"}") == ("529", "ratelimit")
+    assert _hit("●API Error: 503 service unavailable") == ("503", "generic")
+    print("OK classify: 400+tool→protocol, 429/529→ratelimit, 5xx→generic")
+
+    # ── Главный регресс: проза модели НЕ триггерит (никакого «API Error: <код>») ──
+    # Реальные строки из claude.log сессии tg-claude-orchestrator:
+    assert _hit("Результат расследования: Журнал сессии noos содержит 13×«APIerror»,"
+                " 9×«ratelimit», 7×«exitcode»") is None
+    assert _hit("Ретрансляция ошибок API/rate-limit в чат с подсказкой /model") is None
+    assert _hit("Скажи, бывает ли api error 429 у Anthropic?") is None
+    assert _hit("rate-limit relay, overloaded, 429, internal server error — "
+                "просто перечисление слов без баннера") is None
+    print("OK no false positives on model prose (был ложный алерт о лимите)")
+
+    # ── Дедуп по сигнатуре code:class: корень один — сигнатура одна ──
+    sigs = set()
+    for c in ["API Error: 400 messages.7.content.2.server_tool_use.id: x",
+              "API Error: 400 messages.9.server_tool_use.id: y",
+              "API Error: 429 rate_limit_error"]:
+        code, klass = _hit(c)
+        sigs.add(f"{code}:{klass}")
+    assert sigs == {"400:protocol", "429:ratelimit"}, sigs
+    print("OK signatures: корень 400-protocol схлопывается в одну сигнатуру")
+
+    print("ALL ERROR-RELAY OK")
+
+
+if __name__ == "__main__":
+    main()
