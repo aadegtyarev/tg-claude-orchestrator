@@ -16,6 +16,7 @@ import logging
 import os
 import pty
 import re
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -73,15 +74,35 @@ class BashSession:
     def write(self, text: str) -> None:
         os.write(self.master, text.encode())
 
+    def interrupt(self) -> None:
+        """Послать Ctrl-C (SIGINT фоновому пайплайну bash) — прервать убежавшую
+        команду, не убивая саму оболочку. Используется при таймауте /bash,
+        чтобы процесс не гадил в общий буфер следующему вызову."""
+        try:
+            os.write(self.master, b"\x03")
+        except OSError:
+            pass
+
     @property
     def running(self) -> bool:
         return self.proc.poll() is None
 
     def close(self) -> None:
+        # Интерактивный bash -i игнорирует SIGTERM — terminate() не дорабатывал,
+        # и оболочка утекала (REVIEW.md B1). Поэтому SIGKILL по всей группе
+        # процессов (bash + её дети: sleep/сборки/...). start_new_session=True
+        # делает bash лидером группы, killpg(pid) накрывает её целиком и не
+        # задевает процесс бота (другая сессия). Близко к мгновенному, без
+        # долгого ожидания — close не stall-ит event loop из хендлеров.
         try:
-            self.proc.terminate()
-        except Exception:
-            pass
+            os.killpg(self.proc.pid, signal.SIGKILL)
+            self.proc.wait(timeout=3)
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=1)
+            except Exception:
+                pass
         try:
             os.close(self.master)
         except OSError:
@@ -111,3 +132,8 @@ class BashShellManager:
         if sess is not None:
             sess.close()
             logger.info("bash-терминал закрыт (топик %s)", thread_id)
+
+    def close_all(self) -> None:
+        """Прибрать все bash-оболочки (остановка launcher'а)."""
+        for tid in list(self._sessions):
+            self.close(tid)
