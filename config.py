@@ -32,6 +32,8 @@ class Config:
     bot_lang: str
     idle_timeout_h: float
     log_max_mb: float
+    default_model: str | None  # --model по умолчанию (None = решение Claude/профиля/проекта)
+    default_effort: str | None  # --effort по умолчанию (low/medium/high/xhigh/max)
     claude_env: dict[str, str]  # доп. env для процесса claude (CLAUDE_ENV_*)
 
     @classmethod
@@ -66,6 +68,11 @@ class Config:
             bot_lang=(os.getenv("BOT_LANG", "ru").strip().lower() or "ru"),
             idle_timeout_h=float(os.getenv("IDLE_TIMEOUT_H", "6")),
             log_max_mb=float(os.getenv("LOG_MAX_MB", "10")),
+            # Модель/effort по умолчанию для всех сессий. Не заданы — Claude
+            # берёт свои дефолты (или то, что в профиле/проекте). /model на
+            # сессию перекрывает DEFAULT_MODEL.
+            default_model=(raw.strip() or None) if (raw := os.getenv("DEFAULT_MODEL", "")).strip() else None,
+            default_effort=(raw.strip() or None) if (raw := os.getenv("DEFAULT_EFFORT", "")).strip() else None,
             # CLAUDE_ENV_ANTHROPIC_BASE_URL=... → в процесс claude уйдёт
             # ANTHROPIC_BASE_URL=... (префикс снимается).
             claude_env={

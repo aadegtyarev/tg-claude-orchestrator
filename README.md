@@ -15,9 +15,9 @@ N параллельных сессий Claude Code в форум-топиках
 
 ```
 Telegram Group (Topics)
-  ├── 🧵 data-analyst → claude #1 (PTY) ──(.mcp.json)──> channel_server :18761
-  ├── 🧵 devops       → claude #2 (PTY) ──(.mcp.json)──> channel_server :18762
-  └── 🧵 coder        → claude #3 (PTY) ──(.mcp.json)──> channel_server :18763
+  ├── 🧵 data-analyst → claude #1 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18761
+  ├── 🧵 devops       → claude #2 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18762
+  └── 🧵 coder        → claude #3 (PTY, cwd=проект) ──(--mcp-config)──> channel_server :18763
 
 launcher (один процесс)
   ├── бот aiogram: команды, файлы, статус-баблы
@@ -27,8 +27,15 @@ launcher (один процесс)
 ```
 
 **Кто кого запускает:** launcher запускает только процессы `claude` (под PTY).
-`channel_server.py` запускает **сам Claude Code** — по `.mcp.json` в директории
-сессии. Оркестратор общается с channel-сервером только по HTTP.
+`channel_server.py` запускает **сам Claude Code** — по `.mcp.json`, который
+передан флагом `--mcp-config` (лежит в папке сессии). Оркестратор общается с
+channel-сервером только по HTTP.
+
+**cwd = папка проекта:** если сессия создана с путём (`/new имя /path`), claude
+запускается прямо в проекте — грузит его `CLAUDE.md`, `.mcp.json`, `.claude/`
+(натуральное поведение «cd в проект и claude»). Канал-сервер и настройки бота
+подсасываются флагами (`--mcp-config`, `--settings`) и consent не просят;
+профиль (`CLAUDE_CONFIG_DIR`) и проект остаются нетронутыми.
 
 **Почему PTY:** headless-запуск не работает — без TTY claude уходит в
 `--print` и завершается, а в `-p`/stream-json режиме channel-события не будят
@@ -98,6 +105,8 @@ journalctl --user -u tg-claude-orchestrator -f
 | `SESSIONS_DIR` | `~/tg-claude-sessions` | Директория сессий |
 | `MAX_INSTANCES` | 5 | Лимит одновременных сессий |
 | `CLAUDE_BIN` | `claude` | Путь к бинарнику Claude Code |
+| `DEFAULT_MODEL` | — | Модель по умолчанию для новых сессий (псевдоним `opus`/`sonnet`/… или точное имя). Не задано — дефолт Claude/профиля/проекта. `/model` перекрывает |
+| `DEFAULT_EFFORT` | — | Effort по умолчанию: `low`/`medium`/`high`/`xhigh`/`max`. Не задано — решает Claude/профиль/проект |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Свой профиль Claude Code |
 | `CLAUDE_ENV_<ИМЯ>` | — | Проброс env в процесс claude: `CLAUDE_ENV_ANTHROPIC_BASE_URL=…` → claude получит `ANTHROPIC_BASE_URL=…` |
 | `ORCH_PORT` | 18080 | HTTP-порт оркестратора |
@@ -241,12 +250,17 @@ Read); обратно Claude присылает файлы сам — тулом
   `POST /reply` оркестратора → сообщение в нужный топик.
 - Слэш-команды (`/compact`, `/context`…) печатаются прямо в PTY сессии,
   не через канал.
-- Запуск: `claude --session-id=<uuid> [--model <имя>]
+- Запуск: `claude --session-id=<uuid> [--model <имя>] [--effort <уровень>]
+  --mcp-config <сессия>/.mcp.json --settings <сессия>/.claude/settings.local.json
   --dangerously-load-development-channels server:tg-channel-<имя>
-  (--permission-mode <mode> | --dangerously-skip-permissions при bypass)`.
-  Dev-записи передаются самому dev-флагу; `--session-id` требует UUID.
+  (--permission-mode <mode> | --dangerously-skip-permissions при bypass)`,
+  `cwd` = папка проекта. Dev-флаг ссылается на сервер из `--mcp-config`;
+  `--session-id` требует UUID. `--model`/`--effort` — только если заданы
+  `DEFAULT_MODEL`/`DEFAULT_EFFORT` (или `/model` на сессию).
 - Согласие на MCP-сервер предодобрено `enableAllProjectMcpServers` в
-  `.claude/settings.local.json` сессии.
+  `.claude/settings.local.json` сессии (подаётся через `--settings`, мержится
+  с профилем и проектом). `AskUserQuestion` запрещён в `permissions.deny`
+  (интерактивное меню виснет без TTY); в bypass-режиме страж — системный промпт.
 
 - Permission relay: capability `claude/channel/permission`; запрос
   (`notifications/claude/channel/permission_request`) пересылается на
