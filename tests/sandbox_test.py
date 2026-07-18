@@ -1,0 +1,133 @@
+"""Файловая песочница (bubblewrap): структура argv + реальная изоляция.
+
+Покрыто:
+  - build_argv: порядок (tmpfs $HOME до биндов, RW после RO), «-try»-флаги;
+  - sandbox_prefix у SessionManager: пусто при SANDBOX=off, allowlist при bwrap;
+  - интеграция: настоящий bash под bwrap видит cwd на запись, но НЕ видит
+    ~/.ssh и не пишет на реальный диск (если bwrap доступен в окружении).
+
+Запуск: .venv/bin/python tests/sandbox_test.py
+"""
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
+
+import sandbox  # noqa: E402
+from bashshell import BashSession  # noqa: E402
+from sessions import SessionManager  # noqa: E402
+
+
+def test_build_argv_order():
+    home = Path("/home/tester")
+    argv = sandbox.build_argv(
+        home=home,
+        chdir=home / "proj",
+        rw_paths=[home / "proj"],
+        ro_paths=[home / "code"],
+    )
+    s = " ".join(argv)
+    assert argv[0] == "bwrap"
+    assert argv[-1] == "--"
+    assert "--chdir" in argv and argv[argv.index("--chdir") + 1] == str(home / "proj")
+    # tmpfs $HOME должен идти РАНЬШЕ биндов под ним, иначе они затрутся.
+    i_tmpfs = argv.index(str(home))  # аргумент "--tmpfs <home>"
+    i_ro = s.index("--ro-bind-try /home/tester/code")
+    i_rw = s.index("--bind-try /home/tester/proj")
+    assert (len(" ".join(argv[:i_tmpfs]))) < i_ro < i_rw, "порядок tmpfs<RO<RW нарушен"
+    # безопасные флаги присутствуют
+    for flag in ("--die-with-parent", "--unshare-pid", "--proc", "--dev"):
+        assert flag in argv, flag
+    # сеть НЕ изолируется (нужна для API/localhost)
+    assert "--unshare-net" not in argv
+    print("OK build_argv: порядок tmpfs<RO<RW, die-with-parent, сеть общая")
+
+
+def _mgr(mode: str) -> SessionManager:
+    cfg = SimpleNamespace(
+        sandbox=mode,
+        sandbox_extra_rw=(),
+        claude_config_dir=Path("/home/tester/.claude-proxy"),
+    )
+    m = SessionManager.__new__(SessionManager)
+    m.config = cfg
+    return m
+
+
+def test_prefix_off_empty():
+    assert _mgr("off").sandbox_prefix(Path("/x"), [Path("/x")]) == []
+    print("OK sandbox_prefix: SANDBOX=off → пустой префикс")
+
+
+def test_prefix_allowlist():
+    m = _mgr("bwrap")
+    work = str(Path.home() / "proj")
+    argv = m.sandbox_prefix(Path(work), [Path(work)])
+    s = " ".join(argv)
+    # claude_config_dir из конфига — RW (контролируемое значение)
+    assert "--bind-try /home/tester/.claude-proxy" in s
+    # прочие пути привязаны к реальному $HOME процесса
+    assert f"--bind-try {Path.home() / '.claude.json'}" in s
+    assert f"--bind-try {work}" in s                       # рабочая папка RW
+    assert "--ro-bind-try" in s and "/.local/share/claude" in s  # бинарь RO
+    print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
+
+
+def test_real_isolation():
+    ok, why = sandbox.available()
+    if not ok:
+        print(f"SKIP real_isolation: bwrap недоступен ({why})")
+        return
+    home = Path.home()
+    work = Path(tempfile.mkdtemp(prefix="sbx_", dir=home / "tg-claude-sessions"
+                                  if (home / "tg-claude-sessions").exists() else None))
+    try:
+        wrapper = sandbox.build_argv(
+            home=home, chdir=work, rw_paths=[work],
+            ro_paths=[home / ".local"],
+        )
+        sh = BashSession(work, wrapper)
+        try:
+            marker = "SBXDONE"
+            # Результат — через код возврата ($?), чтобы токен результата
+            # («SSHRC=1») не совпадал с текстом команды («SSHRC=$?»): иначе
+            # эхо интерактивного bash фальшиво «подтверждает» проверку.
+            sh.write(f"echo -n canwrite > {work}/in.txt; "
+                     f"test -e ~/.ssh; echo \"SSHRC=$?\"; "
+                     f"echo -n leak > ~/leaktest.txt 2>/dev/null; "
+                     f"echo {marker}\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if marker.encode() in sh.snapshot():
+                    break
+                time.sleep(0.3)
+            out = sh.snapshot().decode(errors="replace")
+            assert "SSHRC=1" in out, f"~/.ssh должен быть невидим (SSHRC=1)\n{out}"
+            assert "SSHRC=0" not in out, f"~/.ssh виден в песочнице!\n{out}"
+            assert (work / "in.txt").read_text() == "canwrite", "не записал в рабочую папку"
+            # запись в ~ уходит в эфемерный tmpfs — на реальном диске файла нет
+            assert not (home / "leaktest.txt").exists(), "УТЕЧКА: файл появился в реальном $HOME"
+            print("OK real_isolation: cwd пишется, ~/.ssh скрыт, записи в $HOME не текут на диск")
+        finally:
+            sh.close()
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+        (home / "leaktest.txt").unlink(missing_ok=True)
+
+
+def main():
+    test_build_argv_order()
+    test_prefix_off_empty()
+    test_prefix_allowlist()
+    test_real_isolation()
+    print("ALL SANDBOX OK")
+
+
+if __name__ == "__main__":
+    main()

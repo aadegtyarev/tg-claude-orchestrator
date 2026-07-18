@@ -567,7 +567,13 @@ class TelegramBot:
             await message.reply(self.t("bash_usage"))
             return
         thread_id = message.message_thread_id or 0
-        shell = self.bash.get_or_create(thread_id, self._bash_cwd(message))
+        cwd = self._bash_cwd(message)
+        # Та же файловая песочница, что и у claude: /bash видит папку
+        # сессии/проекта и конфиг Claude Code, но не остальную ФС/систему.
+        session = self._topic_session(message)
+        extra_rw = [cwd] + ([session.session_dir] if session is not None else [])
+        wrapper = self.manager.sandbox_prefix(chdir=cwd, extra_rw=extra_rw)
+        shell = self.bash.get_or_create(thread_id, cwd, wrapper)
         if shell.busy:
             await message.reply(self.t("bash_busy"))
             return
