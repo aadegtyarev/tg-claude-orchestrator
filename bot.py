@@ -63,6 +63,8 @@ WATCHDOG_CHECK = 15.0
 ERROR_RELAY_INTERVAL = 6.0
 ERROR_RELAY_COOLDOWN = 60.0
 ERROR_RELAY_REPEAT = 600.0
+# Живой сигнал ретраев: пере-файр при росте attempt, но не чаще раза в N сек.
+RETRY_SURFACE_INTERVAL = 30.0
 
 # /bash: как часто перечитывать вывод и перерисовывать статус-сообщение,
 # сколько ждать команду и сколько текста показывать (лимит Telegram — 4096,
@@ -217,6 +219,11 @@ _API_ERR_BANNER_RE = re.compile(rb"API Error:\s*(\d{3})\b([^\n]{0,140})", re.IGN
 # Класс ошибки по деталям баннера (код разбираем отдельно).
 _RL_DETAIL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\bcapacity\b", re.IGNORECASE)
 _PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d", re.IGNORECASE)
+# Живые сигналы из claude.log (когда тулов нет, но что-то происходит):
+#  • ретрай API-ошибки — Claude Code пишет «Retrying … attempt K/M»;
+#  • краш-рестарт — баннер «Resume this session with» / «Welcome back».
+_RETRY_RE = re.compile(rb"attempt\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+_RESTART_RE = re.compile(rb"Resume this session with|Welcome back", re.IGNORECASE)
 
 
 def _classify_api_error(code: bytes, detail: bytes) -> str:
@@ -232,6 +239,26 @@ def _classify_api_error(code: bytes, detail: bytes) -> str:
     if code == b"400" and _PROTO_DETAIL_RE.search(detail):
         return "protocol"
     return "generic"
+
+
+def _detect_log_signals(chunk: bytes) -> dict:
+    """Разобрать кусок claude.log на три класса сигналов (для ретранслятора).
+
+    Возвращает {api_error, retry, restarts}:
+      • api_error — (code, klass) баннера «API Error: <код>» либо None;
+      • retry — (attempt, total) из «attempt K/M», последний в куске, либо None;
+      • restarts — сколько баннеров рестарта («Resume this session»/«Welcome back»).
+    Чистая функция: только разбор байтов — тестируется без петли/Telegram.
+    """
+    out: dict = {"api_error": None, "retry": None, "restarts": 0}
+    m = _API_ERR_BANNER_RE.search(chunk)
+    if m:
+        out["api_error"] = (m.group(1), _classify_api_error(m.group(1), m.group(2)))
+    rm = _RETRY_RE.search(chunk)
+    if rm:
+        out["retry"] = (int(rm.group(1)), int(rm.group(2)))
+    out["restarts"] = len(_RESTART_RE.findall(chunk))
+    return out
 
 
 def md_to_html(text: str) -> str:
@@ -1170,17 +1197,19 @@ class TelegramBot:
             return
 
     async def _error_relay_loop(self, thread_id: int) -> None:
-        """Транслировать ошибки API Клода (rate-limit/400-протокол/5xx) в чат.
+        """Транслировать в чат, что Claude делает, когда тулов ещё нет.
 
-        Эти ошибки видны только в claude.log (отрисовка TUI). На активном ходе
-        нюхаем ПРИРАЩЕНИЕ лога с момента старта (баннер запуска с «rate limits»
-        не трогаем) и при появлении НАСТОЯЩЕГО баннера «API Error: <код>» пишем
-        в топик — чтобы не гадать, «зависло или упёрлось». Триггер — именно
-        баннер с кодом, а не слова «rate-limit»/«api error» в прозе ответов
-        (Клод их сам пишет и раньше порождал ложные алерты). Класс задаёт текст:
-        rate-limit → /model, 400-протокол (апстрим шлёт кривой server_tool_use) →
-        /clear, прочее → «ответ задерживается». Любая ошибка — не чаще
-        ERROR_RELAY_COOLDOWN; та же — глушится ERROR_RELAY_REPEAT.
+        Сигналы нюхаем из ПРИРАЩЕНИЯ claude.log (отрисовка TUI) с момента старта
+        хода; разбирает их _detect_log_signals. Три класса:
+          1. «API Error: <код>» — настоящая ошибка API. Триггер — именно баннер с
+             кодом, не слова «rate-limit» в прозе ответов (раньше ловили ложное).
+             Класс задаёт действие: rate-limit→/model, 400-протокол→/clear,
+             прочее→«задерживается». Раз в ERROR_RELAY_COOLDOWN, та же — REPEAT.
+          2. Ретрай «attempt K/M» — ЖИВОЙ: пере-файр при росте K (видно прогресс
+             3/100 → 47/100), throttle RETRY_SURFACE_INTERVAL. Главное против
+             «5 минут тишины, непонятно что делает».
+          3. Краш-рестарт «Resume this session» mid-хода — Claude упал и поднялся.
+             Растёт счётчик → предупреждаем (раз в COOLDOWN), намекаем /close_session.
         """
         session = self.manager.get(thread_id)
         if session is None or self.chat_id is None:
@@ -1194,7 +1223,18 @@ class TelegramBot:
         last_surfaced = -ERROR_RELAY_COOLDOWN
         last_sig: str | None = None
         last_sig_at = -ERROR_RELAY_REPEAT
+        last_retry_k = 0
+        last_retry_at = -RETRY_SURFACE_INTERVAL
+        restart_count = 0
+        last_restart_at = -ERROR_RELAY_COOLDOWN
         loop_time = asyncio.get_running_loop().time
+
+        async def _surf(text: str) -> None:
+            try:
+                await self._send(self.chat_id, thread_id, text)
+            except Exception as e:
+                logger.debug("error_relay: не удалось отправить: %s", e)
+
         while True:
             await asyncio.sleep(ERROR_RELAY_INTERVAL)
             try:
@@ -1205,27 +1245,36 @@ class TelegramBot:
                 offset = 0
             chunk = _LOG_ANSI_RE.sub(b"", data[offset:]).replace(b"\r", b"")
             offset = len(data)
-            m = _API_ERR_BANNER_RE.search(chunk)
-            if not m:
-                continue
+            sig = _detect_log_signals(chunk)
             now = loop_time()
-            if now - last_surfaced < ERROR_RELAY_COOLDOWN:
-                continue
-            code = m.group(1)
-            klass = _classify_api_error(code, m.group(2))
-            sig = f"{code.decode()}:{klass}"
-            # Ту же ошибку не дублируем ERROR_RELAY_REPEAT — петля 400-х родит
-            # одно сообщение, а не десять. Иная ошибка — surfaced нормально.
-            if sig == last_sig and now - last_sig_at < ERROR_RELAY_REPEAT:
-                continue
-            last_surfaced = now
-            last_sig, last_sig_at = sig, now
-            try:
-                await self._send(
-                    self.chat_id, thread_id, self.t(f"api_error_{klass}")
-                )
-            except Exception as e:
-                logger.debug("error_relay: не удалось отправить: %s", e)
+
+            # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
+            if sig["api_error"]:
+                code, klass = sig["api_error"]
+                s = f"{code.decode()}:{klass}"
+                cooled = now - last_surfaced >= ERROR_RELAY_COOLDOWN
+                fresh = not (s == last_sig and now - last_sig_at < ERROR_RELAY_REPEAT)
+                if cooled and fresh:
+                    last_surfaced = now
+                    last_sig, last_sig_at = s, now
+                    await _surf(self.t(f"api_error_{klass}"))
+
+            # 2. Живой ретрай: пере-файр, когда attempt вырос — чтобы было видно
+            #    прогресс (3/100 → 47/100), а не одна тишина. Throttle — RETRY_SURFACE_INTERVAL.
+            if sig["retry"]:
+                k, total = sig["retry"]
+                if k > last_retry_k and now - last_retry_at >= RETRY_SURFACE_INTERVAL:
+                    last_retry_k = k
+                    last_retry_at = now
+                    await _surf(self.t("api_retrying", attempt=k, total=total))
+
+            # 3. Краш-рестарт-луп: баннер «Resume this session» mid-хода = Claude
+            #    упал и поднялся. Растёт счётчик — предупреждаем (раз в COOLDOWN).
+            if sig["restarts"]:
+                restart_count += sig["restarts"]
+                if now - last_restart_at >= ERROR_RELAY_COOLDOWN:
+                    last_restart_at = now
+                    await _surf(self.t("session_restart_loop", count=restart_count))
 
     async def _typing_loop(self, thread_id: int) -> None:
         while True:

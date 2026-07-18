@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bot import _API_ERR_BANNER_RE, _classify_api_error  # noqa: E402
+from bot import _API_ERR_BANNER_RE, _classify_api_error, _detect_log_signals  # noqa: E402
 
 
 def _hit(chunk: str) -> tuple[str, str] | None:
@@ -54,6 +54,22 @@ def main():
         sigs.add(f"{code}:{klass}")
     assert sigs == {"400:protocol", "429:ratelimit"}, sigs
     print("OK signatures: корень 400-protocol схлопывается в одну сигнатуру")
+
+    # ── _detect_log_signals: разбор трёх классов сигналов из куска лога ──
+    none = _detect_log_signals("●Думаю над задачей… ✻Crunched for 12s".encode())
+    assert none["api_error"] is None and none["retry"] is None and none["restarts"] == 0, none
+    print("OK detect: чистый лог → никаких сигналов")
+
+    # retry: «Retrying in 1s · attempt 47/100» (живой прогресс ретраев)
+    r = _detect_log_signals("API Error: 400 … ✻Retrying in 1s · attempt 47/100".encode())
+    assert r["retry"] == (47, 100), r["retry"]
+    assert r["api_error"] is not None  # в том же куске виден и баннер ошибки
+    print("OK detect: retry attempt K/M + сопутствующая API-ошибка")
+
+    # restart-loop: баннер «Resume this session» mid-хода = краш-рестарт
+    rs = _detect_log_signals("Resume this session with:\nclaude --resume x\n…\nResume this session with:\nclaude --resume y".encode())
+    assert rs["restarts"] == 2, rs["restarts"]
+    print("OK detect: рестарт-баннеры считаются")
 
     print("ALL ERROR-RELAY OK")
 
