@@ -433,6 +433,7 @@ class SessionManager:
                         "SESSION_NAME": session.name,
                         "ORCH_HOST": self.config.orch_host,
                         "ORCH_PORT": str(self.config.orch_port),
+                        "ORCH_TOKEN": self.config.orch_token,
                     },
                 }
             }
@@ -445,13 +446,19 @@ class SessionManager:
 
         - enableAllProjectMcpServers: авто-апрув MCP из .mcp.json проекта,
           чтоб твои серверы стартовали без диалога «New MCP server found»
-          (на канал из --mcp-config не влияет — он доверенный и так);
+          (на канал из --mcp-config не влияет — он доверенный и так).
+          Ставим ТОЛЬКО без linked_path: иначе /new к чужому проекту запустит
+          его .mcp.json command без consent → RCE (REVIEW.md S3). Свой cwd
+          (папка сессии) проектных .mcp.json не содержит, так что там флаг
+          безвреден и сохраняет прежнее поведение;
         - permissions.allow для канал-тулов: только в небайпасных режимах,
           иначе Claude спросит разрешение на каждый ответ в Telegram;
         - PreToolUse-хук: вызовы тулов → POST /event/<имя> → статус-бабл.
           `|| true` — хук не должен блокировать Claude.
         """
-        settings: dict = {"enableAllProjectMcpServers": True}
+        settings: dict = {}
+        if session.linked_path is None:
+            settings["enableAllProjectMcpServers"] = True
         perms: dict = {
             "deny": ["AskUserQuestion"],  # интерактивный вопрос-меню — под ботом
             # виснет без TUI-клика; Claude получит «tool not allowed» и (по
@@ -468,6 +475,7 @@ class SessionManager:
         if self.config.show_tool_calls:
             hook_cmd = (
                 "curl -sf -m 3 -X POST -H 'Content-Type: application/json' "
+                f"-H 'Authorization: Bearer {self.config.orch_token}' "
                 f"--data-binary @- http://127.0.0.1:{self.config.orch_port}/event/{session.name} "
                 ">/dev/null 2>&1 || true"
             )

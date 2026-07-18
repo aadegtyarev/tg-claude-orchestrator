@@ -27,6 +27,9 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "default")
 ORCH_HOST = os.environ.get("ORCH_HOST", "127.0.0.1")
 ORCH_PORT = int(os.environ.get("ORCH_PORT", "18080"))
 ORCH_URL = f"http://{ORCH_HOST}:{ORCH_PORT}/reply"
+# Общий секрет с оркестратором (REVIEW.md S1). Приходят из env, который
+# sessions.py кладёт в .mcp.json; пустой = оркестратор без токена (старый режим).
+ORCH_TOKEN = os.environ.get("ORCH_TOKEN", "")
 
 # Минимальный интервал между push-уведомлениями в Claude.
 PUSH_INTERVAL = 0.5
@@ -154,6 +157,10 @@ class ChannelServer:
         # Ссылки на фоновые задачи: event loop держит task слабой ссылкой,
         # без сохранения задача может быть собрана GC до завершения.
         self._tasks: set[asyncio.Task] = set()
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {ORCH_TOKEN}"} if ORCH_TOKEN else {}
 
     def _spawn(self, coro) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -283,7 +290,7 @@ class ChannelServer:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as http:
-                async with http.post(ORCH_URL, json=payload) as resp:
+                async with http.post(ORCH_URL, json=payload, headers=self._auth_headers) as resp:
                     resp.raise_for_status()
             result = {"content": [{"type": "text", "text": f"{ok_text} (ctx={payload.get('context_id')})"}]}
         except Exception as e:
@@ -301,7 +308,7 @@ class ChannelServer:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as http:
-                async with http.post(url, json=params) as resp:
+                async with http.post(url, json=params, headers=self._auth_headers) as resp:
                     resp.raise_for_status()
         except Exception as e:
             logger.error("Не удалось переслать permission_request: %s", e)
