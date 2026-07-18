@@ -99,6 +99,22 @@ def main():
     assert "<b>x</b>" not in safe and "&lt;b&gt;x&lt;/b&gt;" in safe, safe
     print("OK detail HTML-escaped")
 
+    # ── спавн сабагента: "Agent" — актуальное имя тула в Claude Code ≥2.1.
+    # Раньше код искал только "Task" и падал в generic-фолбэк (description
+    # без имени агента) — REVIEW.md, найдено разбором живого лога noos.
+    agent_line = b._tool_line("Agent", {
+        "subagent_type": "dev-reviewer", "description": "Fresh review slice 3",
+    })
+    assert agent_line == "<b>🤖 dev-reviewer</b>: <i>Fresh review slice 3</i>", agent_line
+    print("OK Agent (актуальное имя) → узнан, имя агента показано")
+
+    # "Task" (более старые версии CC) — тот же рендер, для совместимости.
+    task_line = b._tool_line("Task", {
+        "subagent_type": "dev-reviewer", "description": "Fresh review slice 3",
+    })
+    assert task_line == agent_line, (task_line, agent_line)
+    print("OK Task (старое имя) → тот же рендер, что и Agent")
+
     # ── _with_quote: цитата reply склеивается с текстом для модели ──
     Q = SimpleNamespace
     # выделенный фрагмент (message.quote) приоритетнее полного reply_to
