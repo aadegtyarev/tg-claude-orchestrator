@@ -46,6 +46,13 @@ LINE_LIMIT = 150
 # Индикатор «печатает…»: Telegram гасит его через ~5 с, обновляем чаще.
 TYPING_INTERVAL = 4.0
 
+# Сторож зависаний: если после отправки Claude молчит и claude.log не растёт
+# STALL_CHECKS проверок подряд — предупреждаем в топик (рост лога = живой
+# ход/размышление, отсутствие роста = завис).
+WATCHDOG_GRACE = 20.0
+WATCHDOG_CHECK = 15.0
+STALL_CHECKS = 2
+
 # Окно контекста для процента в /stats. Захардкожено грубо: у моделей с
 # 1M-окном цифра будет занижать реальный запас — это ориентир, не факт.
 CONTEXT_WINDOW = 200_000
@@ -97,6 +104,8 @@ class TelegramBot:
         )
         # thread_id -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
         self._typing: dict[int, asyncio.Task] = {}
+        # thread_id -> сторож зависаний (стартует/гаснет вместе с typing).
+        self._watchdogs: dict[int, asyncio.Task] = {}
         self._register_handlers()
 
     def t(self, key: str, **kwargs) -> str:
@@ -260,10 +269,12 @@ class TelegramBot:
             raw = raw[1:-1].strip()
         if not raw:
             return "", None
-        if raw.startswith("/"):
+        # Путь = токен, начинающийся с / или ~ (домашняя папка).
+        is_path = lambda tok: tok.startswith("/") or tok.startswith("~")
+        if is_path(raw):
             return Path(raw).name, raw
         tokens = raw.split()
-        path_idx = next((i for i, tok in enumerate(tokens) if tok.startswith("/")), None)
+        path_idx = next((i for i, tok in enumerate(tokens) if is_path(tok)), None)
         if path_idx is not None:
             project_path = " ".join(tokens[path_idx:])
             title = " ".join(tokens[:path_idx]) or Path(project_path).name
@@ -703,17 +714,56 @@ class TelegramBot:
     # ── индикатор «печатает…» ───────────────────────────────────
 
     def _start_typing(self, thread_id: int) -> None:
-        """Показывать «печатает…» в топике, пока Claude обрабатывает запрос.
+        """«печатает…» + сторож зависаний на время обработки запроса.
 
-        Снимается финальным ответом (_stop_typing в handle_reply).
+        Оба гаснут финальным ответом (_stop_typing в handle_reply).
         """
         self._stop_typing(thread_id)
         self._typing[thread_id] = asyncio.create_task(self._typing_loop(thread_id))
+        self._watchdogs[thread_id] = asyncio.create_task(self._watchdog_loop(thread_id))
 
     def _stop_typing(self, thread_id: int) -> None:
-        task = self._typing.pop(thread_id, None)
-        if task is not None:
-            task.cancel()
+        for registry in (self._typing, self._watchdogs):
+            task = registry.pop(thread_id, None)
+            if task is not None:
+                task.cancel()
+
+    async def _watchdog_loop(self, thread_id: int) -> None:
+        """Если Claude молчит И claude.log не растёт несколько проверок подряд —
+        это зависание (а не долгое размышление): предупреждаем в топик.
+        """
+        session = self.manager.get(thread_id)
+        if session is None:
+            return
+        log = session.session_dir / "claude.log"
+        await asyncio.sleep(WATCHDOG_GRACE)
+        try:
+            last_size = log.stat().st_size
+        except OSError:
+            last_size = 0
+        stalls = 0
+        while True:
+            await asyncio.sleep(WATCHDOG_CHECK)
+            try:
+                size = log.stat().st_size
+            except OSError:
+                size = last_size
+            if size == last_size:
+                stalls += 1
+            else:
+                stalls, last_size = 0, size
+            if stalls < STALL_CHECKS:
+                continue
+            # Завис: снимаем «печатает», шлём диагностику один раз.
+            t = self._typing.pop(thread_id, None)
+            if t is not None:
+                t.cancel()
+            tail = await asyncio.to_thread(self.manager.tail_log, session, 10)
+            msg = self.t("stalled")
+            if tail:
+                msg += "\n\n" + self.t("session_died_tail", tail=tail[:1200])
+            await self._send(self.chat_id, thread_id, msg)
+            return
 
     async def _typing_loop(self, thread_id: int) -> None:
         while True:
