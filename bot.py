@@ -32,15 +32,24 @@ from aiogram.types import (
     ReactionTypeEmoji,
 )
 
+from ansi import strip_ansi
 from bashshell import BashShellManager, clean as bash_clean
 from bubble import BubbleManager
 from config import Config
-from sessions import Session, SessionError, SessionManager, slugify
+# logsignals/mdrender/slug/ansi вынесены из этого модуля (REVIEW.md D1/D2);
+# alias-имена с подчёркиванием сохранены для обратной совместимости с тестами
+# (error_relay_test импортирует _API_ERR_BANNER_RE и др. из bot).
+from logsignals import (
+    API_ERR_BANNER_RE as _API_ERR_BANNER_RE,
+    classify_api_error as _classify_api_error,
+    detect_log_signals as _detect_log_signals,
+)
+from mdrender import md_to_html, split_text
+from sessions import Session, SessionError, SessionManager
+from slug import slugify
 from texts import get_texts
 
 logger = logging.getLogger(__name__)
-
-TG_MESSAGE_LIMIT = 4096
 
 # Обрезка одной строки бабла / промежуточного ответа.
 LINE_LIMIT = 100
@@ -180,104 +189,27 @@ def _bash_head(command: str) -> str:
     return f"{cd_dest} · {body}" if cd_dest else body
 
 
-def split_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> list[str]:
-    """Разбить текст под лимит Telegram, по возможности по переводу строки."""
-    chunks = []
-    while len(text) > limit:
-        cut = text.rfind("\n", limit // 2, limit)
-        if cut == -1:
-            cut = limit
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    if text:
-        chunks.append(text)
-    return chunks
-
-
 # ── markdown → Telegram HTML ───────────────────────────────────
-# Telegram рендерит ограниченный HTML: b/i/s/code/pre/a. Превращаем в него
-# разметку из ответов Claude, остальное оставляем как есть. Небезопасные
-# символы экранируем. Если итог бракованный — _send откатывается на plain.
-_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
-_CODE_INLINE_RE = re.compile(r"`([^`\n]+)`")
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
-# _italic_ с.word-границами — чтобы не калечить snake_case (my_var_name).
-_ITALIC_RE = re.compile(r"(?<![\w*])_(?!\s)(.+?)(?<!\s)_(?![\w*])", re.DOTALL)
-_PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
-
-# Очистка claude.log от ANSI и детектор ошибок API Клода (для ретранслятора).
-#
-# Триггер — ТОЛЬКО настоящий баннер TUI «API Error: <код> <детали>». Клод и сам
-# охотно пишет слова «rate-limit»/«api error» в ответах (диагностика чужой
-# сессии, описание самой этой фичи), и прежний широкий греп ловил эту прозу как
-# ложный алерт о лимите. Баннер с кодом модель дословно не цитирует, поэтому он
-# — надёжный сигнал. group(1)=код, group(2)=хвост строки с деталями (для класса).
-_LOG_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
-_API_ERR_BANNER_RE = re.compile(rb"API Error:\s*(\d{3})\b([^\n]{0,140})", re.IGNORECASE)
-# Класс ошибки по деталям баннера (код разбираем отдельно).
-_RL_DETAIL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\bcapacity\b", re.IGNORECASE)
-_PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d|thinking", re.IGNORECASE)
-# Живые сигналы из claude.log (когда тулов нет, но что-то происходит):
-#  • ретрай API-ошибки — Claude Code пишет «Retrying … attempt K/M»;
-#  • краш-рестарт — баннер «Resume this session with» / «Welcome back».
-_RETRY_RE = re.compile(rb"attempt\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
-_RESTART_RE = re.compile(rb"Resume this session with|Welcome back", re.IGNORECASE)
+# Рендер (md_to_html) и разбивка текста (split_text), а также разбор сигналов
+# claude.log (_detect_log_signals и др.) вынесены в mdrender.py и logsignals.py
+# (см. импорты вверху). alias-имена с подчёркиванием сохранены для обратной
+# совместимости с тестами (from bot import split_text / _API_ERR_BANNER_RE …).
 
 
-def _classify_api_error(code: bytes, detail: bytes) -> str:
-    """Класс ошибки API для ретранслятора: ratelimit | protocol | generic.
+def _read_log_delta(path: Path, offset: int) -> tuple[bytes, int]:
+    """Прочитать приращение лога с offset: (сырой delta, новый offset=size).
 
-    ratelimit — 429/529/overloaded: транзитно, помогает смена модели.
-    protocol — 400 с кривым server_tool_use/tool_result: апстрим (z.ai) шлёт
-              несогласованный блок, модель тут ни при чём — /clear или /close_session.
-    generic  — прочее (5xx и т.п.).
+    Если файл стал меньше offset (resume/ротация/усечение) — читаем с начала.
+    Чистая функция над файлом — тестируется без петли/Telegram (REVIEW.md B5).
+    Бросает OSError наружу (вызывающий continue'ит).
     """
-    if code in (b"429", b"529") or _RL_DETAIL_RE.search(detail):
-        return "ratelimit"
-    if code == b"400" and _PROTO_DETAIL_RE.search(detail):
-        return "protocol"
-    return "generic"
-
-
-def _detect_log_signals(chunk: bytes) -> dict:
-    """Разобрать кусок claude.log на три класса сигналов (для ретранслятора).
-
-    Возвращает {api_error, retry, restarts}:
-      • api_error — (code, klass) баннера «API Error: <код>» либо None;
-      • retry — (attempt, total) из «attempt K/M», последний в куске, либо None;
-      • restarts — сколько баннеров рестарта («Resume this session»/«Welcome back»).
-    Чистая функция: только разбор байтов — тестируется без петли/Telegram.
-    """
-    out: dict = {"api_error": None, "retry": None, "restarts": 0}
-    m = _API_ERR_BANNER_RE.search(chunk)
-    if m:
-        out["api_error"] = (m.group(1), _classify_api_error(m.group(1), m.group(2)))
-    rm = _RETRY_RE.search(chunk)
-    if rm:
-        out["retry"] = (int(rm.group(1)), int(rm.group(2)))
-    out["restarts"] = len(_RESTART_RE.findall(chunk))
-    return out
-
-
-def md_to_html(text: str) -> str:
-    """Светлый markdown → HTML Telegram. Код выносится первым (внутри нет
-    разметки), затем экранируется остальное, затем разметка."""
-    stash: list[str] = []
-
-    def _keep(html_body: str, tag: str) -> str:
-        stash.append(f"<{tag}>{html_body}</{tag}>")
-        return f"\x00{len(stash) - 1}\x00"
-
-    text = _CODE_BLOCK_RE.sub(lambda m: _keep(html.escape(m.group(1)), "pre"), text)
-    text = _CODE_INLINE_RE.sub(lambda m: _keep(html.escape(m.group(1)), "code"), text)
-    text = html.escape(text)
-    text = _BOLD_RE.sub(r"<b>\1</b>", text)
-    text = _STRIKE_RE.sub(r"<s>\1</s>", text)
-    text = _LINK_RE.sub(r'<a href="\2">\1</a>', text)
-    text = _ITALIC_RE.sub(r"<i>\1</i>", text)
-    return _PLACEHOLDER_RE.sub(lambda m: stash[int(m.group(1))], text)
+    size = path.stat().st_size
+    if offset > size:
+        offset = 0
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        delta = fh.read(size - offset)
+    return delta, size
 
 
 class TelegramBot:
@@ -338,6 +270,10 @@ class TelegramBot:
         await self.dp.start_polling(self.bot)
 
     async def close(self) -> None:
+        # Останавливаем launcher: прибираем и постоянные bash-оболочки топиков,
+        # иначе они осиротеют и переживут процесс бота (REVIEW.md B1). В потоке —
+        # proc.wait(timeout) блокирующий, на shutdown не stall-ит event loop.
+        await asyncio.to_thread(self.bash.close_all)
         await self.bot.session.close()
 
     # ── регистрация и доступ ────────────────────────────────────
@@ -659,6 +595,10 @@ class TelegramBot:
                 if code is not None:
                     break
             else:
+                # Таймаут: прерываем убежавшую команду (Ctrl-C), чтобы она не
+                # гадила в общий буфер следующему /bash. Сама оболочка живёт —
+                # дослать ввод/посмотреть статус можно /bashin.
+                shell.interrupt()
                 await status.edit_text(
                     self._bash_render(cmd, out, None, timeout=True), parse_mode="HTML"
                 )
@@ -705,6 +645,7 @@ class TelegramBot:
             await message.reply(self.t("only_topic"))
             return
         self._stop_typing(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.close(session)
         await message.reply(self.t("close_done"))
@@ -749,6 +690,7 @@ class TelegramBot:
             return
         await callback.answer(self.t("delete_doing"))
         self._stop_typing(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.delete(session)
         try:
@@ -1029,7 +971,7 @@ class TelegramBot:
             quoted = reply_txt                                # весь процитированный пост
         # Диагностика: дошли ли до бота данные цитаты (в форумах/при privacy
         # mode их может не быть — тогда функцию надо крепить иначе).
-        logger.info(
+        logger.debug(
             "on_text quote=%s reply_msg=%s quote_len=%d reply_len=%d",
             bool(quote_txt), message.reply_to_message is not None,
             len(quote_txt or ""), len(reply_txt or ""),
@@ -1237,14 +1179,14 @@ class TelegramBot:
 
         while True:
             await asyncio.sleep(ERROR_RELAY_INTERVAL)
+            # Читаем ТОЛЬКО приращение с прошлого тика (seek), а не весь лог
+            # целиком каждый тик (REVIEW.md B5). _read_log_delta — чистая функция
+            # (тестируется отдельно), сама разруливает усечение/ротацию.
             try:
-                data = log.read_bytes()
+                delta, offset = _read_log_delta(log, offset)
             except OSError:
                 continue
-            if offset > len(data):  # лог обнулили (resume/ротация) — смотрим с начала
-                offset = 0
-            chunk = _LOG_ANSI_RE.sub(b"", data[offset:]).replace(b"\r", b"")
-            offset = len(data)
+            chunk = strip_ansi(delta)
             sig = _detect_log_signals(chunk)
             now = loop_time()
 
@@ -1312,10 +1254,9 @@ class TelegramBot:
         if chat_id is None:
             return
 
-        if thread_id is not None:  # ответ/файл = активность (сброс таймера простоя)
-            session = self.manager.get(thread_id)
-            if session is not None:
-                self.manager.touch(session)
+        session = self.manager.get(thread_id) if thread_id is not None else None
+        if session is not None:  # ответ/файл = активность (сброс таймера простоя)
+            self.manager.touch(session)
 
         if data.get("file_path"):
             if thread_id is not None:
@@ -1323,6 +1264,7 @@ class TelegramBot:
             await self._send_file(
                 chat_id, thread_id,
                 str(data["file_path"]), str(data.get("caption", "")), reply_to,
+                session,
             )
             return
 
@@ -1348,11 +1290,55 @@ class TelegramBot:
         if thread_id is not None:
             await self.bubbles.close(thread_id)
 
+    def _sendfile_roots(self, session: Session | None) -> list[Path]:
+        """Рабочие папки, откуда Клоду разрешено отправлять файлы в чат:
+        cwd проекта (или папка сессии), сама папка сессии и incoming-каталог.
+        """
+        roots: list[Path] = []
+        if session is not None:
+            roots.append(self.manager.effective_cwd(session))
+            roots.append(session.session_dir)
+        else:
+            roots.append(self.config.sessions_dir)
+        inc = Path(self.config.incoming_dir).expanduser()
+        if not inc.is_absolute():
+            base = session.session_dir if session is not None else self.config.sessions_dir
+            inc = base / inc
+        roots.append(inc)
+        return roots
+
+    def _path_in_workspace(self, path: Path, session: Session | None) -> bool:
+        """Лежит ли path (после resolve, со симлинками) внутри одной из рабочих
+        папок сессии. Ошибки resolve/stat (битая симссылка, нет прав) → False:
+        лучше отказать, чем вынести файл за пределами workspace."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        for root in self._sendfile_roots(session):
+            try:
+                root_resolved = root.resolve()
+                if resolved.is_relative_to(root_resolved):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
     async def _send_file(
         self, chat_id: int, thread_id: int | None,
         file_path: str, caption: str, reply_to: int | None,
+        session: Session | None,
     ) -> None:
         path = Path(file_path).expanduser()
+        # Jail: только внутри рабочих папок сессии (cwd проекта / папка сессии /
+        # incoming). Без этого промпт-инъекция из чужого файла/CLAUDE.md могла
+        # заставить Клода вызвать send_file_to_telegram на ~/.ssh/id_rsa или
+        # .env и выслать секреты в чат (REVIEW.md S2). resolve() раскрывает
+        # симлинки — escape через ссылку тоже отсекается.
+        if not self._path_in_workspace(path, session):
+            logger.warning("send_file отклонён вне workspace: %s", path)
+            await self._send(chat_id, thread_id, self.t("sendfile_denied", path=path))
+            return
         if not path.is_file():
             await self._send(chat_id, thread_id, self.t("sendfile_not_found", path=path))
             return
@@ -1533,22 +1519,34 @@ class TelegramBot:
     # ── служебное ───────────────────────────────────────────────
 
     def _parse_context(self, context_id: str) -> tuple[int | None, int | None, int | None]:
-        """context_id = tg:chat_id:thread_id:message_id (thread_id=0 — без топика)."""
+        """context_id = tg:chat_id:thread_id:message_id (thread_id=0 — без топика).
+
+        Кривой/чужой context_id — drop, а не «дефолт в основной чат»: иначе
+        локальный злоумышленник или баг канала могли бы вбросить ответ в main
+        chat (REVIEW.md B6).
+        """
         parts = context_id.split(":")
         if len(parts) == 4 and parts[0] == "tg":
             try:
                 chat_id, thread_raw, reply_to = int(parts[1]), int(parts[2]), int(parts[3])
-                return chat_id, thread_raw or None, reply_to or None
             except ValueError:
                 pass
-        logger.warning("Некорректный context_id: %r", context_id)
-        return self.chat_id, None, None
+            else:
+                # Defence-in-depth: чужой chat_id (валидный по формату) не должен
+                # отправляться — бот пишет только в привязанный чат (REVIEW B6/🟡4).
+                if self.chat_id is not None and chat_id != self.chat_id:
+                    logger.warning("context_id с чужим chat_id (игнорирую): %r", context_id)
+                    return None, None, None
+                return chat_id, thread_raw or None, reply_to or None
+        logger.warning("Некорректный context_id (игнорирую): %r", context_id)
+        return None, None, None
 
     async def notify_session_dead(self, session: Session, code: int | str) -> None:
         """Колбэк SessionManager: Claude умер сам по себе."""
         if self.chat_id is None:
             return
         self._stop_typing(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         text = self.t("session_died", name=session.title, code=code)
         tail = await asyncio.to_thread(self.manager.tail_log, session)
@@ -1562,6 +1560,7 @@ class TelegramBot:
             return
         for session in sessions:
             self._stop_typing(session.thread_id)
+            await asyncio.to_thread(self.bash.close, session.thread_id)
             await self.bubbles.close(session.thread_id)
             await self._send(
                 self.chat_id, session.thread_id,
