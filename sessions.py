@@ -115,6 +115,47 @@ _DIALOGS = [
 ]
 
 
+# PreToolUse-хук как отдельный python-скрипт (а не curl с токеном в аргументах).
+# Токен встроен константой в этот 0600-файл — НЕ в cmdline (иначе виден в
+# /proc/<pid>/cmdline любому локальному пользователю) и НЕ в settings.local.json
+# (0644). Раньше curl -H 'Authorization: Bearer …' течёт в оба места (REVIEW S1,
+# найдено адверсариальным ревью). __PORT__/__NAME__/__TOKEN__ подставляются
+# обычным replace (без .format-скобок, чтобы безопасно для任意 значения токена).
+_HOOK_SCRIPT = '''#!/usr/bin/env python3
+"""PreToolUse-хук Claude Code: POST /event/<имя> оркестратору.
+
+Токен встроен константой сюда (файл 0600), НЕ в cmdline/настройки — иначе
+ORCH_TOKEN виден локальному процессу через /proc/<pid>/cmdline (REVIEW.md S1).
+Читает событие из stdin, всегда выходит 0 — хук не должен блокировать Claude."""
+import sys
+import urllib.request
+
+_URL = "http://127.0.0.1:__PORT__/event/__NAME__"
+_TOKEN = "__TOKEN__"
+
+
+def main():
+    try:
+        body = sys.stdin.read()
+        req = urllib.request.Request(
+            _URL,
+            data=body.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + _TOKEN,
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:
+        pass
+
+
+main()
+sys.exit(0)
+'''
+
+
 # ── живость процесса claude по /proc (Linux) ──────────────────
 # Вотчдог судит «завис/не завис» не только по байтам лога: спиннер «almost
 # done» может на секунды замолчать в нормальной работе — это не зависание.
@@ -449,6 +490,8 @@ class SessionManager:
           `|| true` — хук не должен блокировать Claude.
         """
         settings: dict = {}
+        settings_dir = session.session_dir / ".claude"
+        settings_dir.mkdir(exist_ok=True)
         if session.linked_path is None:
             settings["enableAllProjectMcpServers"] = True
         perms: dict = {
@@ -465,19 +508,25 @@ class SessionManager:
             ]
         settings["permissions"] = perms
         if self.config.show_tool_calls:
-            hook_cmd = (
-                "curl -sf -m 3 -X POST -H 'Content-Type: application/json' "
-                f"-H 'Authorization: Bearer {self.config.orch_token}' "
-                f"--data-binary @- http://127.0.0.1:{self.config.orch_port}/event/{session.name} "
-                ">/dev/null 2>&1 || true"
+            # Токен уходит в 0600-скрипт (см. _HOOK_SCRIPT), команда хука =
+            # только путь к интерпретатору и скрипту — ничего секретного в
+            # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
+            hook_script = settings_dir / "pretooluse_hook.py"
+            hook_script.write_text(
+                _HOOK_SCRIPT
+                .replace("__PORT__", str(self.config.orch_port))
+                .replace("__NAME__", session.name)
+                .replace("__TOKEN__", self.config.orch_token)
             )
+            os.chmod(hook_script, 0o600)
             settings["hooks"] = {
                 "PreToolUse": [
-                    {"matcher": "", "hooks": [{"type": "command", "command": hook_cmd}]}
+                    {"matcher": "", "hooks": [
+                        {"type": "command",
+                         "command": f'"{sys.executable}" "{hook_script}"'},
+                    ]}
                 ]
             }
-        settings_dir = session.session_dir / ".claude"
-        settings_dir.mkdir(exist_ok=True)
         (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
 
     async def _start_claude(self, session: Session, resume: bool = False) -> None:

@@ -196,6 +196,22 @@ def _bash_head(command: str) -> str:
 # совместимости с тестами (from bot import split_text / _API_ERR_BANNER_RE …).
 
 
+def _read_log_delta(path: Path, offset: int) -> tuple[bytes, int]:
+    """Прочитать приращение лога с offset: (сырой delta, новый offset=size).
+
+    Если файл стал меньше offset (resume/ротация/усечение) — читаем с начала.
+    Чистая функция над файлом — тестируется без петли/Telegram (REVIEW.md B5).
+    Бросает OSError наружу (вызывающий continue'ит).
+    """
+    size = path.stat().st_size
+    if offset > size:
+        offset = 0
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        delta = fh.read(size - offset)
+    return delta, size
+
+
 class TelegramBot:
     def __init__(self, config: Config, manager: SessionManager):
         self.config = config
@@ -255,8 +271,9 @@ class TelegramBot:
 
     async def close(self) -> None:
         # Останавливаем launcher: прибираем и постоянные bash-оболочки топиков,
-        # иначе они осиротеют и переживут процесс бота (REVIEW.md B1).
-        self.bash.close_all()
+        # иначе они осиротеют и переживут процесс бота (REVIEW.md B1). В потоке —
+        # proc.wait(timeout) блокирующий, на shutdown не stall-ит event loop.
+        await asyncio.to_thread(self.bash.close_all)
         await self.bot.session.close()
 
     # ── регистрация и доступ ────────────────────────────────────
@@ -628,7 +645,7 @@ class TelegramBot:
             await message.reply(self.t("only_topic"))
             return
         self._stop_typing(session.thread_id)
-        self.bash.close(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.close(session)
         await message.reply(self.t("close_done"))
@@ -673,7 +690,7 @@ class TelegramBot:
             return
         await callback.answer(self.t("delete_doing"))
         self._stop_typing(session.thread_id)
-        self.bash.close(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         await self.manager.delete(session)
         try:
@@ -1163,22 +1180,12 @@ class TelegramBot:
         while True:
             await asyncio.sleep(ERROR_RELAY_INTERVAL)
             # Читаем ТОЛЬКО приращение с прошлого тика (seek), а не весь лог
-            # целиком каждый тик (REVIEW.md B5): под лимитом LOG_MAX_MB это
-            # полные чтения в память ради хвоста. Размер — через stat; если
-            # файл стал меньше (resume/ротация) — с начала.
+            # целиком каждый тик (REVIEW.md B5). _read_log_delta — чистая функция
+            # (тестируется отдельно), сама разруливает усечение/ротацию.
             try:
-                size = log.stat().st_size
+                delta, offset = _read_log_delta(log, offset)
             except OSError:
                 continue
-            if offset > size:
-                offset = 0
-            try:
-                with open(log, "rb") as fh:
-                    fh.seek(offset)
-                    delta = fh.read(size - offset)
-            except OSError:
-                continue
-            offset = size
             chunk = strip_ansi(delta)
             sig = _detect_log_signals(chunk)
             now = loop_time()
@@ -1522,9 +1529,15 @@ class TelegramBot:
         if len(parts) == 4 and parts[0] == "tg":
             try:
                 chat_id, thread_raw, reply_to = int(parts[1]), int(parts[2]), int(parts[3])
-                return chat_id, thread_raw or None, reply_to or None
             except ValueError:
                 pass
+            else:
+                # Defence-in-depth: чужой chat_id (валидный по формату) не должен
+                # отправляться — бот пишет только в привязанный чат (REVIEW B6/🟡4).
+                if self.chat_id is not None and chat_id != self.chat_id:
+                    logger.warning("context_id с чужим chat_id (игнорирую): %r", context_id)
+                    return None, None, None
+                return chat_id, thread_raw or None, reply_to or None
         logger.warning("Некорректный context_id (игнорирую): %r", context_id)
         return None, None, None
 
@@ -1533,7 +1546,7 @@ class TelegramBot:
         if self.chat_id is None:
             return
         self._stop_typing(session.thread_id)
-        self.bash.close(session.thread_id)
+        await asyncio.to_thread(self.bash.close, session.thread_id)
         await self.bubbles.close(session.thread_id)
         text = self.t("session_died", name=session.title, code=code)
         tail = await asyncio.to_thread(self.manager.tail_log, session)
@@ -1547,7 +1560,7 @@ class TelegramBot:
             return
         for session in sessions:
             self._stop_typing(session.thread_id)
-            self.bash.close(session.thread_id)
+            await asyncio.to_thread(self.bash.close, session.thread_id)
             await self.bubbles.close(session.thread_id)
             await self._send(
                 self.chat_id, session.thread_id,

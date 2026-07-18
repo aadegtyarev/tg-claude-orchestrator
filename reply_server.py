@@ -7,6 +7,7 @@ POST /event/{name}  — события PreToolUse-хука Claude Code (вызо
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Awaitable, Callable
 
 from aiohttp import web
@@ -31,11 +32,14 @@ async def start_reply_server(
     # но без токена любой локальный процесс (и вкладка браузера через DNS
     # rebinding) мог бы POST /reply с file_path и выгрузить任意 файл в чат
     # (REVIEW.md S1). Канал-сервер и curl-хук пробрасывают тот же токен.
-    expected_auth = f"Bearer {config.orch_token}"
+    expected_auth = f"Bearer {config.orch_token}".encode()
 
     @web.middleware
     async def _auth(request: web.Request, handler):
-        if request.headers.get("Authorization", "") != expected_auth:
+        sent = request.headers.get("Authorization", "").encode("utf-8", "replace")
+        # constant-time сравнение; на байтах — безопасно при любом (в т.ч.
+        # не-ASCII) вводе, без TypeError.
+        if not secrets.compare_digest(sent, expected_auth):
             return web.Response(status=401, text="unauthorized")
         return await handler(request)
 
