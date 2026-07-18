@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 
@@ -329,12 +330,19 @@ class ChannelServer:
         # промпт в Claude или POST /permission behavior=allow и авто-разрешить
         # запрос. Пустой ORCH_TOKEN (тестовый запуск без .env) = режим открыт —
         # в проде config всегда генерирует/читает токен.
-        expected = f"Bearer {ORCH_TOKEN}" if ORCH_TOKEN else ""
+        expected = (f"Bearer {ORCH_TOKEN}").encode() if ORCH_TOKEN else b""
+        if not ORCH_TOKEN:
+            logger.warning(
+                "ORCH_TOKEN пуст — channel-сервер в ОТКРЫТОМ режиме (любой "
+                "локальный процесс может /notify//permission). Только для тестов!"
+            )
 
         @web.middleware
         async def _auth(request: web.Request, handler):
-            if expected and request.headers.get("Authorization", "") != expected:
-                return web.Response(status=401, text="unauthorized")
+            if expected:
+                sent = request.headers.get("Authorization", "").encode("utf-8", "replace")
+                if not secrets.compare_digest(sent, expected):
+                    return web.Response(status=401, text="unauthorized")
             return await handler(request)
 
         app = web.Application(middlewares=[_auth])
