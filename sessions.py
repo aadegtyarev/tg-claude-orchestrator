@@ -260,9 +260,7 @@ class SessionManager:
             try:
                 session.session_dir.mkdir(parents=True, exist_ok=True)
                 if project_path:
-                    session.linked_path = self._link_project(
-                        session.session_dir, project_path
-                    )
+                    session.linked_path = self._link_project(project_path)
                 self._write_mcp_json(session)
                 self._write_claude_settings(session)
                 await self._start_claude(session)
@@ -300,26 +298,16 @@ class SessionManager:
         return None
 
     @staticmethod
-    def _link_project(session_dir: Path, project_path: str) -> str:
-        """Симлинк на внешний проект внутри директории сессии.
-
+    def _link_project(project_path: str) -> str:
+        """Рабочая директория проекта: claude запускается прямо в ней
+        (натуральный cwd — грузит CLAUDE.md/.mcp.json/.claude проекта).
         Несуществующая директория создаётся автоматически.
         """
         real_path = Path(project_path).expanduser().resolve()
         if real_path.is_file():
             raise SessionError(f"Это файл, а не директория: {project_path}")
         real_path.mkdir(parents=True, exist_ok=True)
-        symlink = session_dir / f"linked-{real_path.name}"
-        if symlink.is_symlink():
-            # Пересоздаём, если указывает не туда (в т.ч. битый симлинк).
-            if Path(os.readlink(symlink)) != real_path:
-                symlink.unlink()
-                os.symlink(real_path, symlink, target_is_directory=True)
-        elif symlink.exists():
-            raise SessionError(f"В директории сессии уже есть {symlink.name}")
-        else:
-            os.symlink(real_path, symlink, target_is_directory=True)
-        return str(symlink)
+        return str(real_path)
 
     def _write_mcp_json(self, session: Session) -> None:
         """Конфиг, по которому Claude Code сам запустит channel_server.py.
@@ -344,25 +332,31 @@ class SessionManager:
         (session.session_dir / ".mcp.json").write_text(json.dumps(mcp, indent=2))
 
     def _write_claude_settings(self, session: Session) -> None:
-        """Настройки Claude Code для headless-запуска.
+        """Настройки бота для headless-запуска. Грузятся через --settings и
+        мержатся с профилем (CLAUDE_CONFIG_DIR) и проектом — не заменяют их.
 
-        - enableAllProjectMcpServers: предодобряет наш MCP-сервер из .mcp.json
-          (иначе сессия повиснет на диалоге согласия);
-        - permissions.allow: тулы канала всегда разрешены — иначе в строгих
-          режимах каждое сообщение в Telegram требовало бы подтверждения;
-        - PreToolUse-хук: каждый вызов инструмента отправляется в оркестратор
-          (POST /event/<имя>) и попадает в статус-бабл Telegram.
+        - enableAllProjectMcpServers: авто-апрув MCP из .mcp.json проекта,
+          чтоб твои серверы стартовали без диалога «New MCP server found»
+          (на канал из --mcp-config не влияет — он доверенный и так);
+        - permissions.allow для канал-тулов: только в небайпасных режимах,
+          иначе Claude спросит разрешение на каждый ответ в Telegram;
+        - PreToolUse-хук: вызовы тулов → POST /event/<имя> → статус-бабл.
           `|| true` — хук не должен блокировать Claude.
         """
-        settings: dict = {
-            "enableAllProjectMcpServers": True,
-            "permissions": {
-                "allow": [
-                    f"mcp__tg-channel-{session.name}__reply_to_telegram",
-                    f"mcp__tg-channel-{session.name}__send_file_to_telegram",
-                ]
-            },
+        settings: dict = {"enableAllProjectMcpServers": True}
+        perms: dict = {
+            "deny": ["AskUserQuestion"],  # интерактивный вопрос-меню — под ботом
+            # виснет без TUI-клика; Claude получит «tool not allowed» и (по
+            # системному промпту) переспросит через reply_to_telegram.
+            # Внимание: в режиме bypass проверки разрешений нет — там страж
+            # только системный промпт.
         }
+        if self.config.permission_mode != "bypass":
+            perms["allow"] = [
+                f"mcp__tg-channel-{session.name}__reply_to_telegram",
+                f"mcp__tg-channel-{session.name}__send_file_to_telegram",
+            ]
+        settings["permissions"] = perms
         if self.config.show_tool_calls:
             hook_cmd = (
                 "curl -sf -m 3 -X POST -H 'Content-Type: application/json' "
@@ -402,10 +396,14 @@ class SessionManager:
             if resume
             else [f"--session-id={session.claude_session_id}"]
         )
-        # Модель передаём как есть: синонимы (opus/sonnet/haiku/…) и полные
-        # имена мапит сам Claude Code — мы не дублируем его каталог моделей.
-        if session.model:
-            session_arg += ["--model", session.model]
+        # Модель: /model на сессию → DEFAULT_MODEL из .env → дефолт Claude.
+        # Синонимы (opus/sonnet/haiku/…) и полные имена мапит сам Claude Code.
+        model = session.model or self.config.default_model
+        if model:
+            session_arg += ["--model", model]
+        # Effort по умолчанию из .env (low/medium/high/xhigh/max).
+        if self.config.default_effort:
+            session_arg += ["--effort", self.config.default_effort]
         # Режим разрешений: bypass — без ограничений; остальные режимы
         # спрашивают, запросы прилетают в Telegram (permission relay).
         if self.config.permission_mode == "bypass":
@@ -417,14 +415,26 @@ class SessionManager:
         session.log_file = open(session.session_dir / "claude.log", "ab")
         master, slave = pty.openpty()
         try:
-            # Синтаксис по документации: dev-записи каналов передаются самому
-            # --dangerously-load-development-channels (server:<ключ из .mcp.json>).
+            # cwd = папка проекта (если задан линк): натуральное поведение —
+            # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
+            # и настройки бота подсасываем флагами ниже (consent не просят).
+            cwd = str(self.effective_cwd(session))
+            extra: list[str] = []
+            mcp_json = session.session_dir / ".mcp.json"
+            if mcp_json.exists():
+                extra += ["--mcp-config", str(mcp_json)]
+            settings_file = session.session_dir / ".claude" / "settings.local.json"
+            if settings_file.exists():
+                extra += ["--settings", str(settings_file)]
+            # dev-записи каналов передаются --dangerously-load-development-channels
+            # (server:<имя>; определено в .mcp.json из --mcp-config).
             session.process = await asyncio.create_subprocess_exec(
                 self.config.claude_bin,
                 *session_arg,
+                *extra,
                 "--dangerously-load-development-channels",
                 f"server:tg-channel-{session.name}",
-                cwd=str(session.session_dir),
+                cwd=cwd,
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,
@@ -754,13 +764,28 @@ class SessionManager:
 
     # ── статистика по транскрипту ───────────────────────────────
 
+    def effective_cwd(self, session: Session) -> Path:
+        """Реальный cwd процесса claude: папка проекта, если задан линк,
+        иначе папка сессии. Натуральное поведение «cd в проект и claude» —
+        Claude грузит CLAUDE.md/.mcp.json/.claude из проекта.
+
+        Эту же строку используем для кодирования пути транскрипта (см.
+        transcript_path) — Claude хранит его по cwd, должны совпадать.
+        """
+        if session.linked_path:
+            try:
+                return Path(session.linked_path).resolve()
+            except OSError:
+                return session.session_dir
+        return session.session_dir
+
     def transcript_path(self, session: Session) -> Path:
         """Транскрипт сессии в профиле Claude Code.
 
-        Путь проекта кодируется заменой '/' и '.' на '-'.
+        Путь проекта (= cwd Claude) кодируется заменой '/' и '.' на '-'.
         """
         config_dir = self.config.claude_config_dir or Path.home() / ".claude"
-        encoded = str(session.session_dir).replace("/", "-").replace(".", "-")
+        encoded = str(self.effective_cwd(session)).replace("/", "-").replace(".", "-")
         return config_dir / "projects" / encoded / f"{session.claude_session_id}.jsonl"
 
     def read_stats(self, session: Session) -> dict | None:
