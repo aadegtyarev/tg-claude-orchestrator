@@ -161,7 +161,9 @@ class BubbleManager:
         carried = list(old.lines) if old and old.lines else []
         if old is not None and chat_id is not None:
             await self._finish_message(old, chat_id)
-        self._active.add(thread_id)
+        # Единая точка «старт хода» — раньше дублировали _active.add тут и в
+        # open(); теперь fork делегирует в open() (REVIEW.md D3).
+        self.open(thread_id)
         new = Bubble()
         new.lines = carried
         new.updated_at = time.time()

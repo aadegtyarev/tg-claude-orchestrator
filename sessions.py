@@ -32,7 +32,9 @@ from typing import IO, Awaitable, Callable
 
 import aiohttp
 
+from ansi import strip_ansi
 from config import Config
+from slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
 
 logger = logging.getLogger(__name__)
 
@@ -101,33 +103,8 @@ def _scan_pollution(entries) -> str | None:
 
 
 class SessionError(Exception):
-    """Ошибка создания/работы сессии — текст показывается пользователю."""
+    """Ошибка создания/работы сессией — текст показывается пользователю."""
 
-
-# Транслитерация кириллицы в латиницу для slug (ГОСТ-подобная, упрощённая).
-_TRANSLIT = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "j", "к": "k", "л": "l", "м": "m",
-    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
-    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
-}
-
-
-def slugify(title: str) -> str:
-    """Безопасный непустой идентификатор из отображаемого имени.
-
-    Название топика может быть любым (пробелы, эмодзи, кириллица), но папка,
-    ключ MCP-сервера (`tg-channel-<slug>`), CLI-аргумент `server:...` и URL
-    хука `/event/<slug>` требуют [A-Za-z0-9_-]. Кириллица транслитерируется;
-    если после этого не осталось латиницы/цифр (эмодзи, иероглифы) — автослаг.
-    """
-    translit = "".join(_TRANSLIT.get(ch, _TRANSLIT.get(ch.lower(), ch)) for ch in title)
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", translit).strip("-")[:32]
-    return slug or f"session-{uuid.uuid4().hex[:6]}"
-
-
-_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 
 # Стартовые диалоги интерактивного claude и клавиши-ответы.
 # Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
@@ -136,6 +113,47 @@ _DIALOGS = [
     ("bypasspermissions", b"2\r"),     # «Yes, I accept» — пункт 2
     ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
 ]
+
+
+# PreToolUse-хук как отдельный python-скрипт (а не curl с токеном в аргументах).
+# Токен встроен константой в этот 0600-файл — НЕ в cmdline (иначе виден в
+# /proc/<pid>/cmdline любому локальному пользователю) и НЕ в settings.local.json
+# (0644). Раньше curl -H 'Authorization: Bearer …' течёт в оба места (REVIEW S1,
+# найдено адверсариальным ревью). __PORT__/__NAME__/__TOKEN__ подставляются
+# обычным replace (без .format-скобок, чтобы безопасно для任意 значения токена).
+_HOOK_SCRIPT = '''#!/usr/bin/env python3
+"""PreToolUse-хук Claude Code: POST /event/<имя> оркестратору.
+
+Токен встроен константой сюда (файл 0600), НЕ в cmdline/настройки — иначе
+ORCH_TOKEN виден локальному процессу через /proc/<pid>/cmdline (REVIEW.md S1).
+Читает событие из stdin, всегда выходит 0 — хук не должен блокировать Claude."""
+import sys
+import urllib.request
+
+_URL = "http://127.0.0.1:__PORT__/event/__NAME__"
+_TOKEN = "__TOKEN__"
+
+
+def main():
+    try:
+        body = sys.stdin.read()
+        req = urllib.request.Request(
+            _URL,
+            data=body.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + _TOKEN,
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:
+        pass
+
+
+main()
+sys.exit(0)
+'''
 
 
 # ── живость процесса claude по /proc (Linux) ──────────────────
@@ -212,7 +230,7 @@ def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
             except ValueError:  # лог уже закрыт при остановке сессии
                 pass
             buf = (buf + chunk)[-16384:]
-            screen = _ANSI_RE.sub(b"", buf).replace(b"\r", b"").replace(b" ", b"")
+            screen = strip_ansi(buf).replace(b" ", b"")
             screen_text = screen.decode(errors="replace").lower()
             for marker, keys in _DIALOGS:
                 if marker in screen_text and marker not in answered:
@@ -270,9 +288,24 @@ class SessionManager:
         self._by_thread: dict[int, Session] = {}
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
+        # Общий HTTP-пул к channel-серверам (keep-alive, без сессии на запрос —
+        # REVIEW.md E1). Ленивый: создаётся в event loop при первом обращении.
+        self._http: aiohttp.ClientSession | None = None
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
+
+    def _http_session(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        return self._http
+
+    def _channel_headers(self) -> dict[str, str]:
+        """Auth на эндпоинты channel-сервера (/notify /permission /ping) —
+        симметрично ORCH_TOKEN на стороне оркестратора: без него локальный
+        процесс мог бы POST /notify и вбросить промпт в Claude или POST
+        /permission behavior=allow и авто-разрешить запрос."""
+        return {"Authorization": f"Bearer {self.config.orch_token}"}
 
     # ── состояние на диске ──────────────────────────────────────
     # Записи переживают /close_session и рестарт launcher'а: топик остаётся,
@@ -433,6 +466,7 @@ class SessionManager:
                         "SESSION_NAME": session.name,
                         "ORCH_HOST": self.config.orch_host,
                         "ORCH_PORT": str(self.config.orch_port),
+                        "ORCH_TOKEN": self.config.orch_token,
                     },
                 }
             }
@@ -445,13 +479,21 @@ class SessionManager:
 
         - enableAllProjectMcpServers: авто-апрув MCP из .mcp.json проекта,
           чтоб твои серверы стартовали без диалога «New MCP server found»
-          (на канал из --mcp-config не влияет — он доверенный и так);
+          (на канал из --mcp-config не влияет — он доверенный и так).
+          Ставим ТОЛЬКО без linked_path: иначе /new к чужому проекту запустит
+          его .mcp.json command без consent → RCE (REVIEW.md S3). Свой cwd
+          (папка сессии) проектных .mcp.json не содержит, так что там флаг
+          безвреден и сохраняет прежнее поведение;
         - permissions.allow для канал-тулов: только в небайпасных режимах,
           иначе Claude спросит разрешение на каждый ответ в Telegram;
         - PreToolUse-хук: вызовы тулов → POST /event/<имя> → статус-бабл.
           `|| true` — хук не должен блокировать Claude.
         """
-        settings: dict = {"enableAllProjectMcpServers": True}
+        settings: dict = {}
+        settings_dir = session.session_dir / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        if session.linked_path is None:
+            settings["enableAllProjectMcpServers"] = True
         perms: dict = {
             "deny": ["AskUserQuestion"],  # интерактивный вопрос-меню — под ботом
             # виснет без TUI-клика; Claude получит «tool not allowed» и (по
@@ -466,18 +508,25 @@ class SessionManager:
             ]
         settings["permissions"] = perms
         if self.config.show_tool_calls:
-            hook_cmd = (
-                "curl -sf -m 3 -X POST -H 'Content-Type: application/json' "
-                f"--data-binary @- http://127.0.0.1:{self.config.orch_port}/event/{session.name} "
-                ">/dev/null 2>&1 || true"
+            # Токен уходит в 0600-скрипт (см. _HOOK_SCRIPT), команда хука =
+            # только путь к интерпретатору и скрипту — ничего секретного в
+            # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
+            hook_script = settings_dir / "pretooluse_hook.py"
+            hook_script.write_text(
+                _HOOK_SCRIPT
+                .replace("__PORT__", str(self.config.orch_port))
+                .replace("__NAME__", session.name)
+                .replace("__TOKEN__", self.config.orch_token)
             )
+            os.chmod(hook_script, 0o600)
             settings["hooks"] = {
                 "PreToolUse": [
-                    {"matcher": "", "hooks": [{"type": "command", "command": hook_cmd}]}
+                    {"matcher": "", "hooks": [
+                        {"type": "command",
+                         "command": f'"{sys.executable}" "{hook_script}"'},
+                    ]}
                 ]
             }
-        settings_dir = session.session_dir / ".claude"
-        settings_dir.mkdir(exist_ok=True)
         (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
 
     async def _start_claude(self, session: Session, resume: bool = False) -> None:
@@ -575,29 +624,32 @@ class SessionManager:
     async def _wait_ready(self, session: Session) -> None:
         """Готовность = channel-сервер отвечает на /ping (его поднял Claude)."""
         deadline = asyncio.get_running_loop().time() + READY_TIMEOUT
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=2)
-        ) as http:
-            while True:
-                proc = session.process
-                if proc is None or proc.returncode is not None:
-                    code = proc.returncode if proc else "?"
-                    raise SessionError(
-                        f"Claude завершился при старте (код {code}). "
-                        f"Лог: {session.session_dir / 'claude.log'}"
-                    )
-                try:
-                    async with http.get(f"http://127.0.0.1:{session.port}/ping") as resp:
-                        if resp.status == 200:
-                            return
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    pass
-                if asyncio.get_running_loop().time() > deadline:
-                    raise SessionError(
-                        f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
-                        f"Лог: {session.session_dir / 'claude.log'}"
-                    )
-                await asyncio.sleep(1)
+        http = self._http_session()
+        ping_timeout = aiohttp.ClientTimeout(total=2)
+        while True:
+            proc = session.process
+            if proc is None or proc.returncode is not None:
+                code = proc.returncode if proc else "?"
+                raise SessionError(
+                    f"Claude завершился при старте (код {code}). "
+                    f"Лог: {session.session_dir / 'claude.log'}"
+                )
+            try:
+                async with http.get(
+                    f"http://127.0.0.1:{session.port}/ping",
+                    timeout=ping_timeout,
+                    headers=self._channel_headers(),
+                ) as resp:
+                    if resp.status == 200:
+                        return
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+            if asyncio.get_running_loop().time() > deadline:
+                raise SessionError(
+                    f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
+                    f"Лог: {session.session_dir / 'claude.log'}"
+                )
+            await asyncio.sleep(1)
 
     # ── жизненный цикл: close / resume / clear / set_model ─────
 
@@ -714,6 +766,8 @@ class SessionManager:
         for session in self.list_all():
             await self._stop_process(session, save=False)
         self.save_state()
+        if self._http is not None and not self._http.closed:
+            await self._http.close()
 
     # ── внутренняя механика процессов ───────────────────────────
 
@@ -737,7 +791,12 @@ class SessionManager:
         self.save_state()
         logger.warning("Сессия %s: Claude неожиданно завершился (код %s)", session.name, code)
         if self.on_dead is not None:
-            await self.on_dead(session, code)
+            # Колбэк (уведомление в Telegram) не должен ронять watcher-таск:
+            # исключение здесь otherwise убило бы задачу молча (REVIEW.md B3).
+            try:
+                await self.on_dead(session, code)
+            except Exception:
+                logger.exception("on_dead для сессии %s — колбэк упал", session.name)
 
     async def _stop_process(self, session: Session, save: bool = True) -> None:
         """Погасить процесс сессии: watcher, группа процессов, лог."""
@@ -791,14 +850,13 @@ class SessionManager:
 
     async def send_to_claude(self, session: Session, text: str, context_id: str) -> None:
         session.last_activity = time.time()
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as http:
-            async with http.post(
-                f"http://127.0.0.1:{session.port}/notify",
-                json={"content": text, "context_id": context_id},
-            ) as resp:
-                resp.raise_for_status()
+        http = self._http_session()
+        async with http.post(
+            f"http://127.0.0.1:{session.port}/notify",
+            json={"content": text, "context_id": context_id},
+            headers=self._channel_headers(),
+        ) as resp:
+            resp.raise_for_status()
 
     def touch(self, session: Session) -> None:
         """Отметить активность (ответ Claude) — сброс таймера простоя."""
@@ -811,7 +869,7 @@ class SessionManager:
             raw = path.read_bytes()[-16384:]
         except OSError:
             return ""
-        clean = _ANSI_RE.sub(b"", raw).replace(b"\r", b"")
+        clean = strip_ansi(raw)
         text = clean.decode(errors="replace")
         tail = [ln for ln in text.splitlines() if ln.strip()][-lines:]
         return "\n".join(tail)
@@ -853,7 +911,7 @@ class SessionManager:
             raw = log.read_bytes()[before:]
         except OSError:
             return ""
-        return _ANSI_RE.sub(b"", raw).replace(b"\r", b"").decode(errors="replace")
+        return strip_ansi(raw).decode(errors="replace")
 
     async def close_idle(self) -> list[Session]:
         """Остановить работающие сессии, простаивавшие дольше IDLE_TIMEOUT_H.
@@ -875,14 +933,13 @@ class SessionManager:
 
     async def send_permission(self, session: Session, request_id: str, behavior: str) -> None:
         """Вердикт по запросу разрешения — обратно в channel_server."""
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as http:
-            async with http.post(
-                f"http://127.0.0.1:{session.port}/permission",
-                json={"request_id": request_id, "behavior": behavior},
-            ) as resp:
-                resp.raise_for_status()
+        http = self._http_session()
+        async with http.post(
+            f"http://127.0.0.1:{session.port}/permission",
+            json={"request_id": request_id, "behavior": behavior},
+            headers=self._channel_headers(),
+        ) as resp:
+            resp.raise_for_status()
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""

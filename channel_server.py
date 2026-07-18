@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 
@@ -27,6 +28,9 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "default")
 ORCH_HOST = os.environ.get("ORCH_HOST", "127.0.0.1")
 ORCH_PORT = int(os.environ.get("ORCH_PORT", "18080"))
 ORCH_URL = f"http://{ORCH_HOST}:{ORCH_PORT}/reply"
+# Общий секрет с оркестратором (REVIEW.md S1). Приходят из env, который
+# sessions.py кладёт в .mcp.json; пустой = оркестратор без токена (старый режим).
+ORCH_TOKEN = os.environ.get("ORCH_TOKEN", "")
 
 # Минимальный интервал между push-уведомлениями в Claude.
 PUSH_INTERVAL = 0.5
@@ -154,6 +158,18 @@ class ChannelServer:
         # Ссылки на фоновые задачи: event loop держит task слабой ссылкой,
         # без сохранения задача может быть собрана GC до завершения.
         self._tasks: set[asyncio.Task] = set()
+        # Общий HTTP-пул к оркестратору (REVIEW.md E1).
+        self._http: aiohttp.ClientSession | None = None
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {ORCH_TOKEN}"} if ORCH_TOKEN else {}
+
+    def _http_session(self) -> aiohttp.ClientSession:
+        # Общий пул к оркестратору (keep-alive) — без сессии на запрос (REVIEW E1).
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        return self._http
 
     def _spawn(self, coro) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -168,6 +184,8 @@ class ChannelServer:
         finally:
             self._stopped.set()
             await http_runner.cleanup()
+            if self._http is not None and not self._http.closed:
+                await self._http.close()
 
     # ── stdio / JSON-RPC ────────────────────────────────────────
 
@@ -280,11 +298,9 @@ class ChannelServer:
 
     async def _forward_to_orchestrator(self, msg_id: int, payload: dict, ok_text: str) -> None:
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as http:
-                async with http.post(ORCH_URL, json=payload) as resp:
-                    resp.raise_for_status()
+            http = self._http_session()
+            async with http.post(ORCH_URL, json=payload, headers=self._auth_headers) as resp:
+                resp.raise_for_status()
             result = {"content": [{"type": "text", "text": f"{ok_text} (ctx={payload.get('context_id')})"}]}
         except Exception as e:
             logger.error("Не удалось передать оркестратору: %s", e)
@@ -298,18 +314,38 @@ class ChannelServer:
         """Переслать permission_request оркестратору (POST /permission/<имя>)."""
         url = f"http://{ORCH_HOST}:{ORCH_PORT}/permission/{SESSION_NAME}"
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as http:
-                async with http.post(url, json=params) as resp:
-                    resp.raise_for_status()
+            http = self._http_session()
+            async with http.post(url, json=params,
+                                 timeout=aiohttp.ClientTimeout(total=10),
+                                 headers=self._auth_headers) as resp:
+                resp.raise_for_status()
         except Exception as e:
             logger.error("Не удалось переслать permission_request: %s", e)
 
     # ── HTTP: приём push от оркестратора ────────────────────────
 
     async def _start_http(self) -> web.AppRunner:
-        app = web.Application()
+        # Auth на /notify /permission /ping тем же ORCH_TOKEN (симметрично
+        # оркестратору): без него локальный процесс мог бы POST /notify и вбросить
+        # промпт в Claude или POST /permission behavior=allow и авто-разрешить
+        # запрос. Пустой ORCH_TOKEN (тестовый запуск без .env) = режим открыт —
+        # в проде config всегда генерирует/читает токен.
+        expected = (f"Bearer {ORCH_TOKEN}").encode() if ORCH_TOKEN else b""
+        if not ORCH_TOKEN:
+            logger.warning(
+                "ORCH_TOKEN пуст — channel-сервер в ОТКРЫТОМ режиме (любой "
+                "локальный процесс может /notify//permission). Только для тестов!"
+            )
+
+        @web.middleware
+        async def _auth(request: web.Request, handler):
+            if expected:
+                sent = request.headers.get("Authorization", "").encode("utf-8", "replace")
+                if not secrets.compare_digest(sent, expected):
+                    return web.Response(status=401, text="unauthorized")
+            return await handler(request)
+
+        app = web.Application(middlewares=[_auth])
         app.router.add_get("/ping", self._http_ping)
         app.router.add_post("/notify", self._http_notify)
         app.router.add_post("/permission", self._http_permission)
