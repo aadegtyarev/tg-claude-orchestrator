@@ -91,6 +91,39 @@ def split_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+# ── markdown → Telegram HTML ───────────────────────────────────
+# Telegram рендерит ограниченный HTML: b/i/s/code/pre/a. Превращаем в него
+# разметку из ответов Claude, остальное оставляем как есть. Небезопасные
+# символы экранируем. Если итог бракованный — _send откатывается на plain.
+_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
+_CODE_INLINE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+# _italic_ с.word-границами — чтобы не калечить snake_case (my_var_name).
+_ITALIC_RE = re.compile(r"(?<![\w*])_(?!\s)(.+?)(?<!\s)_(?![\w*])", re.DOTALL)
+_PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
+
+
+def md_to_html(text: str) -> str:
+    """Светлый markdown → HTML Telegram. Код выносится первым (внутри нет
+    разметки), затем экранируется остальное, затем разметка."""
+    stash: list[str] = []
+
+    def _keep(html_body: str, tag: str) -> str:
+        stash.append(f"<{tag}>{html_body}</{tag}>")
+        return f"\x00{len(stash) - 1}\x00"
+
+    text = _CODE_BLOCK_RE.sub(lambda m: _keep(html.escape(m.group(1)), "pre"), text)
+    text = _CODE_INLINE_RE.sub(lambda m: _keep(html.escape(m.group(1)), "code"), text)
+    text = html.escape(text)
+    text = _BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _STRIKE_RE.sub(r"<s>\1</s>", text)
+    text = _LINK_RE.sub(r'<a href="\2">\1</a>', text)
+    text = _ITALIC_RE.sub(r"<i>\1</i>", text)
+    return _PLACEHOLDER_RE.sub(lambda m: stash[int(m.group(1))], text)
+
+
 class TelegramBot:
     def __init__(self, config: Config, manager: SessionManager):
         self.config = config
@@ -106,7 +139,27 @@ class TelegramBot:
         self._typing: dict[int, asyncio.Task] = {}
         # thread_id -> сторож зависаний (стартует/гаснет вместе с typing).
         self._watchdogs: dict[int, asyncio.Task] = {}
+        # thread_id -> [message_id] сообщения топика (входящие юзера + ответы
+        # Claude), чтобы /clear мог снести саму переписку, оставив топик.
+        self._topic_msgs: dict[int, list[int]] = {}
         self._register_handlers()
+
+    def _track_msg(self, thread_id: int | None, msg_id: int | None) -> None:
+        if thread_id and msg_id:
+            self._topic_msgs.setdefault(thread_id, []).append(msg_id)
+
+    async def _clear_topic_msgs(self, thread_id: int) -> None:
+        """Удалить все отслеженные сообщения топика (сам топик оставить).
+
+        Best-effort: боты не умеют ни перечислять, ни удалять пачкой — только
+        по известным id. Неотслеженное (системные статусы, старое до старта)
+        остаётся. Ошибки игнорируем (уже удалено / старше 48 ч).
+        """
+        for mid in self._topic_msgs.pop(thread_id, []):
+            try:
+                await self.bot.delete_message(self.chat_id, mid)
+            except Exception:
+                pass
 
     def t(self, key: str, **kwargs) -> str:
         return self._texts[key].format(**kwargs)
@@ -437,6 +490,9 @@ class TelegramBot:
             await self.manager.close(session)
             await status.edit_text(self.t("clear_fail", error=e))
             return
+        # Чистая переписка в топике (сам топик остаётся). Статус clear_done не
+        # трекается — остаётся как отметка нового старта.
+        await self._clear_topic_msgs(session.thread_id)
         await status.edit_text(self.t("clear_done"))
 
     async def cmd_compact(self, message: Message) -> None:
@@ -464,6 +520,16 @@ class TelegramBot:
             return
         await message.reply(await asyncio.to_thread(self._stats_text, session))
 
+    def _model_display(self, session: Session, stats: dict | None = None) -> str:
+        """Имя модели для показа: реальная из транскрипта → установленная
+        (алиас вроде opus) → «по умолчанию Claude Code».
+
+        Без транскрипта (stats=None) читает его — блокирующее чтение, дёргать
+        через asyncio.to_thread. Если stats уже есть — лишнего I/O нет.
+        """
+        model = (stats or self.manager.read_stats(session) or {}).get("model", "")
+        return model or session.model or self.t("default_model")
+
     def _stats_text(self, session: Session) -> str:
         stats = self.manager.read_stats(session)
         uptime = self._fmt_duration(time.time() - session.started_at)
@@ -476,7 +542,7 @@ class TelegramBot:
         return self.t(
             "stats_body",
             header=header,
-            model=stats["model"] or session.model or self.t("default_model"),
+            model=self._model_display(session, stats),
             ctx=self._fmt_num(ctx),
             pct=f"{ctx / CONTEXT_WINDOW * 100:.0f}",
             out=self._fmt_num(stats["output_tokens"]),
@@ -553,8 +619,9 @@ class TelegramBot:
             InlineKeyboardButton(text=alias, callback_data=f"model:{session.thread_id}:{alias}")
             for alias in MODEL_ALIASES
         ]
+        model = await asyncio.to_thread(self._model_display, session)
         await message.reply(
-            self.t("model_prompt", model=session.model or self.t("default_model")),
+            self.t("model_prompt", model=model),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
 
@@ -625,12 +692,14 @@ class TelegramBot:
             return
         if not await self._ensure_running(session, message):
             return
+        self._track_msg(message.message_thread_id, message.message_id)
         await self._forward(session, message, message.text)
 
     async def on_file(self, message: Message) -> None:
         """Фото (в т.ч. из буфера обмена) и документы: скачать в сессию."""
         if not self._accept(message):
             return
+        self._track_msg(message.message_thread_id, message.message_id)
         session = self._topic_session(message)
         if session is None:
             return
@@ -1028,29 +1097,43 @@ class TelegramBot:
     async def _send(
         self, chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None
     ) -> None:
-        """Отправка обычным текстом (без разметки) с разбиением по лимиту.
+        """Отправка с разметкой (markdown→HTML), фолбэк — чистый текст.
 
         Деградация: без reply (исходное сообщение удалено) → без топика
         (топик удалили руками) — финальный ответ не должен теряться.
         """
-        for i, chunk in enumerate(split_text(text)):
-            kwargs: dict = {"chat_id": chat_id, "text": chunk}
+        for i, plain in enumerate(split_text(text)):
+            hchunk = md_to_html(plain)
+            kwargs: dict = {"chat_id": chat_id}
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
             if reply_to and i == 0:
                 kwargs["reply_to_message_id"] = reply_to
+            use_html = True
             while True:
-                try:
-                    await self.bot.send_message(**kwargs)
+                sent = False
+                if use_html:
+                    try:
+                        msg = await self.bot.send_message(text=hchunk, parse_mode="HTML", **kwargs)
+                        sent = True
+                    except Exception as e:
+                        logger.warning("HTML-отправка не удалась, фолбэк на plain: %s", e)
+                        use_html = False
+                if not sent:
+                    try:
+                        msg = await self.bot.send_message(text=plain, **kwargs)
+                        sent = True
+                    except Exception:
+                        if "reply_to_message_id" in kwargs:
+                            kwargs.pop("reply_to_message_id")
+                        elif "message_thread_id" in kwargs:
+                            kwargs.pop("message_thread_id")
+                        else:
+                            logger.error("Не удалось отправить сообщение в чат %s", chat_id)
+                            return
+                if sent:
+                    self._track_msg(kwargs.get("message_thread_id"), getattr(msg, "message_id", None))
                     break
-                except Exception as e:
-                    if "reply_to_message_id" in kwargs:
-                        kwargs.pop("reply_to_message_id")
-                    elif "message_thread_id" in kwargs:
-                        kwargs.pop("message_thread_id")
-                    else:
-                        logger.error("Не удалось отправить сообщение в чат %s: %s", chat_id, e)
-                        return
 
     @staticmethod
     def _fmt_num(n: int) -> str:
