@@ -12,13 +12,13 @@
 чтобы после `/clear` скормить его и продолжить с нуля, без потери контекста.
 
 ### Что уже есть (строительные блоки)
-- `sessions.py`: `transcript_path(session)` → `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`;
+- `core/sessions.py`: `transcript_path(session)` → `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`;
   `_scan_pollution(entries)` — чистая функция, находит маркеры загрязнения;
   `read_pollution_excerpt(session)` — читает хвост транскрипта.
-- `bot.py`: релей `_error_relay_loop` уже ловит `protocol`-400 и шлёт эксцепт.
+- `core/turn.py`: релей `_error_relay_loop` уже ловит `protocol`-400 и шлёт эксцепт.
 - modelpipe-прокси на `127.0.0.1:8787` — туда можно слать свежий Anthropic-запрос
   на резюме (роут `claude-*` напрямую, или дешёвый `deepseek-*` / `glm-*`).
-- `_send(chat_id, thread_id, text)` — отправка длинного текста в ТГ.
+- `core.notice(session, text)` — доставка длинного текста во все адаптеры.
 - **Проверенный факт:** Claude Code персистит `signature` у thinking-блоков
   (7770/8702 подписаны на момент проверки) → неподписанный thinking = реально
   чужой бэкенд, детектор не ложноположит.
