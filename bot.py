@@ -1312,10 +1312,9 @@ class TelegramBot:
         if chat_id is None:
             return
 
-        if thread_id is not None:  # ответ/файл = активность (сброс таймера простоя)
-            session = self.manager.get(thread_id)
-            if session is not None:
-                self.manager.touch(session)
+        session = self.manager.get(thread_id) if thread_id is not None else None
+        if session is not None:  # ответ/файл = активность (сброс таймера простоя)
+            self.manager.touch(session)
 
         if data.get("file_path"):
             if thread_id is not None:
@@ -1323,6 +1322,7 @@ class TelegramBot:
             await self._send_file(
                 chat_id, thread_id,
                 str(data["file_path"]), str(data.get("caption", "")), reply_to,
+                session,
             )
             return
 
@@ -1348,11 +1348,55 @@ class TelegramBot:
         if thread_id is not None:
             await self.bubbles.close(thread_id)
 
+    def _sendfile_roots(self, session: Session | None) -> list[Path]:
+        """Рабочие папки, откуда Клоду разрешено отправлять файлы в чат:
+        cwd проекта (или папка сессии), сама папка сессии и incoming-каталог.
+        """
+        roots: list[Path] = []
+        if session is not None:
+            roots.append(self.manager.effective_cwd(session))
+            roots.append(session.session_dir)
+        else:
+            roots.append(self.config.sessions_dir)
+        inc = Path(self.config.incoming_dir).expanduser()
+        if not inc.is_absolute():
+            base = session.session_dir if session is not None else self.config.sessions_dir
+            inc = base / inc
+        roots.append(inc)
+        return roots
+
+    def _path_in_workspace(self, path: Path, session: Session | None) -> bool:
+        """Лежит ли path (после resolve, со симлинками) внутри одной из рабочих
+        папок сессии. Ошибки resolve/stat (битая симссылка, нет прав) → False:
+        лучше отказать, чем вынести файл за пределами workspace."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        for root in self._sendfile_roots(session):
+            try:
+                root_resolved = root.resolve()
+                if resolved.is_relative_to(root_resolved):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
     async def _send_file(
         self, chat_id: int, thread_id: int | None,
         file_path: str, caption: str, reply_to: int | None,
+        session: Session | None,
     ) -> None:
         path = Path(file_path).expanduser()
+        # Jail: только внутри рабочих папок сессии (cwd проекта / папка сессии /
+        # incoming). Без этого промпт-инъекция из чужого файла/CLAUDE.md могла
+        # заставить Клода вызвать send_file_to_telegram на ~/.ssh/id_rsa или
+        # .env и выслать секреты в чат (REVIEW.md S2). resolve() раскрывает
+        # симлинки — escape через ссылку тоже отсекается.
+        if not self._path_in_workspace(path, session):
+            logger.warning("send_file отклонён вне workspace: %s", path)
+            await self._send(chat_id, thread_id, self.t("sendfile_denied", path=path))
+            return
         if not path.is_file():
             await self._send(chat_id, thread_id, self.t("sendfile_not_found", path=path))
             return
@@ -1533,7 +1577,12 @@ class TelegramBot:
     # ── служебное ───────────────────────────────────────────────
 
     def _parse_context(self, context_id: str) -> tuple[int | None, int | None, int | None]:
-        """context_id = tg:chat_id:thread_id:message_id (thread_id=0 — без топика)."""
+        """context_id = tg:chat_id:thread_id:message_id (thread_id=0 — без топика).
+
+        Кривой/чужой context_id — drop, а не «дефолт в основной чат»: иначе
+        локальный злоумышленник или баг канала могли бы вбросить ответ в main
+        chat (REVIEW.md B6).
+        """
         parts = context_id.split(":")
         if len(parts) == 4 and parts[0] == "tg":
             try:
@@ -1541,8 +1590,8 @@ class TelegramBot:
                 return chat_id, thread_raw or None, reply_to or None
             except ValueError:
                 pass
-        logger.warning("Некорректный context_id: %r", context_id)
-        return self.chat_id, None, None
+        logger.warning("Некорректный context_id (игнорирую): %r", context_id)
+        return None, None, None
 
     async def notify_session_dead(self, session: Session, code: int | str) -> None:
         """Колбэк SessionManager: Claude умер сам по себе."""

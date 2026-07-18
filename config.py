@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+
+def _auto_orch_token() -> str:
+    """Разовый токен внутреннего HTTP-API, если ORCH_TOKEN не задан явно.
+
+    Локальный (127.0.0.1) токен — защита от любого локального процесса и
+    DNS-rebinding из браузера (см. REVIEW.md S1). Перезапуск launcher'а убивает
+    все процессы claude (manager.shutdown), значит и channel_server'ы, поэтому
+    токен, сгенерированный на пуск, согласован со всеми сессиями этого пуска
+    (resume переписывает .mcp.json/settings с актуальным токеном). Для
+    предсказуемости лучше зафиксировать ORCH_TOKEN в .env.
+    """
+    tok = secrets.token_urlsafe(24)
+    logger.warning(
+        "ORCH_TOKEN не задан — сгенерирован разовый токен внутреннего API. "
+        "Для стабильности между перезапусками зафиксируй ORCH_TOKEN в .env.",
+    )
+    return tok
 
 
 @dataclass(frozen=True)
@@ -23,6 +42,7 @@ class Config:
     claude_bin: str
     orch_host: str
     orch_port: int
+    orch_token: str
     allowed_user_ids: frozenset[int]
     show_tool_calls: bool
     delete_bubble: bool
@@ -58,6 +78,8 @@ class Config:
             claude_bin=os.getenv("CLAUDE_BIN", "claude"),
             orch_host=os.getenv("ORCH_HOST", "127.0.0.1"),
             orch_port=int(os.getenv("ORCH_PORT", "18080")),
+            # Токен внутреннего HTTP-API (см. _auto_orch_token / REVIEW.md S1).
+            orch_token=os.getenv("ORCH_TOKEN", "").strip() or _auto_orch_token(),
             allowed_user_ids=cls._parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
             show_tool_calls=cls._parse_bool(os.getenv("SHOW_TOOL_CALLS", "true")),
             delete_bubble=cls._parse_bool(os.getenv("DELETE_BUBBLE", "true")),

@@ -27,6 +27,18 @@ async def start_reply_server(
 ) -> web.AppRunner:
     """Поднять сервер; вернуть runner (закрывать через runner.cleanup())."""
 
+    # Один общий секрет на все эндпоинты: внутренний API живёт на 127.0.0.1,
+    # но без токена любой локальный процесс (и вкладка браузера через DNS
+    # rebinding) мог бы POST /reply с file_path и выгрузить任意 файл в чат
+    # (REVIEW.md S1). Канал-сервер и curl-хук пробрасывают тот же токен.
+    expected_auth = f"Bearer {config.orch_token}"
+
+    @web.middleware
+    async def _auth(request: web.Request, handler):
+        if request.headers.get("Authorization", "") != expected_auth:
+            return web.Response(status=401, text="unauthorized")
+        return await handler(request)
+
     async def reply(request: web.Request) -> web.Response:
         try:
             data = await request.json()
@@ -63,7 +75,7 @@ async def start_reply_server(
             return web.Response(status=500, text="handler error")
         return web.Response(text="OK")
 
-    app = web.Application()
+    app = web.Application(middlewares=[_auth])
     app.router.add_post("/reply", reply)
     app.router.add_post("/event/{name}", tool_event)
     app.router.add_post("/permission/{name}", permission)
