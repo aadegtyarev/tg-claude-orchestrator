@@ -30,10 +30,14 @@ def main():
                 "String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'") == ("400", "protocol")
     assert _hit("●API Error: 400 messages.5: `tool_result` blocks can only be "
                 "in `user` messages") == ("400", "protocol")
+    # thinking-400: чужой (неподписанный) thinking в истории — корень cross-provider
+    # мусора; теперь тоже классифицируется как protocol (→подсказка /clear + эксцепт).
+    assert _hit("●API Error: 400 messages.3.content.1.thinking: must be passed back "
+                "to the API") == ("400", "protocol")
     assert _hit("●API Error: 429 {\"type\":\"rate_limit_error\"}") == ("429", "ratelimit")
     assert _hit("●API Error: 529 {\"type\":\"overloaded_error\"}") == ("529", "ratelimit")
     assert _hit("●API Error: 503 service unavailable") == ("503", "generic")
-    print("OK classify: 400+tool→protocol, 429/529→ratelimit, 5xx→generic")
+    print("OK classify: 400+tool/thinking→protocol, 429/529→ratelimit, 5xx→generic")
 
     # ── Главный регресс: проза модели НЕ триггерит (никакого «API Error: <код>») ──
     # Реальные строки из claude.log сессии tg-claude-orchestrator:

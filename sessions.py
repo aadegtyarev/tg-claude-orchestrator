@@ -44,6 +44,61 @@ READY_TIMEOUT = 60.0
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
 
+# id «честного» server_tool_use от Anthropic — srvtoolu_<base>; чужой бэкенд
+# (z.ai/GLM) лепит id другого формата, на нём реальный Anthropic падает с 400.
+_SRVTOOLU_RE = re.compile(r"^srvtoolu_[A-Za-z0-9_]+$")
+
+
+def _block_snippet(block: dict, limit: int = 280) -> str:
+    """Сжатый человекочитаемый обрезок содержимого блока транскрипта."""
+    t = block.get("type")
+    if t in ("text", "thinking"):
+        body = str(block.get("text") or block.get("thinking") or "")
+    elif t in ("tool_use", "server_tool_use"):
+        body = f"{block.get('name', '?')}({json.dumps(block.get('input', {}), ensure_ascii=False)})"
+    elif t == "tool_result":
+        c = block.get("content")
+        body = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+    else:
+        body = json.dumps(block, ensure_ascii=False)
+    body = " ".join(body.split())
+    return body[:limit] + ("…" if len(body) > limit else "")
+
+
+def _scan_pollution(entries) -> str | None:
+    """Найти загрязнение чужим бэкендом в записях транскрипта (новейшие — в конце).
+
+    Возвращает 'роль: маркер → обрезок' для самого свежего загрязнённого блока
+    либо None. Чистая функция — тестируется без файла/Telegram. Маркеры:
+      • thinking без signature — настоящий Anthropic ВСЕГДА подписывает thinking,
+        неподписанный = история пришла с другого бэкенда (z.ai/GLM);
+      • server_tool_use с id не формата srvtoolu_…;
+      • tool_result внутри assistant-сообщения (смещённый/чужой).
+    """
+    for entry in reversed(entries):
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or entry.get("type") or "?"
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            marker = None
+            if btype == "thinking" and not b.get("signature"):
+                marker = "thinking без подписи (чужой бэкенд)"
+            elif btype == "server_tool_use":
+                if not _SRVTOOLU_RE.match(str(b.get("id", ""))):
+                    marker = "server_tool_use с чужим id (не srvtoolu_…)"
+            elif btype == "tool_result" and role == "assistant":
+                marker = "tool_result в assistant-сообщении (чужой бэкенд)"
+            if marker:
+                return f"{role}: {marker} → {_block_snippet(b)}"
+    return None
+
 
 class SessionError(Exception):
     """Ошибка создания/работы сессии — текст показывается пользователю."""
@@ -914,3 +969,26 @@ class SessionManager:
             "turns": turns,
             "transcript_bytes": path.stat().st_size,
         }
+
+    def read_pollution_excerpt(self, session: Session, max_entries: int = 25) -> str | None:
+        """Эксцепт загрязнения чужим бэкендом из хвоста транскрипта (или None).
+
+        Мусор лежит в недавнем хвосте, поэтому смотрим последние записи и
+        отдаём результат _scan_pollution. Блокирующее чтение — вызывать через
+        asyncio.to_thread (как read_stats).
+        """
+        path = self.transcript_path(session)
+        if not path.exists():
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()[-max_entries * 2:]
+        except OSError:
+            return None
+        entries = []
+        for line in lines:
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+        return _scan_pollution(entries)
