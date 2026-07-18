@@ -1,0 +1,113 @@
+"""Постоянный bash-терминал на топик — в обход Claude Code, напрямую в систему.
+
+Один PTY-процесс `bash -i` на топик, живёт между вызовами /bash (поэтому `cd`
+внутри одной команды сохраняется для следующей). /bash пишет команду + маркер
+конца, стримит вывод в статус-сообщение, ждёт маркер. /bashin пишет сырой ввод
+в тот же PTY — ответ на «y/n» интерактивной команды, которая всё ещё крутится
+в текущем /bash.
+
+Права и cwd — как у процесса бота (никакого --dangerously-skip-permissions):
+пользователь явно просил «мимо Claude Code, сразу в систему».
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import pty
+import re
+import subprocess
+import threading
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
+_BUF_CAP = 200_000  # держим только хвост — на случай болтливой команды
+
+
+def clean(raw: bytes) -> bytes:
+    """Снять ANSI-раскраску/управляющие коды и \\r — для показа в <pre>."""
+    return _ANSI_RE.sub(b"", raw).replace(b"\r", b"")
+
+
+class BashSession:
+    """Один PTY с интерактивным bash и потоком, дренирующим его вывод."""
+
+    def __init__(self, cwd: Path):
+        self.cwd = cwd
+        self.busy = False  # активен ли /bash (для /bashin — не проверяется)
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        master, slave = pty.openpty()
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        try:
+            self.proc = subprocess.Popen(
+                ["/bin/bash", "-i"],
+                stdin=slave, stdout=slave, stderr=slave,
+                cwd=str(cwd), env=env, start_new_session=True,
+            )
+        finally:
+            os.close(slave)
+        self.master = master
+        threading.Thread(target=self._reader, name="bashshell-reader", daemon=True).start()
+
+    def _reader(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            with self._lock:
+                self._buf.extend(chunk)
+                if len(self._buf) > _BUF_CAP:
+                    del self._buf[:-_BUF_CAP]
+
+    def snapshot(self) -> bytes:
+        with self._lock:
+            return bytes(self._buf)
+
+    def write(self, text: str) -> None:
+        os.write(self.master, text.encode())
+
+    @property
+    def running(self) -> bool:
+        return self.proc.poll() is None
+
+    def close(self) -> None:
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+
+class BashShellManager:
+    """thread_id -> BashSession. Одна оболочка на топик, создаётся лениво."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[int, BashSession] = {}
+
+    def get_or_create(self, thread_id: int, cwd: Path) -> BashSession:
+        sess = self._sessions.get(thread_id)
+        if sess is None or not sess.running:
+            sess = BashSession(cwd)
+            self._sessions[thread_id] = sess
+            logger.info("bash-терминал открыт (топик %s, cwd %s)", thread_id, cwd)
+        return sess
+
+    def get(self, thread_id: int) -> BashSession | None:
+        sess = self._sessions.get(thread_id)
+        return sess if sess is not None and sess.running else None
+
+    def close(self, thread_id: int) -> None:
+        sess = self._sessions.pop(thread_id, None)
+        if sess is not None:
+            sess.close()
+            logger.info("bash-терминал закрыт (топик %s)", thread_id)
