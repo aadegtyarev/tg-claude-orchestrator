@@ -57,10 +57,12 @@ TYPING_INTERVAL = 4.0
 # ход/размышление, отсутствие роста = завис).
 WATCHDOG_GRACE = 20.0
 WATCHDOG_CHECK = 15.0
-# Ретранслятор ошибок API из claude.log: как часто нюхать хвост и как часто
-# писать в чат (чтобы не спамить при повторяющемся rate-limit).
+# Ретранслятор ошибок API из claude.log: как часто нюхать хвост, как часто
+# писать в чат (между любыми двумя алертами), и сколько глушить ОДНУ И ТУ ЖЕ
+# ошибку — чтобы 10-минутная петля 400-х не родила 10 одинаковых сообщений.
 ERROR_RELAY_INTERVAL = 6.0
 ERROR_RELAY_COOLDOWN = 60.0
+ERROR_RELAY_REPEAT = 600.0
 
 # /bash: как часто перечитывать вывод и перерисовывать статус-сообщение,
 # сколько ждать команду и сколько текста показывать (лимит Telegram — 4096,
@@ -203,14 +205,33 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 _ITALIC_RE = re.compile(r"(?<![\w*])_(?!\s)(.+?)(?<!\s)_(?![\w*])", re.DOTALL)
 _PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
 
-# Очистка claude.log от ANSI и признаки ошибки API Клода (для ретранслятора).
-# Замечаем rate-limit/overload/429/5xx — то, из-за чего ответ не генерится.
+# Очистка claude.log от ANSI и детектор ошибок API Клода (для ретранслятора).
+#
+# Триггер — ТОЛЬКО настоящий баннер TUI «API Error: <код> <детали>». Клод и сам
+# охотно пишет слова «rate-limit»/«api error» в ответах (диагностика чужой
+# сессии, описание самой этой фичи), и прежний широкий греп ловил эту прозу как
+# ложный алерт о лимите. Баннер с кодом модель дословно не цитирует, поэтому он
+# — надёжный сигнал. group(1)=код, group(2)=хвост строки с деталями (для класса).
 _LOG_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
-_API_ERROR_RE = re.compile(
-    rb"api error|rate[\s_-]?limit|overloaded|\b429\b|service unavailable|internal server error",
-    re.IGNORECASE,
-)
-_RL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\b429\b", re.IGNORECASE)
+_API_ERR_BANNER_RE = re.compile(rb"API Error:\s*(\d{3})\b([^\n]{0,140})", re.IGNORECASE)
+# Класс ошибки по деталям баннера (код разбираем отдельно).
+_RL_DETAIL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\bcapacity\b", re.IGNORECASE)
+_PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d", re.IGNORECASE)
+
+
+def _classify_api_error(code: bytes, detail: bytes) -> str:
+    """Класс ошибки API для ретранслятора: ratelimit | protocol | generic.
+
+    ratelimit — 429/529/overloaded: транзитно, помогает смена модели.
+    protocol — 400 с кривым server_tool_use/tool_result: апстрим (z.ai) шлёт
+              несогласованный блок, модель тут ни при чём — /clear или /close_session.
+    generic  — прочее (5xx и т.п.).
+    """
+    if code in (b"429", b"529") or _RL_DETAIL_RE.search(detail):
+        return "ratelimit"
+    if code == b"400" and _PROTO_DETAIL_RE.search(detail):
+        return "protocol"
+    return "generic"
 
 
 def md_to_html(text: str) -> str:
@@ -1174,13 +1195,17 @@ class TelegramBot:
             return
 
     async def _error_relay_loop(self, thread_id: int) -> None:
-        """Транслировать ошибки API Клода (rate-limit/overload/5xx) в чат.
+        """Транслировать ошибки API Клода (rate-limit/400-протокол/5xx) в чат.
 
         Эти ошибки видны только в claude.log (отрисовка TUI). На активном ходе
         нюхаем ПРИРАЩЕНИЕ лога с момента старта (баннер запуска с «rate limits»
-        не трогаем) и при появлении ошибки пишем в топик — чтобы не гадать,
-        «зависло или упёрлось в лимит». Один класс ошибок — не чаще раза в
-        ERROR_RELAY_COOLDOWN, без спама.
+        не трогаем) и при появлении НАСТОЯЩЕГО баннера «API Error: <код>» пишем
+        в топик — чтобы не гадать, «зависло или упёрлось». Триггер — именно
+        баннер с кодом, а не слова «rate-limit»/«api error» в прозе ответов
+        (Клод их сам пишет и раньше порождал ложные алерты). Класс задаёт текст:
+        rate-limit → /model, 400-протокол (апстрим шлёт кривой server_tool_use) →
+        /clear, прочее → «ответ задерживается». Любая ошибка — не чаще
+        ERROR_RELAY_COOLDOWN; та же — глушится ERROR_RELAY_REPEAT.
         """
         session = self.manager.get(thread_id)
         if session is None or self.chat_id is None:
@@ -1192,6 +1217,8 @@ class TelegramBot:
         except OSError:
             return
         last_surfaced = -ERROR_RELAY_COOLDOWN
+        last_sig: str | None = None
+        last_sig_at = -ERROR_RELAY_REPEAT
         loop_time = asyncio.get_running_loop().time
         while True:
             await asyncio.sleep(ERROR_RELAY_INTERVAL)
@@ -1203,16 +1230,24 @@ class TelegramBot:
                 offset = 0
             chunk = _LOG_ANSI_RE.sub(b"", data[offset:]).replace(b"\r", b"")
             offset = len(data)
-            if not _API_ERROR_RE.search(chunk):
+            m = _API_ERR_BANNER_RE.search(chunk)
+            if not m:
                 continue
             now = loop_time()
             if now - last_surfaced < ERROR_RELAY_COOLDOWN:
                 continue
+            code = m.group(1)
+            klass = _classify_api_error(code, m.group(2))
+            sig = f"{code.decode()}:{klass}"
+            # Ту же ошибку не дублируем ERROR_RELAY_REPEAT — петля 400-х родит
+            # одно сообщение, а не десять. Иная ошибка — surfaced нормально.
+            if sig == last_sig and now - last_sig_at < ERROR_RELAY_REPEAT:
+                continue
             last_surfaced = now
-            kind = "rate-limit/перегрузка" if _RL_RE.search(chunk) else "ошибка API"
+            last_sig, last_sig_at = sig, now
             try:
                 await self._send(
-                    self.chat_id, thread_id, self.t("api_error_hit", kind=kind)
+                    self.chat_id, thread_id, self.t(f"api_error_{klass}")
                 )
             except Exception as e:
                 logger.debug("error_relay: не удалось отправить: %s", e)
