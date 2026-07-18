@@ -32,6 +32,7 @@ from typing import IO, Awaitable, Callable
 
 import aiohttp
 
+import sandbox
 from ansi import strip_ansi
 from config import Config
 from slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
@@ -605,7 +606,13 @@ class SessionManager:
                 extra += ["--settings", str(settings_file)]
             # dev-записи каналов передаются --dangerously-load-development-channels
             # (server:<имя>; определено в .mcp.json из --mcp-config).
+            # Файловая песочница (если включена): claude и все его дети
+            # (channel_server, хуки, Bash-тул) заперты в mount-namespace —
+            # видны только папка сессии, папка проекта и конфиг Claude Code.
+            extra_rw = [session.session_dir, Path(cwd)]
+            prefix = self.sandbox_prefix(chdir=Path(cwd), extra_rw=extra_rw)
             session.process = await asyncio.create_subprocess_exec(
+                *prefix,
                 self.config.claude_bin,
                 *session_arg,
                 *extra,
@@ -988,6 +995,31 @@ class SessionManager:
             except OSError:
                 return session.session_dir
         return session.session_dir
+
+    def sandbox_prefix(self, chdir: Path, extra_rw: list[Path]) -> list[str]:
+        """Префикс argv для запуска команды в файловой песочнице (bwrap).
+
+        Пусто, если SANDBOX=off. Общий allowlist для claude и /bash: конфиг
+        Claude Code (токены/скиллы/plugins/транскрипты) — RW, бинарь claude и
+        репозиторий оркестратора (channel_server + .venv) — RO, плюс переданные
+        рабочие каталоги (папка сессии/проекта) — RW.
+        """
+        if self.config.sandbox != "bwrap":
+            return []
+        home = Path.home()
+        config_dir = self.config.claude_config_dir or (home / ".claude")
+        rw = [
+            *extra_rw,
+            config_dir,
+            home / ".claude.json",  # глобальное состояние claude (может писаться)
+            *self.config.sandbox_extra_rw,
+        ]
+        ro = [
+            home / ".local" / "share" / "claude",  # бинарь и versions/
+            home / ".local" / "bin",               # симлинк claude
+            ROOT,                                   # channel_server.py + .venv
+        ]
+        return sandbox.build_argv(home=home, chdir=chdir, rw_paths=rw, ro_paths=ro)
 
     def transcript_path(self, session: Session) -> Path:
         """Транскрипт сессии в профиле Claude Code.

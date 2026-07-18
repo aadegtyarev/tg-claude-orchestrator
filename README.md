@@ -52,6 +52,7 @@ bypass permissions, dev channels) отвечает автоматика (`_pty_d
 | `bot.py` | Бот: команды, файлы, permission-кнопки, отправка, ретранслятор ошибок API, вотчдог зависаний |
 | `bubble.py` | Статус-бабл: буфер строк, троттлинг правок, закрытие |
 | `sessions.py` | `SessionManager`: PTY-процессы Claude, жизненный цикл, resume, авто-close, ротация логов, статистика |
+| `sandbox.py` | Файловая песочница (bubblewrap): сборка argv-обёртки, проверка доступности |
 | `reply_server.py` | aiohttp: `POST /reply`, `/event/{имя}`, `/permission/{имя}` |
 | `channel_server.py` | MCP-канал: raw JSON-RPC на stdio + HTTP `/notify`, `/ping`, `/permission` |
 | `texts.py` | Все сообщения бота на ru/en (`BOT_LANG`) |
@@ -64,6 +65,8 @@ bypass permissions, dev channels) отвечает автоматика (`_pty_d
 - Telegram-бот от [@BotFather](https://t.me/BotFather)
 - Группа с включёнными Topics, бот — админ с правом «Manage Topics»
   (создаёт и удаляет темы сам)
+- `bubblewrap` (`apt install bubblewrap`) для файловой песочницы —
+  включена по умолчанию; можно отключить `SANDBOX=off` (см. ниже)
 
 ⚠️ Channels — research preview: синтаксис флагов и протокол могут меняться.
 Кастомные каналы загружаются через `--dangerously-load-development-channels`.
@@ -118,6 +121,8 @@ journalctl --user -u tg-claude-orchestrator -f
 | `DELETE_BUBBLE` | `true` | Удалять бабл после ответа (`false` — оставить как журнал) |
 | `INCOMING_DIR` | `incoming` | Куда класть присланные файлы (отн. путь — в папке сессии) |
 | `PERMISSION_MODE` | `auto` | Режим разрешений: `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan` |
+| `SANDBOX` | `bwrap` | Файловая песочница: `bwrap` (изоляция ФС через bubblewrap) / `off` (без изоляции) |
+| `SANDBOX_EXTRA_RW` | — | Доп. пути, открытые из песочницы на запись (через `:`) |
 | `BOT_LANG` | `ru` | Язык сообщений бота: `ru` / `en` |
 | `IDLE_TIMEOUT_H` | 6 | Авто-останов сессии после N ч простоя (0 — выкл.) |
 | `LOG_MAX_MB` | 10 | Ротация `claude.log` при превышении размера (0 — выкл.) |
@@ -125,6 +130,41 @@ journalctl --user -u tg-claude-orchestrator -f
 ⚠️ **Безопасность.** Доступ строго по белому списку: пустой
 `ALLOWED_USER_IDS` = бот игнорирует всех. Кто в списке — тот и одобряет
 запросы разрешений (permission relay), доверяй его только себе.
+
+## Файловая песочница (`SANDBOX`)
+
+По умолчанию (`SANDBOX=bwrap`) процесс `claude` и `/bash`-терминал каждой
+сессии запускаются в изолированном mount-namespace через
+[bubblewrap](https://github.com/containers/bubblewrap) — без root, на
+unprivileged user namespaces. Внутри `$HOME` подменён пустым tmpfs, и наружу
+видны **только** явно разрешённые пути:
+
+| Что | Доступ | Зачем |
+|-----|--------|-------|
+| Папка сессии + папка проекта (`linked_path`) | чтение/запись | собственно работа |
+| `CLAUDE_CONFIG_DIR` (`~/.claude`) + `~/.claude.json` | чтение/запись | токены, скиллы, plugins, транскрипты |
+| Бинарь claude (`~/.local/share/claude`, `~/.local/bin`) | чтение | запуск |
+| Репозиторий оркестратора (`channel_server.py` + `.venv`) | чтение | MCP-канал и хуки |
+| Системный рантайм (`/usr`, `/etc`, …) | чтение | библиотеки, TLS-сертификаты, DNS |
+| `SANDBOX_EXTRA_RW` | чтение/запись | доп. рабочие каталоги |
+
+Всё остальное — другие проекты, `~/.ssh`, `~/.aws`, история shell, системные
+каталоги — **не видно** ни на чтение, ни на запись. Запись в подменённый
+`$HOME` уходит в эфемерный tmpfs и на диск не попадает.
+
+В отличие от нативного `/sandbox` Claude Code (он ограничивает только
+Bash-тул, а `Read`/`Write`/`Edit`, MCP и хуки оставляет на хосте), обёртка
+вокруг всего процесса накрывает **все** инструменты сразу. Это дополняет
+app-level jail для `send_file_to_telegram` (проверка путей от промпт-инъекций)
+ОС-уровневой изоляцией.
+
+Сеть — общая с хостом (нужна для API Anthropic и localhost-оркестратора);
+фильтрации по доменам bubblewrap не делает. Требуется пакет `bubblewrap` и
+разрешённые unprivileged user namespaces (Ubuntu 24.04+ — см.
+`kernel.apparmor_restrict_unprivileged_userns`). Если песочница включена, но
+недоступна, бот **не стартует** с понятной ошибкой — молча без изоляции не
+запускается. `SANDBOX=off` отключает изоляцию (менее безопасно; для машин без
+bwrap).
 
 ## Режимы разрешений и permission relay
 
