@@ -2,6 +2,7 @@
 
 POST /reply         — ответы Claude (тул reply_to_telegram через channel_server)
 POST /event/{name}  — события PreToolUse-хука Claude Code (вызовы инструментов)
+POST /stop/{name}   — конец хода (Stop-хук) — фолбэк на «потерянный финал»
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ async def start_reply_server(
     reply_handler: ReplyHandler,
     tool_event_handler: NamedHandler,
     permission_handler: NamedHandler,
+    stop_handler: NamedHandler,
 ) -> web.AppRunner:
     """Поднять сервер; вернуть runner (закрывать через runner.cleanup())."""
 
@@ -79,10 +81,23 @@ async def start_reply_server(
             return web.Response(status=500, text="handler error")
         return web.Response(text="OK")
 
+    async def stop_event(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            return web.Response(status=400, text="invalid json")
+        try:
+            await stop_handler(request.match_info["name"], payload)
+        except Exception:
+            # Хук не должен мешать Claude — ошибку только логируем (как /event).
+            logger.exception("Ошибка обработки Stop-события")
+        return web.Response(text="OK")
+
     app = web.Application(middlewares=[_auth])
     app.router.add_post("/reply", reply)
     app.router.add_post("/event/{name}", tool_event)
     app.router.add_post("/permission/{name}", permission)
+    app.router.add_post("/stop/{name}", stop_event)
 
     runner = web.AppRunner(app)
     await runner.setup()

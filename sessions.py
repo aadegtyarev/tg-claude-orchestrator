@@ -115,31 +115,48 @@ _DIALOGS = [
 ]
 
 
-# PreToolUse-хук как отдельный python-скрипт (а не curl с токеном в аргументах).
-# Токен встроен константой в этот 0600-файл — НЕ в cmdline (иначе виден в
-# /proc/<pid>/cmdline любому локальному пользователю) и НЕ в settings.local.json
-# (0644). Раньше curl -H 'Authorization: Bearer …' течёт в оба места (REVIEW S1,
-# найдено адверсариальным ревью). __PORT__/__NAME__/__TOKEN__ подставляются
-# обычным replace (без .format-скобок, чтобы безопасно для任意 значения токена).
+# Единый хук-диспетчер (PreToolUse + Stop) как отдельный python-скрипт (а не
+# curl с токеном в аргументах). Токен встроен константой в этот 0600-файл — НЕ
+# в cmdline (иначе виден в /proc/<pid>/cmdline любому локальному пользователю)
+# и НЕ в settings.local.json (0644). Раньше curl -H 'Authorization: Bearer …'
+# тёк в оба места (REVIEW S1, найдено адверсариальным ревью).
+#
+# Stop-хук — fallback против «потерянного финала» (REVIEW: модель нередко
+# завершает длинный ход обычным текстом вместо tool-вызова reply_to_telegram;
+# канал ретранслирует только явные tool-call'ы, голый текст остаётся в
+# транскрипте и не долетает до Telegram — 9/9 длинных ходов в живой сессии).
+# hook_event_name различает событие: PreToolUse → POST /event/<имя> (бабл),
+# Stop → POST /stop/<имя> с last_assistant_message (боту решать, нужен ли
+# fallback — см. bot.py handle_stop_event/_reply_seen_since_stop).
+#
+# __PORT__/__NAME__/__TOKEN__ подставляются обычным replace (без .format-
+# скобок, чтобы безопасно для любого значения токена).
 _HOOK_SCRIPT = '''#!/usr/bin/env python3
-"""PreToolUse-хук Claude Code: POST /event/<имя> оркестратору.
+"""Хук-диспетчер Claude Code (PreToolUse + Stop) → POST оркестратору.
 
 Токен встроен константой сюда (файл 0600), НЕ в cmdline/настройки — иначе
 ORCH_TOKEN виден локальному процессу через /proc/<pid>/cmdline (REVIEW.md S1).
 Читает событие из stdin, всегда выходит 0 — хук не должен блокировать Claude."""
+import json
 import sys
 import urllib.request
 
-_URL = "http://127.0.0.1:__PORT__/event/__NAME__"
+_ORCH = "http://127.0.0.1:__PORT__"
+_NAME = "__NAME__"
 _TOKEN = "__TOKEN__"
 
 
 def main():
     try:
-        body = sys.stdin.read()
+        raw = sys.stdin.read()
+        try:
+            event = json.loads(raw).get("hook_event_name", "")
+        except ValueError:
+            event = ""
+        path = "/stop/" + _NAME if event == "Stop" else "/event/" + _NAME
         req = urllib.request.Request(
-            _URL,
-            data=body.encode("utf-8"),
+            _ORCH + path,
+            data=raw.encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": "Bearer " + _TOKEN,
@@ -486,8 +503,14 @@ class SessionManager:
           безвреден и сохраняет прежнее поведение;
         - permissions.allow для канал-тулов: только в небайпасных режимах,
           иначе Claude спросит разрешение на каждый ответ в Telegram;
-        - PreToolUse-хук: вызовы тулов → POST /event/<имя> → статус-бабл.
-          `|| true` — хук не должен блокировать Claude.
+        - PreToolUse-хук (если show_tool_calls): вызовы тулов → POST
+          /event/<имя> → статус-бабл;
+        - Stop-хук (всегда): конец хода → POST /stop/<имя> с
+          last_assistant_message → фолбэк, если ход завершился голым текстом
+          вместо reply_to_telegram (REVIEW: 9/9 длинных ходов в живой сессии
+          теряли финал именно так — см. bot.py handle_stop_event).
+          Оба события ловит один скрипт-диспетчер (_HOOK_SCRIPT), никогда не
+          блокирует Claude (except+exit 0).
         """
         settings: dict = {}
         settings_dir = session.session_dir / ".claude"
@@ -507,26 +530,23 @@ class SessionManager:
                 f"mcp__tg-channel-{session.name}__send_file_to_telegram",
             ]
         settings["permissions"] = perms
+
+        # Токен уходит в 0600-скрипт (см. _HOOK_SCRIPT), команда хука = только
+        # путь к интерпретатору и скрипту — ничего секретного в
+        # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
+        hook_script = settings_dir / "hook_dispatch.py"
+        hook_script.write_text(
+            _HOOK_SCRIPT
+            .replace("__PORT__", str(self.config.orch_port))
+            .replace("__NAME__", session.name)
+            .replace("__TOKEN__", self.config.orch_token)
+        )
+        os.chmod(hook_script, 0o600)
+        hook_cmd = {"type": "command", "command": f'"{sys.executable}" "{hook_script}"'}
+        hooks: dict = {"Stop": [{"hooks": [hook_cmd]}]}  # Stop не поддерживает matcher
         if self.config.show_tool_calls:
-            # Токен уходит в 0600-скрипт (см. _HOOK_SCRIPT), команда хука =
-            # только путь к интерпретатору и скрипту — ничего секретного в
-            # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
-            hook_script = settings_dir / "pretooluse_hook.py"
-            hook_script.write_text(
-                _HOOK_SCRIPT
-                .replace("__PORT__", str(self.config.orch_port))
-                .replace("__NAME__", session.name)
-                .replace("__TOKEN__", self.config.orch_token)
-            )
-            os.chmod(hook_script, 0o600)
-            settings["hooks"] = {
-                "PreToolUse": [
-                    {"matcher": "", "hooks": [
-                        {"type": "command",
-                         "command": f'"{sys.executable}" "{hook_script}"'},
-                    ]}
-                ]
-            }
+            hooks["PreToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
+        settings["hooks"] = hooks
         (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
 
     async def _start_claude(self, session: Session, resume: bool = False) -> None:
