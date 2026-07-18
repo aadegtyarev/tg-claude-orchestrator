@@ -22,7 +22,7 @@ def free_port() -> int:
 
 
 def test_split_text():
-    from orchestrator.mdrender import split_text
+    from orchestrator.core.mdrender import split_text
     assert split_text("") == []
     assert split_text("a" * 5000) == ["a" * 4096, "a" * 904]
     chunks = split_text(("слово " * 100 + "\n") * 20)
@@ -31,7 +31,7 @@ def test_split_text():
 
 
 def test_texts():
-    from orchestrator.texts import MESSAGES
+    from orchestrator.core.texts import MESSAGES
     assert set(MESSAGES["ru"]) == set(MESSAGES["en"]), \
         set(MESSAGES["ru"]) ^ set(MESSAGES["en"])
     print("OK texts (ru/en паритет)")
@@ -79,7 +79,7 @@ async def test_channel_server():
 
     await send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     tools = [t["name"] for t in (await recv())["result"]["tools"]]
-    assert tools == ["reply_to_telegram", "send_file_to_telegram"], tools
+    assert tools == ["reply_to_user", "send_file_to_user"], tools
 
     import aiohttp
     await asyncio.sleep(0.3)
@@ -87,10 +87,10 @@ async def test_channel_server():
         async with http.get(f"http://127.0.0.1:{port}/ping") as resp:
             assert resp.status == 200
         async with http.post(f"http://127.0.0.1:{port}/notify",
-                             json={"content": "тест", "context_id": "tg:1:2:3"}) as resp:
+                             json={"content": "тест", "context_id": "telegram:smoke:1:2:3"}) as resp:
             assert resp.status == 200
     push = await recv()
-    assert push["params"] == {"content": "тест", "meta": {"context_id": "tg:1:2:3"}}
+    assert push["params"] == {"content": "тест", "meta": {"context_id": "telegram:smoke:1:2:3"}}
 
     # вердикт разрешения
     async with aiohttp.ClientSession() as http:

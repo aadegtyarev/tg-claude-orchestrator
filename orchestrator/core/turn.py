@@ -7,16 +7,17 @@
   * error-relay — трансляция ошибок API/ретраев/краш-рестартов из claude.log.
 
 Плюс флаг _last_action_was_reply — гейт Stop-фолбэка («потерянный финал»
-хода: модель закончила голым текстом вместо reply_to_telegram).
+хода: модель закончила голым текстом вместо reply_to_user).
 
 Раньше всё это было размазано по TelegramBot четырьмя словарями с ручной
 синхронизацией (REVIEW.md D5/D6); теперь жизненный цикл хода в одном месте:
 start() открывает ход, stop() закрывает, forget() — при удалении сессии.
 
-Зависимости отданы колбэками, чтобы модуль не знал про aiogram:
-  send(thread_id, text)   — сообщение в топик (bot._send с chat_id бота);
-  typing(thread_id) -> bool — послать chat-action; False = чат ещё не привязан,
-                              цикл гаснет.
+Зависимости отданы колбэками, чтобы модуль не знал про транспорт:
+  send(session, text)     — служебное сообщение в сессию (ядро шлёт во все
+                            адаптеры);
+  typing(session) -> bool — показать «печатает…»; False = слать некуда,
+                            цикл гаснет.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from .ansi import strip_ansi
 from .logsignals import detect_log_signals
 
 if TYPE_CHECKING:
-    from sessions import SessionManager
+    from .sessions import Session, SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -70,87 +71,88 @@ def read_log_delta(path: Path, offset: int) -> tuple[bytes, int]:
 
 
 class TurnSupervisor:
-    """Фоновые задачи хода + Stop-гейт, ключ — thread_id топика."""
+    """Фоновые задачи хода + Stop-гейт, ключ — имя сессии."""
 
     def __init__(
         self,
         manager: "SessionManager",
         t: Callable[..., str],
-        send: Callable[[int, str], Awaitable[None]],
-        typing: Callable[[int], Awaitable[bool]],
+        send: Callable[["Session", str], Awaitable[None]],
+        typing: Callable[["Session"], Awaitable[bool]],
     ):
         self.manager = manager
         self.t = t
         self._send = send
         self._typing_action = typing
-        # thread_id -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
-        self._typing: dict[int, asyncio.Task] = {}
-        # thread_id -> сторож зависаний (стартует/гаснет вместе с typing).
-        self._watchdogs: dict[int, asyncio.Task] = {}
-        # thread_id -> ретранслятор ошибок API (rate-limit/5xx) из claude.log.
-        self._error_relays: dict[int, asyncio.Task] = {}
-        # thread_id -> было ли ПОСЛЕДНЕЕ действие модели (до этого Stop-события)
-        # вызовом reply_to_telegram. Гейт для handle_stop_event: длинный ход
+        # session.name -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
+        self._typing: dict[str, asyncio.Task] = {}
+        # имя сессии -> сторож зависаний (стартует/гаснет вместе с typing).
+        self._watchdogs: dict[str, asyncio.Task] = {}
+        # имя сессии -> ретранслятор ошибок API (rate-limit/5xx) из claude.log.
+        self._error_relays: dict[str, asyncio.Task] = {}
+        # имя сессии -> было ли ПОСЛЕДНЕЕ действие модели (до этого Stop-события)
+        # вызовом reply_to_user. Гейт для handle_stop_event: длинный ход
         # часто заканчивается голым текстом вместо tool-вызова — этот текст
         # канал не видит и он не долетает до Telegram (REVIEW.md: 9/9 длинных
         # ходов в живой сессии теряли финал именно так). ВАЖНО: это не «reply
         # был где-то в ходе» — reply мог случиться в середине, а потом ещё
         # шли Bash/Edit и голый текст после них уже потерян. Поэтому флаг
-        # ставится True на reply_to_telegram и явно сбрасывается в False
+        # ставится True на reply_to_user и явно сбрасывается в False
         # любым ДРУГИМ тул-вызовом — остаётся True только если reply был
         # самым последним, что видел бот перед Stop.
-        self._last_action_was_reply: dict[int, bool] = {}
+        self._last_action_was_reply: dict[str, bool] = {}
 
     # ── жизненный цикл хода ─────────────────────────────────────
 
-    def start(self, thread_id: int) -> None:
+    def start(self, name: str) -> None:
         """«печатает…» + сторож зависаний + релей ошибок на время запроса.
 
         Все гаснут финальным ответом (stop() в handle_reply).
         """
-        self.stop(thread_id)
-        self._typing[thread_id] = asyncio.create_task(self._typing_loop(thread_id))
-        self._watchdogs[thread_id] = asyncio.create_task(self._watchdog_loop(thread_id))
-        self._error_relays[thread_id] = asyncio.create_task(self._error_relay_loop(thread_id))
+        self.stop(name)
+        self._typing[name] = asyncio.create_task(self._typing_loop(name))
+        self._watchdogs[name] = asyncio.create_task(self._watchdog_loop(name))
+        self._error_relays[name] = asyncio.create_task(self._error_relay_loop(name))
 
-    def stop(self, thread_id: int) -> None:
+    def stop(self, name: str) -> None:
         for registry in (self._typing, self._watchdogs, self._error_relays):
-            task = registry.pop(thread_id, None)
+            task = registry.pop(name, None)
             if task is not None:
                 task.cancel()
 
-    def forget(self, thread_id: int) -> None:
+    def forget(self, name: str) -> None:
         """Полная зачистка состояния топика (удаление сессии)."""
-        self.stop(thread_id)
-        self._last_action_was_reply.pop(thread_id, None)
+        self.stop(name)
+        self._last_action_was_reply.pop(name, None)
 
     # ── Stop-гейт «потерянного финала» ──────────────────────────
 
-    def note_tool(self, thread_id: int, is_reply: bool) -> None:
-        """Отметить тул-вызов: reply_to_telegram ставит флаг, любой другой
-        (в т.ч. send_file_to_telegram) — сбрасывает."""
-        self._last_action_was_reply[thread_id] = is_reply
+    def note_tool(self, name: str, is_reply: bool) -> None:
+        """Отметить тул-вызов: reply_to_user ставит флаг, любой другой
+        (в т.ч. send_file_to_user) — сбрасывает."""
+        self._last_action_was_reply[name] = is_reply
 
-    def pop_reply_flag(self, thread_id: int) -> bool:
+    def pop_reply_flag(self, name: str) -> bool:
         """Прочитать и сбросить флаг на Stop-событии (новое окно до следующего
         Stop)."""
-        flag = self._last_action_was_reply.get(thread_id, False)
-        self._last_action_was_reply[thread_id] = False
+        flag = self._last_action_was_reply.get(name, False)
+        self._last_action_was_reply[name] = False
         return flag
 
     # ── фоновые циклы ───────────────────────────────────────────
 
-    async def _typing_loop(self, thread_id: int) -> None:
+    async def _typing_loop(self, name: str) -> None:
         while True:
-            if not await self._typing_action(thread_id):
+            session = self.manager.get(name)
+            if session is None or not await self._typing_action(session):
                 return
             await asyncio.sleep(TYPING_INTERVAL)
 
-    async def _watchdog_loop(self, thread_id: int) -> None:
+    async def _watchdog_loop(self, name: str) -> None:
         """Если Claude молчит И claude.log не растёт несколько проверок подряд —
         это зависание (а не долгое размышление): предупреждаем в топик.
         """
-        session = self.manager.get(thread_id)
+        session = self.manager.get(name)
         if session is None:
             return
         log = session.session_dir / "claude.log"
@@ -175,17 +177,17 @@ class TurnSupervisor:
             if stalls < STALL_CHECKS:
                 continue
             # Завис: снимаем «печатает», шлём диагностику один раз.
-            t = self._typing.pop(thread_id, None)
+            t = self._typing.pop(name, None)
             if t is not None:
                 t.cancel()
             tail = await asyncio.to_thread(self.manager.tail_log, session, 10)
             msg = self.t("stalled")
             if tail:
                 msg += "\n\n" + self.t("session_died_tail", tail=tail[:1200])
-            await self._send(thread_id, msg)
+            await self._send(session, msg)
             return
 
-    async def _error_relay_loop(self, thread_id: int) -> None:
+    async def _error_relay_loop(self, name: str) -> None:
         """Транслировать в чат, что Claude делает, когда тулов ещё нет.
 
         Сигналы нюхаем из ПРИРАЩЕНИЯ claude.log (отрисовка TUI) с момента старта
@@ -200,7 +202,7 @@ class TurnSupervisor:
           3. Краш-рестарт «Resume this session» mid-хода — Claude упал и поднялся.
              Растёт счётчик → предупреждаем (раз в COOLDOWN), намекаем /close_session.
         """
-        session = self.manager.get(thread_id)
+        session = self.manager.get(name)
         if session is None:
             return
         log = session.session_dir / "claude.log"
@@ -220,7 +222,7 @@ class TurnSupervisor:
 
         async def _surf(text: str) -> None:
             try:
-                await self._send(thread_id, text)
+                await self._send(session, text)
             except Exception as e:
                 logger.debug("error_relay: не удалось отправить: %s", e)
 

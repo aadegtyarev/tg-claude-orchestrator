@@ -27,7 +27,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• другие <code>/команды</code> — уходят в терминал Claude Code\n\n"
             "Пока Claude работает, в топике живёт статус-бабл: вызовы\n"
             "инструментов, сабагенты и промежуточные ответы, кнопка ⏹ Стоп.\n"
-            "Файлы Claude присылает сам (тул send_file_to_telegram).\n"
+            "Файлы Claude присылает сам (тул send_file_to_user).\n"
             "Запросы разрешений приходят кнопками ✅/❌ (permission relay)."
         ),
         "only_main_chat": "Команда работает только в основном чате.",
@@ -124,7 +124,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stop_fail": "Не удалось связаться с сессией.",
         "stop_message": (
             "[system] Пользователь нажал Стоп. Немедленно прекрати текущую работу, "
-            "не начинай новых действий и вызови reply_to_telegram с complete=true "
+            "не начинай новых действий и вызови reply_to_user с complete=true "
             "и коротким итогом: что успел сделать."
         ),
         "subagent": "🤖 Сабагент {agent}",
@@ -142,7 +142,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "по умолчанию (api.anthropic.com)",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
-        "sendfile_denied": "⛔ Не отправляю: файл вне рабочей папки сессии ({path}). send_file_to_telegram разрешён только для файлов проекта/сессии — защита от утечки секретов.",
+        "sendfile_denied": "⛔ Не отправляю: файл вне рабочей папки сессии ({path}). send_file_to_user разрешён только для файлов проекта/сессии — защита от утечки секретов.",
         "sendfile_fail": "❌ Не удалось отправить файл: {error}",
         "session_not_found": "Сессия не найдена.",
         "topic_delete_fail": "Сессия удалена, но топик удалить не удалось: {error}",
@@ -214,7 +214,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• other <code>/commands</code> — typed into the Claude Code terminal\n\n"
             "While Claude works, a status bubble lives in the topic: tool calls,\n"
             "subagents, intermediate replies, and a ⏹ Stop button.\n"
-            "Claude can send files back (send_file_to_telegram tool).\n"
+            "Claude can send files back (send_file_to_user tool).\n"
             "Permission prompts arrive as ✅/❌ buttons (permission relay)."
         ),
         "only_main_chat": "This command works only in the main chat.",
@@ -311,7 +311,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stop_fail": "Could not reach the session.",
         "stop_message": (
             "[system] The user pressed Stop. Immediately stop the current work, "
-            "start nothing new, and call reply_to_telegram with complete=true "
+            "start nothing new, and call reply_to_user with complete=true "
             "and a short summary of what you managed to do."
         ),
         "subagent": "🤖 Subagent {agent}",
@@ -329,7 +329,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "default (api.anthropic.com)",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
-        "sendfile_denied": "⛔ Refused: the file is outside the session workspace ({path}). send_file_to_telegram is allowed only for project/session files — this prevents secret exfiltration.",
+        "sendfile_denied": "⛔ Refused: the file is outside the session workspace ({path}). send_file_to_user is allowed only for project/session files — this prevents secret exfiltration.",
         "sendfile_fail": "❌ Failed to send the file: {error}",
         "session_not_found": "Session not found.",
         "topic_delete_fail": "Session deleted, but the topic could not be removed: {error}",

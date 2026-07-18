@@ -75,13 +75,20 @@ def build_argv(
     chdir: Path,
     rw_paths: list[Path],
     ro_paths: list[Path],
+    home_dir: Path | None = None,
 ) -> list[str]:
     """Собрать argv-префикс bwrap. Итог: [bwrap, …, "--"] — дальше сама команда.
 
-    Порядок важен: сначала tmpfs $HOME (прячет всё), затем RO-биндами кладём
-    рантайм и код, и в самом конце RW-биндами — рабочие каталоги, чтобы при
+    Порядок важен: сначала подмена $HOME (прячет всё домашнее), затем RO-биндами
+    кладём рантайм и код, и в самом конце RW-биндами — рабочие каталоги, чтобы при
     пересечении путей запись всегда побеждала (например, linked_path == репозиторий
     оркестратора: он и RO как код, и RW как проект → останется RW).
+
+    home_dir — персистентный приватный дом сессии: монтируется НА МЕСТО $HOME
+    вместо пустого tmpfs. Реальный дом по-прежнему скрыт, но всё, что процесс
+    пишет «к себе домой» (venv, кэши pip/npm, dotfiles), переживает рестарт —
+    иначе агентские окружения испарялись вместе с tmpfs (живой инцидент:
+    пропавший ~/.venv). None = прежнее поведение (эфемерный tmpfs).
     """
     args: list[str] = [
         BWRAP,
@@ -94,14 +101,23 @@ def build_argv(
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--tmpfs", "/run",
+        # DNS при systemd-resolved: /etc/resolv.conf — симлинк в
+        # /run/systemd/resolve/, который прячет tmpfs /run выше. Возвращаем
+        # каталог резолвера RO, иначе внутри песочницы умирает вся DNS-резолюция
+        # (живой инцидент: github.com не резолвится, curl/gh глохнут).
+        "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
     ]
 
     # 1) системный рантайм — только чтение.
     for p in _SYSTEM_RO:
         _bind(args, "--ro-bind-try", p)
 
-    # 2) $HOME — пустой tmpfs: всё домашнее по умолчанию скрыто.
-    args += ["--tmpfs", str(home)]
+    # 2) $HOME: персистентный приватный дом сессии или пустой tmpfs.
+    #    В обоих случаях реальное содержимое $HOME скрыто.
+    if home_dir is not None:
+        args += ["--bind", str(home_dir), str(home)]
+    else:
+        args += ["--tmpfs", str(home)]
 
     # 3) RO-пути под $HOME (бинарь claude, репозиторий с channel_server/venv).
     for p in ro_paths:

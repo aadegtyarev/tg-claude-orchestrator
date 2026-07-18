@@ -14,24 +14,26 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.bot import TelegramBot  # noqa: E402
-from orchestrator.toolline import (  # noqa: E402
+from orchestrator.adapters.telegram.adapter import TelegramAdapter  # noqa: E402
+from orchestrator.core.toolline import (  # noqa: E402
     bash_head as _bash_head,
     file_suffix as _file_suffix,
     first_meaningful as _first_meaningful,
+    tool_line,
 )
 
 
 class StubBot:
-    """Лёгкий носитель для _tool_line без поднятия Telegram/сессий."""
+    """Лёгкий носитель для tool_line без поднятия Telegram/сессий."""
 
-    # бинтим реальные методы класса — логику проверяем как есть.
-    _tool_line = TelegramBot._tool_line
-    _with_quote = TelegramBot._with_quote
-    _shorten = staticmethod(TelegramBot._shorten)  # иначе станет bound-method
+    # бинтим реальный метод адаптера — логику склейки цитат проверяем как есть.
+    _with_quote = TelegramAdapter._with_quote
 
     def t(self, key, **kw):
         return f"🤖 {kw.get('agent', 'agent')}"
+
+    def _tool_line(self, tool, tool_input):
+        return tool_line(tool, tool_input, self.t)
 
 
 def main():

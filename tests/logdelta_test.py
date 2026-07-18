@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.turn import read_log_delta as _read_log_delta  # noqa: E402
+from orchestrator.core.turn import read_log_delta as _read_log_delta  # noqa: E402
 
 
 def main():
