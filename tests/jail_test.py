@@ -16,7 +16,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from bot import TelegramBot  # noqa: E402
+from orchestrator.bot import TelegramBot  # noqa: E402
 
 
 def main():

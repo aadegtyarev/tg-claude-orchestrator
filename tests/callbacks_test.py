@@ -16,9 +16,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-import bot as botmod  # noqa: E402
-from bot import TelegramBot  # noqa: E402
-from texts import get_texts  # noqa: E402
+from orchestrator import bot as botmod  # noqa: E402
+from orchestrator.bot import TelegramBot  # noqa: E402
+from orchestrator.texts import get_texts  # noqa: E402
 
 calls: list = []
 
@@ -75,9 +75,11 @@ def make_bot():
     b.manager = FakeMgr()
     b.chat_id = -100
     b.config = SimpleNamespace(allowed_user_ids={1})
-    b._typing = {}
     b.bubbles = FakeBubbles()
-    b._stop_typing = lambda tid: None
+    # TurnSupervisor не поднимаем: хендлерам нужны только stop/forget/start.
+    b.turns = SimpleNamespace(
+        stop=lambda tid: None, start=lambda tid: None, forget=lambda tid: None
+    )
     b._switch_model = TelegramBot._switch_model.__get__(b)
     b._stats_text = lambda s: "stats"
     return b

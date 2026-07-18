@@ -43,19 +43,39 @@ channel-сервером только по HTTP.
 «persistent terminal»: пуш сам запускает ход. Стартовые диалоги (trust folder,
 bypass permissions, dev channels) отвечает автоматика (`_pty_driver`).
 
-## Модули
+## Структура и модули
 
-| Файл | Ответственность |
-|------|-----------------|
-| `launcher.py` | Точка входа: сборка, graceful shutdown |
+Весь код — в пакете `orchestrator/`, запуск `python -m orchestrator`
+(в корне остаётся `launcher.py`-шим для старых systemd-юнитов).
+
+```
+orchestrator/   — пакет приложения (см. таблицу ниже)
+tests/          — офлайн-тесты (run_all.sh гоняет все)
+docs/           — дизайн-документы будущих интеграций
+install.sh      — установка: venv + systemd user-unit (+ --uninstall)
+.env.example    — образец конфигурации
+```
+
+| Модуль | Ответственность |
+|--------|-----------------|
+| `__main__.py` | Точка входа: сборка компонентов, graceful shutdown |
 | `config.py` | Чтение `.env` в неизменяемый `Config` |
-| `bot.py` | Бот: команды, файлы, permission-кнопки, отправка, ретранслятор ошибок API, вотчдог зависаний |
-| `bubble.py` | Статус-бабл: буфер строк, троттлинг правок, закрытие |
-| `sessions.py` | `SessionManager`: PTY-процессы Claude, жизненный цикл, resume, авто-close, ротация логов, статистика |
+| `bot.py` | Telegram-транспорт: команды, файлы, permission-кнопки, отправка |
+| `turn.py` | `TurnSupervisor`: фоновые задачи хода (typing, вотчдог зависаний, ретранслятор ошибок API) + Stop-гейт «потерянного финала» |
+| `bubble.py` | Статус-бабл: буфер строк, схлопывание, заморозка, троттлинг правок |
+| `toolline.py` | Рендер вызова инструмента в компактную строку бабла |
+| `cbdata.py` | Сборка/разбор callback-данных inline-кнопок |
+| `sessions.py` | `SessionManager`: PTY-процессы Claude, жизненный цикл, resume, авто-close, ротация логов |
+| `transcript.py` | Чтение транскриптов: статистика `/stats`, скан загрязнения чужим бэкендом |
+| `proctree.py` | Сигналы живости дерева процессов по `/proc` (для вотчдога) |
+| `hookscript.py` | Шаблон хук-диспетчера (PreToolUse + Stop → POST оркестратору) |
+| `runner.py` | Шов изоляции: как заворачивать процессы (`bwrap` / без; будущий agent-vm) |
 | `sandbox.py` | Файловая песочница (bubblewrap): сборка argv-обёртки, проверка доступности |
-| `reply_server.py` | aiohttp: `POST /reply`, `/event/{имя}`, `/permission/{имя}` |
-| `channel_server.py` | MCP-канал: raw JSON-RPC на stdio + HTTP `/notify`, `/ping`, `/permission` |
+| `reply_server.py` | aiohttp: `POST /reply`, `/event/{имя}`, `/stop/{имя}`, `/permission/{имя}` |
+| `channel_server.py` | MCP-канал: raw JSON-RPC на stdio + HTTP `/notify`, `/ping`, `/permission` (запускается самим Claude, проектных импортов нет) |
+| `bashshell.py` | Постоянный `/bash`-терминал топика (PTY мимо Claude) |
 | `texts.py` | Все сообщения бота на ru/en (`BOT_LANG`) |
+| `mdrender.py`, `logsignals.py`, `ansi.py`, `slug.py` | Чистые утилиты: markdown→HTML, сигналы claude.log, ANSI, слаги |
 
 ## Требования
 
@@ -80,25 +100,31 @@ systemctl --user enable --now tg-claude-orchestrator
 journalctl --user -u tg-claude-orchestrator -f
 ```
 
-Вручную: `source .venv/bin/activate && python launcher.py`.
+Вручную: `.venv/bin/python -m orchestrator`.
+Удалить сервис: `./install.sh --uninstall` (репозиторий и `.env` не трогает).
 
-Тесты без Telegram и Claude (контракт channel-сервера, логика кнопок,
-гейт бабла, конфиг, паритет текстов ru/en):
+Тесты офлайновые (без Telegram и Claude): контракт channel-сервера, логика
+кнопок, бабл, вотчдог, песочница, Stop-фолбэк и т.д. Всё разом:
 
 ```bash
-.venv/bin/python tests/smoke_test.py       # протокол канала, конфиг, тексты
-.venv/bin/python tests/callbacks_test.py   # inline-кнопки: парсинг, гварды
-.venv/bin/python tests/bubble_test.py      # статус-бабл: гейт от сирот
-.venv/bin/python tests/watchdog_test.py    # вотчдог: живая работа vs зависание
-.venv/bin/python tests/tool_line_test.py   # компактные строки тулов, reply-цитаты
-.venv/bin/python tests/error_relay_test.py # ретранслятор ошибок API: строгий баннер, без ложных
+tests/run_all.sh                  # каждый тест можно гонять и отдельно:
+.venv/bin/python tests/smoke_test.py
 ```
 
-Сервис — user-unit (`Restart=on-failure`), `install.sh` включает
-`loginctl enable-linger`: работает в фоне и переживает разлогин.
-При остановке launcher'а записи сессий сохраняются в
-`SESSIONS_DIR/.sessions.json` — после перезапуска сессии возобновляются
-по первому сообщению в топике.
+Линт (конфиг в `pyproject.toml`, инструменты — `requirements-dev.txt`):
+
+```bash
+.venv/bin/ruff check .
+```
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) гоняет линт и все тесты
+на Python 3.10/3.12.
+
+Сервис — user-unit (`Restart=on-failure` + `StartLimitBurst` от
+рестарт-штопора), `install.sh` включает `loginctl enable-linger`: работает
+в фоне и переживает разлогин. При остановке оркестратора записи сессий
+сохраняются в `SESSIONS_DIR/.sessions.json` — после перезапуска сессии
+возобновляются по первому сообщению в топике.
 
 ## Конфигурация (.env)
 
@@ -316,6 +342,41 @@ push→ход→ответ, хуки инструментов, close/resume с f
 `send_file_to_telegram`, смена модели (`--model sonnet`), проброс
 слэш-команд в PTY (`/context`), permission relay в режиме `default`
 (запрос → allow → выполнение → ответ).
+
+## Как добавить фичу
+
+Принцип проекта — **наблюдаемость**: всё, что модель делает в фоне (тулы,
+сабагенты, ретраи, зависания), должно быть видно пользователю. Новые фичи
+при развилках дизайна выбирают наблюдаемый вариант.
+
+Типовые расширения:
+
+- **Новая команда бота** — хендлер в `bot.py` (`cmd_*` + регистрация в
+  `_register_handlers` + пункт меню в `start_polling`), тексты — парой
+  ru/en в `texts.py` (паритет ключей проверяет `smoke_test`). Inline-кнопки —
+  формат в `cbdata.py` (build+parse рядом), регресс — в `callbacks_test.py`.
+- **Новый способ изоляции / запуска процессов** — класс с методом
+  `wrap(argv, chdir, extra_rw)` в `runner.py` + ветка в `make_runner()` +
+  значение `SANDBOX` в `config._parse_sandbox`. Больше ничего трогать не
+  надо: и `claude`, и `/bash` запускаются через раннер.
+- **Новая логика хода** (индикаторы, сторожа) — в `TurnSupervisor`
+  (`turn.py`): он единственный владелец фоновых задач между «сообщение
+  ушло в Claude» и «пришёл финальный ответ».
+- **Рендер строк бабла** — `toolline.py` (чистые функции, регресс —
+  `tool_line_test.py`).
+- **Новый транспорт (Matrix, …)** — пока не абстрагирован: Telegram-специфика
+  сосредоточена в `bot.py`/`bubble.py`, остальные модули транспорта не знают.
+  Направление — `docs/messaging-connector.md`.
+
+После правок: `tests/run_all.sh` и `.venv/bin/ruff check .`.
+
+## Дизайн-документы (`docs/`)
+
+| Документ | Что описывает |
+|----------|----------------|
+| [`docs/agent-vm-integration.md`](docs/agent-vm-integration.md) | Замена bwrap-песочницы на microVM ([wirenboard/agent-vm](https://github.com/wirenboard/agent-vm)): сессии в изолированных ВМ, управление ими из Telegram |
+| [`docs/secrets-wallet.md`](docs/secrets-wallet.md) | «Кошелёк секретов»: токены/пароли доступны CLI-инструментам, но не видны модели |
+| [`docs/messaging-connector.md`](docs/messaging-connector.md) | Путь к нескольким мессенджерам (Matrix) через выделение транспорт-коннектора |
 
 ## Лицензия
 
