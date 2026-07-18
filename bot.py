@@ -611,12 +611,16 @@ class TelegramBot:
                 await asyncio.sleep(BASH_POLL_INTERVAL)
                 raw = shell.snapshot()[start:]
                 out = bash_clean(raw)
-                idx = out.find(marker.encode())
-                if idx != -1:
-                    tail = out[idx:].split(b"\n", 1)[0]
-                    parts = tail.split()
-                    code = parts[-1].decode() if len(parts) > 1 else "?"
-                    out = out[:idx]
+                # Маркер ищем как «marker <цифры>»: интерактивный bash эхом
+                # прокручивает введённую `echo marker $?` (с литералом $?),
+                # и наивный find цеплял это эхо — код возврата получался «$?».
+                m = re.search(re.escape(marker).encode() + rb"\s+(\d+)", out)
+                if m:
+                    code = m.group(1).decode()
+                    out = out[: m.start()]
+                # Вымарываем эхо команды-маркера из показа.
+                mbytes = marker.encode()
+                out = b"\n".join(ln for ln in out.split(b"\n") if mbytes not in ln)
                 shown = self._bash_render(cmd, out, code)
                 if shown != last_edit:
                     try:
@@ -1107,7 +1111,8 @@ class TelegramBot:
         # Подстраховка реакцией: дублируем в бабле иконку + начало текста —
         # строка в бабле не зависит от прав на реакции в чате.
         await self._react(message, "👍")
-        snippet = html.escape(self._shorten(message.text or "", 28))
+        # Для фото/документов текст живёт в caption, не в text — берём оба.
+        snippet = html.escape(self._shorten(message.text or message.caption or "", 28))
         await self.bubbles.append(session.thread_id, f"📨 {snippet}")
         self._start_typing(session.thread_id)
 
