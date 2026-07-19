@@ -57,8 +57,8 @@ def make_env(tmp: Path):
         async def slash_command(self, s, cmd):
             calls.append(("slash", cmd))
 
-        async def soft_stop(self, s, origin):
-            calls.append(("soft_stop",))
+        async def request_report(self, s, origin):
+            calls.append(("request_report",))
 
         async def hard_stop(self, s):
             calls.append(("hard_stop",))
@@ -151,7 +151,7 @@ async def main():
                 assert r.status == 200
             async with http.post(f"{base}/api/sessions/dev/interrupt", headers=auth) as r:
                 assert r.status == 200
-            assert ("soft_stop",) in calls and ("hard_stop",) in calls
+            assert ("request_report",) in calls and ("hard_stop",) in calls
             print("OK stop/interrupt")
 
             # history: reply получает html

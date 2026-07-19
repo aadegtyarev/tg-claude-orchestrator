@@ -384,10 +384,10 @@ class OrchestratorCore:
         await self.bubbles.append(session.name, f"📨 {snippet}")
         self.turns.start(session.name)
 
-    async def soft_stop(self, session: Session, origin: Origin) -> None:
-        """Мягкий стоп: просим Claude свернуть работу и отчитаться (push-
-        сообщение, модель прочитает его, когда доберётся). Жёсткое немедленное
-        прерывание — hard_stop (Esc в PTY)."""
+    async def request_report(self, session: Session, origin: Origin) -> None:
+        """Запрос статус-отчёта (кнопка 📋): push-сообщение модели «отчитайся и
+        продолжай» (не останавливаться). Модель прочитает, когда доберётся.
+        Настоящее прерывание хода — hard_stop (Esc в PTY, кнопка ⛔)."""
         await self.manager.send_to_claude(
             session, self.t("stop_message"), self.context_id(session, origin)
         )

@@ -123,7 +123,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "bubble_working": "⏳ Работаю…",
         "bubble_background": "🌙 Фоновая активность…",
-        "bubble_stop": "⏹ Стоп-отчёт",
+        "bubble_stop": "📋 Отчёт",
         "bubble_esc": "⛔ Прервать ход",
         "bubble_unblock": "⏭ Разблокировать",
         "bubble_backgrounded": "⏬ Задача свёрнута в фон (Ctrl+B) — ввод свободен",
@@ -132,15 +132,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "unblock_requested": "Разблокирую ввод…",
         "esc_requested": "Прерываю ход (Esc)…",
         "esc_done": "⛔ Ход прерван (Esc в терминал). Контекст сохранён — можно писать дальше.",
-        "bubble_stop_requested": "⏹ Запрошена остановка",
-        "bubble_stopping": "⏹ Останавливаю…",
-        "stop_requested": "Попросил Claude остановиться…",
+        "bubble_stop_requested": "📋 Запрошен отчёт",
+        "bubble_stopping": "📋 Запросил отчёт",
+        "stop_requested": "Запросил отчёт…",
         "stop_not_active": "Сессия уже не активна.",
         "stop_fail": "Не удалось связаться с сессией.",
         "stop_message": (
-            "[system] Пользователь нажал Стоп. Немедленно прекрати текущую работу, "
-            "не начинай новых действий и вызови reply_to_user с complete=true "
-            "и коротким итогом: что успел сделать."
+            "Оператор просит краткий статус-отчёт. НЕ останавливайся — просто "
+            "отчитайся и продолжай работу. Через reply_to_user (complete=false) "
+            "коротко: 1) что сделано; 2) что делаешь сейчас; 3) что осталось; "
+            "4) блокеры/риски (если есть). 2–5 пунктов, без воды."
         ),
         "subagent": "🤖 Сабагент {agent}",
         "session_died": (
@@ -329,7 +330,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "bubble_working": "⏳ Working…",
         "bubble_background": "🌙 Background activity…",
-        "bubble_stop": "⏹ Stop report",
+        "bubble_stop": "📋 Report",
         "bubble_esc": "⛔ Interrupt turn",
         "bubble_unblock": "⏭ Unblock input",
         "bubble_backgrounded": "⏬ Task backgrounded (Ctrl+B) — input is free",
@@ -338,15 +339,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "unblock_requested": "Unblocking input…",
         "esc_requested": "Interrupting the turn (Esc)…",
         "esc_done": "⛔ Turn interrupted (Esc into the terminal). Context kept — you can keep chatting.",
-        "bubble_stop_requested": "⏹ Stop requested",
-        "bubble_stopping": "⏹ Stopping…",
-        "stop_requested": "Asked Claude to stop…",
+        "bubble_stop_requested": "📋 Report requested",
+        "bubble_stopping": "📋 Report requested",
+        "stop_requested": "Asked for a report…",
         "stop_not_active": "Session is no longer active.",
         "stop_fail": "Could not reach the session.",
         "stop_message": (
-            "[system] The user pressed Stop. Immediately stop the current work, "
-            "start nothing new, and call reply_to_user with complete=true "
-            "and a short summary of what you managed to do."
+            "The operator wants a short status report. DON'T stop — just report "
+            "and keep working. Via reply_to_user (complete=false), briefly: "
+            "1) done so far; 2) doing now; 3) remaining; 4) blockers/risks "
+            "(if any). 2–5 points, no fluff."
         ),
         "subagent": "🤖 Subagent {agent}",
         "session_died": (

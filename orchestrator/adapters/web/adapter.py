@@ -423,7 +423,7 @@ class WebAdapter:
         if session is None:
             return self._err("session not found", 404)
         try:
-            await self.core.soft_stop(session, self._origin())
+            await self.core.request_report(session, self._origin())
         except Exception as e:
             logger.error("Сессия %s: не удалось отправить стоп: %s", session.name, e)
             return self._err(str(e))

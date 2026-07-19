@@ -945,9 +945,10 @@ class TelegramAdapter:
             await self._strip_markup(callback)
 
     async def on_stop_button(self, callback: CallbackQuery) -> None:
-        """Мягкий стоп (кнопка ⏹): просим Claude свернуть работу и отчитаться.
-        Немедленное прерывание — кнопка ⛔ (on_esc_button → hard_stop, Esc в PTY).
-        """
+        """Кнопка 📋 «Отчёт»: просим Claude дать статус-отчёт и ПРОДОЛЖИТЬ работу
+        (не останавливаться — прежний «стоп» модель считала инъекцией и
+        игнорировала). Настоящее прерывание хода — кнопка ⛔ (on_esc_button →
+        hard_stop, Esc в PTY)."""
         if not self._user_allowed(callback.from_user):
             await callback.answer()
             return
@@ -958,7 +959,7 @@ class TelegramAdapter:
             return
         origin = Origin(self.name, f"{self.chat_id}:{thread_id}:0")
         try:
-            await self.core.soft_stop(session, origin)
+            await self.core.request_report(session, origin)
             await callback.answer(self.t("stop_requested"))
             # Видимый отклик: кнопка «Стоп» → «⏹ Останавливаю…», чтобы было
             # ясно, что бот нажатие зафиксировал (тост легко пропустить).
