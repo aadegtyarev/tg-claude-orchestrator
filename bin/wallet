@@ -89,6 +89,12 @@ def cmd_ls(cfg: dict) -> int:
         desc = f" — {s['description']}" if s.get("description") else ""
         confirm = " [confirm]" if s.get("confirm") else ""
         print(f"{s['name']}{desc}{confirm}")
+        # host — команда на хосте с его кредами (keyring/gh/git), инъекции нет.
+        # inject — значение в env-переменную $<env>; ссылайся на неё в команде.
+        if s.get("mode") == "inject" and s.get("env"):
+            print(f"    режим: inject → в команде используй ${s['env']}")
+        else:
+            print("    режим: host (креды хоста: keyring/gh/git)")
         for pat in s.get("commands", []):
             print(f"    разрешено: {pat}")
     return 0

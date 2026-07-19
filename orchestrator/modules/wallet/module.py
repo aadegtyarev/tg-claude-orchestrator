@@ -303,6 +303,11 @@ class WalletModule:
                 "description": s.description,
                 "commands": list(s.commands),
                 "confirm": s.confirm,
+                # host — команда идёт на хосте с его окружением (keyring/gh/git),
+                # инъекции нет; inject — значение секрета кладётся в env-переменную
+                # `env` дочернего процесса (модель ссылается на неё как $env).
+                "mode": "host" if s.host_passthrough else "inject",
+                "env": None if s.host_passthrough else s.env,
             }
             for s in self.store.load().values()
             if s.session_allowed(session.name)

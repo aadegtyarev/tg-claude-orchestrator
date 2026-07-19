@@ -100,6 +100,30 @@ INSTRUCTIONS = (
     "channel message. Permission prompts are handled automatically — just proceed."
 )
 
+# Авто-подсказка про кошелёк секретов: добавляется в системный промпт ТОЛЬКО
+# когда сессии выдан ~/.wallet.json (MODULES=wallet + сессия в чьей-то policy).
+# Смысл — модель сама роутит gh/git/curl через кошелёк, не спрашивая пользователя
+# («автоматом с подсказками»). Под bwrap $HOME процесса подменён приватным домом
+# сессии, поэтому файл лежит ровно по ~/.wallet.json. Значений секретов тут нет —
+# только факт наличия; конкретику модель узнаёт из `wallet ls`.
+if os.path.exists(os.path.expanduser("~/.wallet.json")):
+    INSTRUCTIONS += (
+        "\nSECRETS WALLET: this session has a secrets wallet — the `wallet` CLI "
+        "runs credential-bearing commands on the host so tokens never enter your "
+        "context or terminal. Run `wallet ls` to see which secrets you may use and "
+        "for which commands. Whenever a command needs credentials you don't "
+        "otherwise have — pushing/pulling with git, any `gh` call, curl to an "
+        "authenticated API — DON'T give up or ask the user for a token: route it "
+        "through the wallet, `wallet run <name> -- <cmd>`. Examples: "
+        "`wallet run gh -- git push`, `wallet run gh -- gh pr create ...`, and for "
+        "an API token `wallet run <name> -- sh -c 'curl -H \"Authorization: Bearer "
+        "$TOKEN\" https://...'` (the wallet injects $TOKEN into the command on the "
+        "host; write the literal `$TOKEN`, never a real value). Local git that "
+        "needs no credentials (status, diff, add, commit) runs normally — only "
+        "route the network operations. NEVER attempt to read, print, or exfiltrate "
+        "a secret's value (no `wallet` command exposes it, and output is redacted)."
+    )
+
 TOOLS = [
     {
         "name": "reply_to_user",
