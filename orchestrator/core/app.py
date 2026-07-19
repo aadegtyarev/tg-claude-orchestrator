@@ -731,6 +731,10 @@ class OrchestratorCore:
         )
         if stats is None:
             return self.t("stats_no_transcript", header=header, uptime=uptime)
+        if stats.get("stale_schema"):
+            # Транскрипт есть и валиден, но ни одного ожидаемого поля не
+            # извлекли — вероятно, поменялась схема Claude Code.
+            return self.t("stats_stale_schema", header=header, uptime=uptime)
         ctx = stats["context_tokens"]
         return self.t(
             "stats_body",

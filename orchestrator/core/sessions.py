@@ -576,8 +576,13 @@ class SessionManager:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
             if asyncio.get_running_loop().time() > deadline:
+                # Частая причина при обновлении Claude Code: channels —
+                # research preview, флаги/протокол могут поменяться, и тогда
+                # claude не спавнит channel_server или не отвечает handshake.
                 raise SessionError(
                     f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
+                    "Возможно, обновилась версия Claude Code и изменился протокол "
+                    "каналов (research preview) — проверь лог и совместимость. "
                     f"Лог: {session.session_dir / 'claude.log'}"
                 )
             await asyncio.sleep(1)

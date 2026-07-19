@@ -64,6 +64,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… и ещё {n}",
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа могут быть недоступны, пока не обновлю парсер.",
         "stats_body": (
             "{header}\n"
             "Модель: {model}\n"
@@ -263,6 +264,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… and {n} more",
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers may be unavailable until the parser is updated.",
         "stats_body": (
             "{header}\n"
             "Model: {model}\n"
