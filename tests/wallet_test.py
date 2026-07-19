@@ -65,6 +65,11 @@ def make_env(tmp: Path):
         confirm_answer["asked"] += 1
         return confirm_answer["value"]
 
+    notices = []
+
+    async def notice(session, text):
+        notices.append(text)
+
     core = SimpleNamespace(
         manager=SimpleNamespace(
             list_all=lambda: [session],
@@ -74,6 +79,8 @@ def make_env(tmp: Path):
         ),
         session_hooks=[],
         bubbles=SimpleNamespace(append=_async_noop),
+        notice=notice,
+        t=lambda k, **kw: kw.get("line", k),
         _record=lambda *a, **kw: None,
         request_confirmation=request_confirmation,
     )

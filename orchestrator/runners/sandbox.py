@@ -101,12 +101,22 @@ def build_argv(
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--tmpfs", "/run",
-        # DNS при systemd-resolved: /etc/resolv.conf — симлинк в
-        # /run/systemd/resolve/, который прячет tmpfs /run выше. Возвращаем
-        # каталог резолвера RO, иначе внутри песочницы умирает вся DNS-резолюция
-        # (живой инцидент: github.com не резолвится, curl/gh глохнут).
-        "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
     ]
+
+    # DNS: /etc/resolv.conf часто симлинк в /run (systemd-resolved →
+    # /run/systemd/resolve, NetworkManager → /run/NetworkManager, resolvconf →
+    # /run/resolvconf), а tmpfs /run выше прячет цель симлинка — внутри
+    # песочницы умирает вся DNS-резолюция (живой инцидент: github.com не
+    # резолвится, curl/gh глохнут). Возвращаем известные каталоги-цели RO;
+    # плюс realpath самого resolv.conf — на случай нестандартной раскладки.
+    for p in ("/run/systemd/resolve", "/run/NetworkManager", "/run/resolvconf"):
+        _bind(args, "--ro-bind-try", p)
+    try:
+        real_resolv = Path("/etc/resolv.conf").resolve()
+        if str(real_resolv).startswith("/run/"):
+            _bind(args, "--ro-bind-try", real_resolv)
+    except OSError:
+        pass
 
     # 1) системный рантайм — только чтение.
     for p in _SYSTEM_RO:

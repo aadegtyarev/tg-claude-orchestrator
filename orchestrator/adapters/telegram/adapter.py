@@ -32,10 +32,9 @@ from aiogram.types import (
 
 from . import cbdata
 from ...config import Config
-from ...core.app import MODEL_ALIASES, OrchestratorCore, PERM_PREVIEW_LIMIT, UserError
+from ...core.app import MODEL_ALIASES, OrchestratorCore, UserError
 from ...core.mdrender import md_to_html, split_text
 from ...core.sessions import Session
-from ...core.toolline import shorten
 from ...core.transport import Origin, PermissionRequest
 
 logger = logging.getLogger(__name__)
@@ -46,6 +45,7 @@ FILE_LIMIT = 50 * 1024 * 1024
 
 class TelegramAdapter:
     name = "telegram"
+    requires_binding = True  # без форум-топика сессии писать некуда
 
     def __init__(self, config: Config, core: OrchestratorCore):
         self.config = config
@@ -283,16 +283,22 @@ class TelegramAdapter:
             await self.bot.delete_message(chat_id=self.chat_id, message_id=int(ref))
         else:
             # Бабл остаётся как журнал работы — снимаем только кнопку Стоп.
-            await self.bot.edit_message_reply_markup(
-                chat_id=self.chat_id, message_id=int(ref), reply_markup=None
-            )
+            await self._strip_stop_button(int(ref))
 
     async def bubble_freeze(self, session: Session, ref: str) -> None:
+        # Заморозка = снять кнопку «Стоп», само сообщение не трогать.
         if self.chat_id is None:
             return
-        await self.bot.edit_message_reply_markup(
-            chat_id=self.chat_id, message_id=int(ref), reply_markup=None
-        )
+        await self._strip_stop_button(int(ref))
+
+    async def _strip_stop_button(self, message_id: int) -> None:
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=self.chat_id, message_id=message_id, reply_markup=None
+            )
+        except Exception as e:
+            # «message is not modified» и т.п. — кнопка и так снята, не критично.
+            logger.debug("Не удалось снять кнопку бабла %s: %s", message_id, e)
 
     # ── Transport: permission relay ─────────────────────────────
 
@@ -304,12 +310,13 @@ class TelegramAdapter:
         thread_id = self._thread_of(session)
         if thread_id is None:
             return
-        # description/preview — недоверенный текст, экранируем.
+        # description/preview — недоверенный текст, экранируем. preview ядро
+        # уже обрезало до лимита (второй срез резал бы маркер «…(обрезано)»).
         text = self.t(
             "perm_request",
             tool=html.escape(request.tool),
             desc=html.escape(request.description),
-            preview=html.escape(request.preview[:PERM_PREVIEW_LIMIT]),
+            preview=html.escape(request.preview),
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -535,6 +542,12 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
+        # Статус-сообщение постим ТОЛЬКО после проверки занятости: иначе при
+        # busy рядом с «терминал занят» навсегда висело бы «⏳ Выполняю <cmd>»,
+        # выглядящее как незавершённая вторая команда.
+        if self.core.bash_busy(key):
+            await message.reply(self.t("bash_busy"))
+            return
         status = await message.reply(self.t("bash_running", cmd=cmd))
         last_edit = ""
 
@@ -550,7 +563,7 @@ class TelegramAdapter:
         try:
             await self.core.run_bash(key, session, cmd, on_update)
         except UserError as e:
-            await message.reply(str(e))
+            await status.edit_text(str(e))
 
     async def cmd_bashin(self, message: Message, command: CommandObject) -> None:
         """Досыл сырого ввода в уже открытый /bash-терминал (ответ на y/n)."""
@@ -818,11 +831,9 @@ class TelegramAdapter:
             return
         if not await self._ensure_running(session, message):
             return
-        # INCOMING_DIR: относительный путь — внутри папки сессии,
-        # абсолютный — общий для всех сессий.
-        incoming = Path(self.config.incoming_dir).expanduser()
-        if not incoming.is_absolute():
-            incoming = session.session_dir / incoming
+        # incoming-каталог — единый источник правды ядра (совпадает с jail'ом
+        # скачивания, иначе положим туда, откуда потом нельзя отдать).
+        incoming = self.core.incoming_dir(session)
         incoming.mkdir(parents=True, exist_ok=True)
 
         if message.document:
@@ -917,9 +928,8 @@ class TelegramAdapter:
             await self._strip_markup(callback)
 
     async def on_stop_button(self, callback: CallbackQuery) -> None:
-        """Мягкий стоп: просим Claude свернуть текущую работу.
-
-        Жёсткого прерывания хода в channels нет; жёсткий вариант — /close_session.
+        """Мягкий стоп (кнопка ⏹): просим Claude свернуть работу и отчитаться.
+        Немедленное прерывание — кнопка ⛔ (on_esc_button → hard_stop, Esc в PTY).
         """
         if not self._user_allowed(callback.from_user):
             await callback.answer()
@@ -1008,5 +1018,3 @@ class TelegramAdapter:
                             return
                 if sent:
                     break
-
-    _shorten = staticmethod(shorten)

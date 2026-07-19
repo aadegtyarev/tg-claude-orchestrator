@@ -152,6 +152,7 @@ class BubbleManager:
         text = self._render_text(bubble)
         if text == bubble.sent_text:
             return
+        delivered = False
         for tr in self._transports():
             try:
                 ref = bubble.refs.get(tr.name)
@@ -159,13 +160,19 @@ class BubbleManager:
                     new_ref = await tr.bubble_post(session, text, stop_button=True)
                     if new_ref is not None:
                         bubble.refs[tr.name] = new_ref
+                        delivered = True
                 else:
                     await tr.bubble_edit(session, ref, text, stop_button=True)
+                    delivered = True
             except Exception as e:
                 logger.debug("Бабл (%s/%s): %s", name, tr.name, e)
-        # Фиксируем после попытки доставки — следующий flush сравнит с этим
-        # текстом; неизменившийся текст не редактируется повторно.
-        bubble.sent_text = text
+        # sent_text фиксируем ТОЛЬКО если хоть один адаптер реально доставил:
+        # иначе транзиентный сбой (429/сеть/chat_id ещё None) пометил бы текст
+        # «отправленным», следующий flush вышел бы по text == sent_text, и бабл
+        # навсегда завис бы на неотправленном состоянии (последний ход без
+        # новых событий — вообще без бабла).
+        if delivered:
+            bubble.sent_text = text
 
     async def _await_flush(self, bubble: Bubble) -> None:
         """Дождаться отложенной правки (или отправки), если она в очереди —

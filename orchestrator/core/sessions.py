@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pty
+import shutil
 import socket
 import sys
 import threading
@@ -568,12 +569,18 @@ class SessionManager:
             self.save_state()
 
     async def delete(self, session: Session) -> None:
-        """Полностью удалить сессию (процесс + запись)."""
+        """Полностью удалить сессию (процесс + запись + приватный дом)."""
         async with session.ops:
             async with self._lock:
                 self._by_name.pop(session.name, None)
                 self._cpu.pop(session.name, None)
             await self._stop_process(session)
+            # Приватный дом песочницы: без удаления /new с тем же slug
+            # унаследовал бы прежний $HOME (ключи, ~/.wallet.json, ~/.bashrc-
+            # foothold) и каталоги копились бы вечно.
+            home = self.config.sessions_dir / ".homes" / session.name
+            if home.is_dir():
+                await asyncio.to_thread(shutil.rmtree, home, ignore_errors=True)
             self.save_state()
 
     async def resume(self, session: Session) -> bool:
@@ -589,6 +596,10 @@ class SessionManager:
             return await self._resume_locked(session)
 
     async def _resume_locked(self, session: Session) -> bool:
+        # Раннеры с unique_cwd (agent-vm): гвард нужен и на resume/clear, не
+        # только на create — иначе восстановленные из .sessions.json две сессии
+        # на один cwd убьют VM друг друга при первом сообщении.
+        self._guard_unique_cwd(session)
         async with self._lock:
             port = self._find_free_port()
             if port is None:
@@ -815,11 +826,19 @@ class SessionManager:
         before = log.stat().st_size if log.exists() else 0
         self.type_into_pty(session, cmd)
         await asyncio.sleep(wait)
-        try:
-            raw = log.read_bytes()[before:]
-        except OSError:
-            return ""
-        return strip_ansi(raw).decode(errors="replace")
+
+        def _read_delta() -> str:
+            # Читаем приращение через seek, а не весь файл в память (лог под
+            # LOG_MAX_MB — десятки МБ); в потоке, чтобы не стопорить event loop.
+            try:
+                with open(log, "rb") as fh:
+                    fh.seek(before)
+                    raw = fh.read()
+            except OSError:
+                return ""
+            return strip_ansi(raw).decode(errors="replace")
+
+        return await asyncio.to_thread(_read_delta)
 
     async def close_idle(self) -> list[Session]:
         """Остановить работающие сессии, простаивавшие дольше IDLE_TIMEOUT_H.
