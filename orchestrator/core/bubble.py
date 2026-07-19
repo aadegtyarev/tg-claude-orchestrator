@@ -131,10 +131,20 @@ class BubbleManager:
         if name not in self._active:
             return
         bubble = self._bubbles.setdefault(name, Bubble())
-        last = bubble.entries[-1] if bubble.entries else None
-        if tool is not None and last is not None and last.tool == tool and last.agent_id == agent_id:
-            last.html = html
-            last.count += 1
+        # Схлопывание ПО АГЕНТУ: ищем последнюю строку того же (tool, agent_id),
+        # даже если между ними вклинились вызовы ДРУГОГО агента. Раньше
+        # сравнивали только с entries[-1], и при параллельных сабагентах
+        # (вызовы чередуются) серия рвалась на десятки строк-дублей.
+        match = None
+        if tool is not None:
+            match = next(
+                (e for e in reversed(bubble.entries)
+                 if e.tool == tool and e.agent_id == agent_id),
+                None,
+            )
+        if match is not None:
+            match.html = html
+            match.count += 1
         else:
             bubble.entries.append(BubbleLine(html=html, agent_id=agent_id, tool=tool))
         bubble.updated_at = time.time()

@@ -124,6 +124,20 @@ async def main():
     assert len(bm._bubbles["s8"].entries) == 4, [e.render() for e in bm._bubbles["s8"].entries]
     print("OK разные tool/agent_id не схлопываются друг с другом")
 
+    # ЧЕРЕДОВАНИЕ агентов: повтор (tool, agent) схлопывается со «своей» строкой,
+    # даже если между ними вклинился ДРУГОЙ агент (параллельные сабагенты). До
+    # фикса сравнивали только entries[-1] и серия рвалась на дубли.
+    await bm.append("s8", "⚡ <b>Bash</b> <code>pwd</code>", agent_id="a1", tool="Bash")  # снова a1
+    await bm.append("s8", "⚡ <b>Bash</b> <code>id</code>", agent_id="a2", tool="Bash")   # снова a2
+    await _settle(bm, "s8")
+    e = bm._bubbles["s8"].entries
+    assert len(e) == 4, [x.render() for x in e]  # новых строк нет — оба схлопнулись
+    a1_bash = next(x for x in e if x.agent_id == "a1" and x.tool == "Bash")
+    a2_bash = next(x for x in e if x.agent_id == "a2" and x.tool == "Bash")
+    assert a1_bash.count == 36 and "pwd" in a1_bash.html, (a1_bash.count, a1_bash.html)
+    assert a2_bash.count == 2 and "id" in a2_bash.html, (a2_bash.count, a2_bash.html)
+    print("OK чередование агентов: повтор схлопывается со своей строкой, не рвётся")
+
     # главный поток (agent_id=None) — без отступа, схлопывается независимо от агентских
     await bm.append("s8", "⚡ <b>Bash</b> <code>git status</code>", tool="Bash")
     await bm.append("s8", "⚡ <b>Bash</b> <code>git log</code>", tool="Bash")
