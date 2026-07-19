@@ -21,6 +21,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -89,8 +90,12 @@ class OrchestratorCore:
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
         # Журнал событий per-сессия: показать историю в веб-интерфейсе после
-        # перезагрузки страницы. В памяти (полная история — в транскрипте CC).
+        # перезагрузки страницы. Персистится через graceful-рестарт (иначе
+        # пропадала при каждом рестарте — «история потерялась»); полная — в
+        # транскрипте CC.
         self._history: dict[str, deque] = {}
+        self._history_path = config.sessions_dir / ".history.json"
+        self._load_history()
         # Ожидающие permission-запросы: (имя сессии, request_id) — от повторного
         # вердикта из второго адаптера (применяется первый ответ).
         self._pending_perms: set[tuple[str, str]] = set()
@@ -171,6 +176,27 @@ class OrchestratorCore:
 
     def history(self, name: str) -> list[dict]:
         return list(self._history.get(name, ()))
+
+    def _load_history(self) -> None:
+        """Восстановить журнал событий с прошлого запуска (веб-история переживает
+        graceful-рестарт). Битый/отсутствующий файл — просто пустая история."""
+        try:
+            data = json.loads(self._history_path.read_text())
+        except (OSError, ValueError):
+            return
+        for name, events in (data or {}).items():
+            if isinstance(events, list):
+                self._history[name] = deque(events, maxlen=HISTORY_LIMIT)
+
+    def save_history(self) -> None:
+        """Сохранить журнал на диск (вызывать при graceful-остановке). Атомарно."""
+        try:
+            data = {name: list(dq) for name, dq in self._history.items() if dq}
+            tmp = self._history_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            os.replace(tmp, self._history_path)
+        except OSError as e:
+            logger.debug("save_history: %s", e)
 
     # ── доставка во все адаптеры ────────────────────────────────
 
