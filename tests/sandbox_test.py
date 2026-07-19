@@ -47,7 +47,21 @@ def test_build_argv_order():
     assert "--unshare-net" not in argv
     # DNS при systemd-resolved: цель симлинка /etc/resolv.conf возвращена в /run
     assert "--ro-bind-try /run/systemd/resolve /run/systemd/resolve" in s
-    print("OK build_argv: порядок tmpfs<RO<RW, die-with-parent, сеть общая, DNS-бинд")
+    # system D-Bus (по умолчанию вкл): проброшен для mDNS/avahi-browse
+    assert "--ro-bind-try /run/dbus /run/dbus" in s
+    print("OK build_argv: порядок tmpfs<RO<RW, die-with-parent, сеть общая, DNS+D-Bus")
+
+
+def test_build_argv_dbus_off():
+    argv = sandbox.build_argv(
+        home=Path("/home/tester"), chdir=Path("/home/tester/proj"),
+        rw_paths=[], ro_paths=[], system_dbus=False,
+    )
+    s = " ".join(argv)
+    # Базовый DNS остаётся, а system D-Bus — нет.
+    assert "/run/systemd/resolve" in s, "базовый DNS должен остаться"
+    assert "/run/dbus" not in s, "SANDBOX_DBUS=off не должен пробрасывать system D-Bus"
+    print("OK build_argv: system_dbus=False убирает D-Bus, оставляет DNS")
 
 
 def test_build_argv_persistent_home():
@@ -67,6 +81,7 @@ def _mgr(mode: str) -> SessionManager:
     cfg = SimpleNamespace(
         sandbox=mode,
         sandbox_extra_rw=(),
+        sandbox_dbus=True,
         claude_config_dir=Path("/home/tester/.claude-proxy"),
     )
     m = SessionManager.__new__(SessionManager)
@@ -158,6 +173,7 @@ def test_real_isolation():
 
 def main():
     test_build_argv_order()
+    test_build_argv_dbus_off()
     test_build_argv_persistent_home()
     test_prefix_off_empty()
     test_prefix_allowlist()

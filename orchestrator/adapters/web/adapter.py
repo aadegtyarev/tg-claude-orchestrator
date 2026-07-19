@@ -216,6 +216,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/compact", self.h_compact)
         r.add_post("/api/sessions/{name}/stop", self.h_stop)
         r.add_post("/api/sessions/{name}/interrupt", self.h_interrupt)
+        r.add_post("/api/sessions/{name}/background", self.h_background)
         r.add_post("/api/sessions/{name}/model", self.h_model)
         r.add_get("/api/sessions/{name}/bubble", self.h_bubble)
         r.add_get("/api/sessions/{name}/stats", self.h_stats)
@@ -436,6 +437,16 @@ class WebAdapter:
             return self._err("session not found", 404)
         try:
             await self.core.hard_stop(session)
+        except UserError as e:
+            return self._err(str(e))
+        return web.json_response({"ok": True})
+
+    async def h_background(self, request: web.Request) -> web.Response:
+        session = self._session_of(request)
+        if session is None:
+            return self._err("session not found", 404)
+        try:
+            await self.core.background(session)
         except UserError as e:
             return self._err(str(e))
         return web.json_response({"ok": True})

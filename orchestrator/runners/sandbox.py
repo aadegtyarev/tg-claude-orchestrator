@@ -76,6 +76,7 @@ def build_argv(
     rw_paths: list[Path],
     ro_paths: list[Path],
     home_dir: Path | None = None,
+    system_dbus: bool = True,
 ) -> list[str]:
     """Собрать argv-префикс bwrap. Итог: [bwrap, …, "--"] — дальше сама команда.
 
@@ -103,12 +104,13 @@ def build_argv(
         "--tmpfs", "/run",
     ]
 
-    # DNS: /etc/resolv.conf часто симлинк в /run (systemd-resolved →
-    # /run/systemd/resolve, NetworkManager → /run/NetworkManager, resolvconf →
-    # /run/resolvconf), а tmpfs /run выше прячет цель симлинка — внутри
-    # песочницы умирает вся DNS-резолюция (живой инцидент: github.com не
-    # резолвится, curl/gh глохнут). Возвращаем известные каталоги-цели RO;
-    # плюс realpath самого resolv.conf — на случай нестандартной раскладки.
+    # Резолюция имён. Сеть песочницы НЕ изолируем (общая с хостом), поэтому
+    # возвращаем в /run рантайм-сокеты резолверов, спрятанные tmpfs /run выше.
+    #
+    # Обычный DNS — ВСЕГДА: /etc/resolv.conf часто симлинк в /run (systemd-
+    # resolved → /run/systemd/resolve, NetworkManager → /run/NetworkManager,
+    # resolvconf → /run/resolvconf); без цели симлинка внутри песочницы умирает
+    # вся DNS-резолюция (живой инцидент: github.com не резолвится, curl/gh глохнут).
     for p in ("/run/systemd/resolve", "/run/NetworkManager", "/run/resolvconf"):
         _bind(args, "--ro-bind-try", p)
     try:
@@ -117,6 +119,18 @@ def build_argv(
             _bind(args, "--ro-bind-try", real_resolv)
     except OSError:
         pass
+
+    # System D-Bus (SANDBOX_DBUS, опционально). Главный юзкейс — mDNS/локальная
+    # сеть: `.local`-хосты и обзор сервисов (avahi-browse, avahi-resolve,
+    # DNS-SD) идут через system D-Bus, где зарегистрирован Avahi. ⚠️ Это
+    # открывает ВЕСЬ system D-Bus, не только Avahi (systemd, logind,
+    # NetworkManager…): read-методы работают, мутации остаются под polkit.
+    # Осознанное расширение поверхности — выключается SANDBOX_DBUS=off.
+    # Базовый `.local`-резолв хоста работает и без D-Bus (nss-mdns minimal шлёт
+    # multicast напрямую); D-Bus нужен для service discovery и avahi-client.
+    if system_dbus:
+        for p in ("/run/dbus", "/run/avahi-daemon"):
+            _bind(args, "--ro-bind-try", p)
 
     # 1) системный рантайм — только чтение.
     for p in _SYSTEM_RO:
