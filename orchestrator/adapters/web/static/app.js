@@ -234,6 +234,13 @@ function renderHistoryEvent(session, ev) {
     case "status":
       addMsg("notice", ev.status === "interrupted" ? "⛔ ход прерван" : "⏸ сессия остановлена");
       break;
+    case "wallet": {
+      // wallet-активность (аудит) — при переключении сессий тоже не теряем.
+      const denied = ev.allowed === false ? " — отказано" : "";
+      addMsg("notice", "🔐 wallet: <code>" +
+        esc((ev.secret || "") + " → " + (ev.cmd || "")) + "</code>" + denied);
+      break;
+    }
   }
 }
 
