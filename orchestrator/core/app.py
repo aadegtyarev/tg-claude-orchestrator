@@ -574,6 +574,13 @@ class OrchestratorCore:
         session = self.manager.get(session_name)
         if session is None:
             return
+        # ВРЕМЕННО (верификация #18/#13): PostToolUse/SubagentStop пока только
+        # логируем сырой payload на 2.1.215, не трогая бабл, чтобы построить
+        # логику на реальной структуре, а не на доках.
+        event = str(payload.get("hook_event_name") or "")
+        if event in ("PostToolUse", "SubagentStop"):
+            logger.info("HOOK %s payload=%s", event, json.dumps(payload, ensure_ascii=False)[:2500])
+            return
         tool = str(payload.get("tool_name") or "?")
         # Наш канальный тул — mcp__channel-<slug>__reply_to_user; сверяем по
         # ХВОСТУ имени, а не подстрокой: `"reply_to_user" in tool` ложно
