@@ -43,6 +43,7 @@ def make_core():
     core._texts = get_texts("ru")
     core.config = SimpleNamespace(max_instances=5)
     core._history = {}
+    core._last_tool = {}
     core.adapters = {}
     core._pending_perms = set()
     core._local_perms = {}
@@ -78,6 +79,35 @@ async def test_exact_tool_name():
     await core.handle_stop_event("noos", {"last_assistant_message": "уже отправлено"})
     assert deliveries == [], deliveries
     print("OK настоящий reply_to_user ставит флаг (без дубля)")
+
+
+async def test_taskoutput_and_bg_available():
+    core = make_core()
+    lines = []
+
+    async def fake_append(name, html, **kw):
+        lines.append(html)
+    core.bubbles = SimpleNamespace(append=fake_append, close=lambda n: asyncio.sleep(0))
+
+    # is_busy управляем через фейк-менеджер.
+    busy = {"v": True}
+    core.manager.is_busy = lambda s: busy["v"]
+
+    # Обычный Bash идёт (is_busy) → можно свернуть в фон (⏭ активна, Ctrl+B).
+    await core.handle_tool_event("noos", {"tool_name": "Bash",
+                                          "tool_input": {"command": "make build"}})
+    assert core._unblock_available("noos") is True
+    assert core.unblock_action("noos") == "background"
+    # TaskOutput → «ждёт фон»: строка в бабле + ⏭ активна (пнуть Esc'ом).
+    await core.handle_tool_event("noos", {"tool_name": "TaskOutput", "tool_input": {}})
+    assert any("Ждёт фоновую задачу" in ln for ln in lines), lines
+    assert core._unblock_available("noos") is True, "ожидание фона можно прервать"
+    assert core.unblock_action("noos") == "kick"
+    # Простой (нет команды, не ждёт фон) → ⏭ неактивна.
+    busy["v"] = False
+    core._last_tool["noos"] = "Read"
+    assert core._unblock_available("noos") is False
+    print("OK ⏭ разблокировка: Bash→background, TaskOutput→kick, покой→неактивна")
 
 
 async def test_pending_perms_cleanup():
@@ -176,12 +206,12 @@ async def test_bubble_sent_text_only_on_delivery():
     class FlakyTr:
         name = "tg"
 
-        async def bubble_post(self, session, html, *, stop_button):
+        async def bubble_post(self, session, html, *, stop_button, unblock_active=False):
             if not delivered["ok"]:
                 raise RuntimeError("429")  # первый раз сбой
             return "1"
 
-        async def bubble_edit(self, session, ref, html, *, stop_button):
+        async def bubble_edit(self, session, ref, html, *, stop_button, unblock_active=False):
             pass
 
     tr = FlakyTr()
@@ -202,6 +232,7 @@ async def test_bubble_sent_text_only_on_delivery():
 
 async def main():
     await test_exact_tool_name()
+    await test_taskoutput_and_bg_available()
     await test_pending_perms_cleanup()
     await test_confirmation_timeout_clears_buttons()
     await test_create_rollback_on_bind_fail()

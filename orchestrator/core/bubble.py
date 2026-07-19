@@ -82,11 +82,15 @@ class BubbleManager:
         get_session: Callable[[str], "Session | None"],
         t: Callable[..., str],
         delete_after: bool,
+        unblock_available: Callable[[str], bool] | None = None,
     ):
         self._transports = transports
         self._get_session = get_session
         self._t = t
         self._delete_after = delete_after
+        # Можно ли сейчас свернуть задачу сессии в фон (Ctrl+B) — для активности
+        # кнопки ⏬. None = всегда False (адаптер без поддержки).
+        self._unblock_available = unblock_available or (lambda name: False)
         self._bubbles: dict[str, Bubble] = {}  # имя сессии -> активный Bubble
         # имя сессии -> замороженные Bubble этого диалогового цикла (см. модуль
         # docstring) — убираются все разом на финальном close().
@@ -152,17 +156,20 @@ class BubbleManager:
         text = self._render_text(bubble)
         if text == bubble.sent_text:
             return
+        unblock = self._unblock_available(name)
         delivered = False
         for tr in self._transports():
             try:
                 ref = bubble.refs.get(tr.name)
                 if ref is None:
-                    new_ref = await tr.bubble_post(session, text, stop_button=True)
+                    new_ref = await tr.bubble_post(
+                        session, text, stop_button=True, unblock_active=unblock
+                    )
                     if new_ref is not None:
                         bubble.refs[tr.name] = new_ref
                         delivered = True
                 else:
-                    await tr.bubble_edit(session, ref, text, stop_button=True)
+                    await tr.bubble_edit(session, ref, text, stop_button=True, unblock_active=unblock)
                     delivered = True
             except Exception as e:
                 logger.debug("Бабл (%s/%s): %s", name, tr.name, e)
