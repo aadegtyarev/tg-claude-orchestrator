@@ -64,7 +64,7 @@ class FakeCore:
         calls.append(("perm", rid, beh))
         return True
 
-    async def soft_stop(self, s, origin):
+    async def request_report(self, s, origin):
         calls.append(("stop_sent",))
 
     async def hard_stop(self, s):
