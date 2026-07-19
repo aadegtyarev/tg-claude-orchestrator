@@ -296,6 +296,19 @@ async def main():
     print("OK #18: не-текущий bash свёрнут в короткую строку")
     await bm.close("s14")
 
+    # ── #18B: завершение вызова (PostToolUse) → короткая строка + статус ──
+    bm.open("s14")
+    await bm.append("s14", "⚡ <b>Bash</b> <code>echo hi</code>", tool="Bash",
+                    full_html="⚡ <b>Bash</b>\n<pre>echo hi --flag</pre>", tool_use_id="tu1")
+    await _settle(bm, "s14")
+    assert "<pre>echo hi --flag</pre>" in bm._render_text(bm._bubbles["s14"])
+    await bm.complete("s14", "tu1", "✓ · 42мс")
+    await _settle(bm, "s14")
+    tt = bm._render_text(bm._bubbles["s14"])
+    assert "<pre>" not in tt and "✓ · 42мс" in tt and "echo hi</code>" in tt, tt
+    print("OK #18B: завершение по tool_use_id → короткая строка + статус")
+    await bm.close("s14")
+
     print("ALL BUBBLE OK")
 
 

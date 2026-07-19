@@ -144,6 +144,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "4) блокеры/риски (если есть). 2–5 пунктов, без воды."
         ),
         "subagent": "🤖 Сабагент {agent}",
+        "subagent_done": "✅ Сабагент завершил · {model}",
+        "subagent_done_nomodel": "✅ Сабагент завершил",
         "session_died": (
             "💀 Сессия «{name}»: Claude завершился (код {code}).\n"
             "Напиши в топик — перезапущу сессию."
@@ -351,6 +353,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "(if any). 2–5 points, no fluff."
         ),
         "subagent": "🤖 Subagent {agent}",
+        "subagent_done": "✅ Subagent finished · {model}",
+        "subagent_done_nomodel": "✅ Subagent finished",
         "session_died": (
             "💀 Session “{name}”: Claude exited (code {code}).\n"
             "Send a message to the topic to restart the session."

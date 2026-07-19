@@ -35,6 +35,7 @@ from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
 from .texts import get_texts
 from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line, tool_line_full
+from .transcript import read_last_model
 from .transport import Origin, PermissionRequest, Transport
 from .turn import TurnSupervisor
 from ..config import Config
@@ -596,9 +597,17 @@ class OrchestratorCore:
     # ── события хуков Claude Code ───────────────────────────────
 
     async def handle_tool_event(self, session_name: str, payload: dict) -> None:
-        """PreToolUse-хук: вызов инструмента → строка в статус-бабле."""
+        """Хуки Claude Code (PreToolUse/PostToolUse/SubagentStop) → статус-бабл.
+        Роут по hook_event_name; PreToolUse — вызов инструмента (строка)."""
         session = self.manager.get(session_name)
         if session is None:
+            return
+        event = str(payload.get("hook_event_name") or "")
+        if event == "PostToolUse":
+            await self._handle_post_tool(session, payload)
+            return
+        if event == "SubagentStop":
+            await self._handle_subagent_stop(session, payload)
             return
         tool = str(payload.get("tool_name") or "?")
         # Наш канальный тул — mcp__channel-<slug>__reply_to_user; сверяем по
@@ -637,6 +646,43 @@ class OrchestratorCore:
             agent_id=str(agent_id) if agent_id else None,
             tool=tool if collapsible else None,
             full_html=tool_line_full(tool, tool_input),  # текущий bash — полно
+            tool_use_id=str(payload.get("tool_use_id") or ""),  # для PostToolUse
+        )
+
+    async def _handle_post_tool(self, session: Session, payload: dict) -> None:
+        """PostToolUse: вызов завершился — сворачиваем «текущую» строку и
+        приписываем итог. exit_code в payload НЕТ (проверено на 2.1.215), поэтому
+        статус по tool_response: ✗ — прервано, ⚠ — есть stderr, иначе ✓; + время."""
+        if str(payload.get("tool_name") or "") != "Bash":
+            return  # подробный вид/итог пока только для Bash
+        resp = payload.get("tool_response") or {}
+        if payload.get("interrupted") or (isinstance(resp, dict) and resp.get("interrupted")):
+            mark = "✗"
+        elif isinstance(resp, dict) and str(resp.get("stderr") or "").strip():
+            mark = "⚠"
+        else:
+            mark = "✓"
+        dur = payload.get("duration_ms")
+        status = f"{mark} · {int(dur)}мс" if isinstance(dur, (int, float)) else mark
+        await self.bubbles.complete(
+            session.name, str(payload.get("tool_use_id") or ""), status
+        )
+
+    async def _handle_subagent_stop(self, session: Session, payload: dict) -> None:
+        """SubagentStop: сабагент завершился — строкой в бабл (с отступом под его
+        agent_id). Модель сабагента в payload НЕТ — best-effort из его транскрипта
+        (agent_transcript_path); не вышло — без модели."""
+        agent_id = str(payload.get("agent_id") or "")
+        model = ""
+        tpath = payload.get("agent_transcript_path")
+        if tpath:
+            try:
+                model = await asyncio.to_thread(read_last_model, Path(tpath)) or ""
+            except Exception:
+                model = ""
+        line = self.t("subagent_done", model=model) if model else self.t("subagent_done_nomodel")
+        await self.bubbles.append(
+            session.name, line, agent_id=agent_id or None,
         )
 
     def _unblock_available(self, name: str) -> bool:

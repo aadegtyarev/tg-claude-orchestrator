@@ -63,12 +63,16 @@ class BubbleLine:
     # Подробный вид (напр. полная bash-команда в <pre>) — показывается ТОЛЬКО
     # пока эта строка «текущая» (in-flight); перестала быть текущей → короткий html.
     full_html: str = ""
+    tool_use_id: str = ""  # для корреляции Pre↔PostToolUse (завершение вызова)
+    status: str = ""  # итог по завершении (✓/✗ · Nмс) — рядом с короткой строкой
 
     def render(self, full: bool = False) -> str:
         prefix = AGENT_INDENT if self.agent_id else ""
         count = f"{self.count}× " if self.count > 1 else ""
-        body = self.full_html if (full and self.full_html) else self.html
-        return f"{prefix}{count}{body}"
+        if full and self.full_html:
+            return f"{prefix}{count}{self.full_html}"  # in-flight — без статуса
+        status = f" <i>{self.status}</i>" if self.status else ""
+        return f"{prefix}{count}{self.html}{status}"
 
 
 @dataclass
@@ -172,6 +176,7 @@ class BubbleManager:
         agent_id: str | None = None,
         tool: str | None = None,
         full_html: str = "",
+        tool_use_id: str = "",
     ) -> None:
         """Добавить строку (или схлопнуть с предыдущей, если tool задан и
         совпадает с последней строкой по (tool, agent_id) — см. BubbleLine).
@@ -200,16 +205,47 @@ class BubbleManager:
         if match is not None:
             match.html = html
             match.full_html = full_html
+            match.tool_use_id = tool_use_id
+            match.status = ""  # новый вызов — снова in-flight, прежний итог убираем
             match.count += 1
             line = match
         else:
-            line = BubbleLine(html=html, agent_id=agent_id, tool=tool, full_html=full_html)
+            line = BubbleLine(
+                html=html, agent_id=agent_id, tool=tool,
+                full_html=full_html, tool_use_id=tool_use_id,
+            )
             bubble.entries.append(line)
         bubble.current_line = line  # последний вызов — «текущий» (рендерится полно)
         bubble.updated_at = time.time()
         # Переполнение: вытесняем старые строки с начала.
         while len(bubble.entries) > 1 and len(self._render_text(bubble)) > TEXT_LIMIT:
             bubble.entries.pop(0)
+        if bubble.flush_task is None or bubble.flush_task.done():
+            bubble.flush_task = asyncio.create_task(self._flush(name))
+
+    async def complete(self, name: str, tool_use_id: str, status: str) -> None:
+        """PostToolUse: вызов завершился — строку сворачиваем в короткий вид и
+        приписываем итог (status, напр. «✓ · 96мс» / «✗ · …»). Ищем строку по
+        tool_use_id; фолбэк — «текущая» (если Pre не дал id)."""
+        if name not in self._active:
+            return
+        bubble = self._bubbles.get(name)
+        if bubble is None:
+            return
+        line = None
+        if tool_use_id:
+            line = next(
+                (e for e in reversed(bubble.entries) if e.tool_use_id == tool_use_id),
+                None,
+            )
+        if line is None:
+            line = bubble.current_line
+        if line is None:
+            return
+        line.status = status
+        if bubble.current_line is line:
+            bubble.current_line = None  # завершился → короткий вид (не in-flight)
+        bubble.updated_at = time.time()
         if bubble.flush_task is None or bubble.flush_task.done():
             bubble.flush_task = asyncio.create_task(self._flush(name))
 
