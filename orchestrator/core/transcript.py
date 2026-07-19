@@ -142,6 +142,30 @@ def read_stats(path: Path) -> dict | None:
     }
 
 
+_MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]+)"')
+
+
+def read_last_model(path: Path, tail_bytes: int = 65536) -> str | None:
+    """Реальная модель последнего ответа (после подмены прокси) — из хвоста
+    транскрипта. Дёшево: читаем только последние tail_bytes и берём последний
+    `"model":"…"`. Прокси может подменять opus→glm и т.п., и это меняется по
+    ходу — показываем в бабле фактическую. `<synthetic>` (служебные записи)
+    игнорируем. None — не нашли."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            raw = f.read()
+    except OSError:
+        return None
+    for m in reversed(_MODEL_RE.findall(raw)):
+        val = m.decode("utf-8", "replace")
+        if val and val != "<synthetic>":
+            return val
+    return None
+
+
 def read_pollution_excerpt(path: Path, max_entries: int = 25) -> str | None:
     """Эксцепт загрязнения чужим бэкендом из хвоста транскрипта (или None).
 

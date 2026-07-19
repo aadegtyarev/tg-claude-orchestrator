@@ -28,6 +28,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from html import escape as html_escape
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -71,6 +72,8 @@ class Bubble:
     # обновляемая строка внизу бабла: видно, что модель жива, когда
     # tool-событий нет (думает / ждёт API / фоновая задача).
     pulse: str = ""
+    # Реальная модель последнего ответа (после подмены прокси) — в заголовке.
+    model: str = ""
     sent_text: str = ""
     flush_task: asyncio.Task | None = None
     # Момент последнего добавления строки — метка «когда обновлено» в конце
@@ -143,27 +146,38 @@ class BubbleManager:
 
     def _render_text(self, bubble: Bubble) -> str:
         updated = time.strftime("%H:%M:%S", time.localtime(bubble.updated_at))
-        text = f"<b>{self._t('bubble_working')}</b>\n" + "\n".join(
+        # Заголовок + реальная модель (после подмены прокси), если известна.
+        head = self._t("bubble_working")
+        if bubble.model:
+            head += f" · {html_escape(bubble.model)}"
+        text = f"<b>{head}</b>\n" + "\n".join(
             e.render() for e in bubble.entries
         )
         if bubble.pulse:
             # Спиннер-глагол внизу (перед временем) — «пульс жизни».
             sep = "\n" if bubble.entries else ""
-            text += f"{sep}✻ {bubble.pulse}"
-        if bubble.entries or bubble.pulse:
+            text += f"{sep}✻ {html_escape(bubble.pulse)}"
+        if bubble.entries or bubble.pulse or bubble.model:
             text += f"\n🕐 {updated}"
         return text
 
-    async def set_pulse(self, name: str, pulse: str) -> None:
-        """Обновить спиннер-глагол сессии (живой пульс). Создаёт бабл, если
-        его ещё нет (модель думает до первого тул-события). Только в активном
-        ходе; неизменный пульс не триггерит лишнюю правку."""
-        if name not in self._active or not pulse:
+    async def set_status(self, name: str, pulse: str = "", model: str = "") -> None:
+        """Обновить живой статус сессии: спиннер-глагол (pulse) и/или реальную
+        модель (model, после подмены прокси). Создаёт бабл, если его ещё нет
+        (модель думает до первого тул-события). Только в активном ходе;
+        неизменный статус не триггерит лишнюю правку."""
+        if name not in self._active:
             return
         bubble = self._bubbles.setdefault(name, Bubble())
-        if bubble.pulse == pulse:
+        changed = False
+        if pulse and bubble.pulse != pulse:
+            bubble.pulse = pulse
+            changed = True
+        if model and bubble.model != model:
+            bubble.model = model
+            changed = True
+        if not changed:
             return
-        bubble.pulse = pulse
         bubble.updated_at = time.time()
         if bubble.flush_task is None or bubble.flush_task.done():
             bubble.flush_task = asyncio.create_task(self._flush(name))
@@ -173,8 +187,10 @@ class BubbleManager:
         await asyncio.sleep(EDIT_INTERVAL)
         bubble = self._bubbles.get(name)
         session = self._get_session(name)
-        # Рендерим при наличии строк ИЛИ пульса (модель думает без тул-событий).
-        if bubble is None or session is None or (not bubble.entries and not bubble.pulse):
+        # Рендерим при наличии строк ИЛИ пульса/модели (живой статус без тулов).
+        if bubble is None or session is None or not (
+            bubble.entries or bubble.pulse or bubble.model
+        ):
             return
         text = self._render_text(bubble)
         if text == bubble.sent_text:

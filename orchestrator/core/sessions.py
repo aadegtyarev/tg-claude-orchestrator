@@ -1001,6 +1001,11 @@ class SessionManager:
         чтение — вызывать через asyncio.to_thread. Логика — transcript.py."""
         return transcript.read_stats(self.transcript_path(session))
 
+    def read_last_model(self, session: Session) -> str | None:
+        """Реальная модель последнего ответа (после подмены прокси) — дёшево
+        из хвоста транскрипта. Логика — transcript.read_last_model."""
+        return transcript.read_last_model(self.transcript_path(session))
+
     def read_pollution_excerpt(self, session: Session, max_entries: int = 25) -> str | None:
         """Эксцепт загрязнения чужим бэкендом из хвоста транскрипта (или None).
         Блокирующее чтение — вызывать через asyncio.to_thread. Логика —
