@@ -123,7 +123,19 @@ def bash_head(command: str) -> str:
     sub = parts[1] if len(parts) > 1 else ""
     if sub and not _WORD_ARG.match(sub):
         sub = ""  # флаг (-n), путь (/x) или кавычка (") — не интересно
-    body = f"{main} {sub}".strip()
+    # Хвост: первый ЗНАЧИМЫЙ аргумент (не флаг) — паттерн grep, файл, URL.
+    # Нужен, чтобы серия схлопнутых команд (6× grep разных паттернов) не
+    # выглядела застывшей: меняющийся хвост показывает, что модель реально
+    # перебирает разное, а не зависла на одном.
+    tail = ""
+    for tok in parts[1:]:
+        if tok.startswith("-"):
+            continue  # флаг
+        cleaned = tok.strip("\"'")
+        if cleaned and cleaned != sub:
+            tail = shorten(cleaned, 32)
+            break
+    body = " ".join(p for p in (main, sub, tail) if p)
     return f"{cd_dest} · {body}" if cd_dest else body
 
 

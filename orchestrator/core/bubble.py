@@ -154,8 +154,10 @@ class BubbleManager:
             e.render() for e in bubble.entries
         )
         if bubble.pulse:
-            # Спиннер-глагол внизу (перед временем) — «пульс жизни».
-            sep = "\n" if bubble.entries else ""
+            # Пульс жизни (спиннер-глагол · время · токены) — внизу, ОТДЕЛЁН
+            # пустой строкой от лога тулов: людям важно сразу видеть «жив и
+            # чем занят», не путая с потоком вызовов.
+            sep = "\n\n" if bubble.entries else ""
             text += f"{sep}✻ {html_escape(bubble.pulse)}"
         if bubble.entries or bubble.pulse or bubble.model:
             text += f"\n🕐 {updated}"

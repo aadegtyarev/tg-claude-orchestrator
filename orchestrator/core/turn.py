@@ -258,13 +258,16 @@ class TurnSupervisor:
             sig = detect_log_signals(chunk)
             now = loop_time()
 
-            # 0. Живой статус: спиннер-глагол (Cogitating…) + реальная модель
-            #    последнего ответа (после подмены прокси). Признак «модель жива»
-            #    и ЧЕМ отвечает, когда tool-событий нет (думает/ждёт API).
+            # 0. Живой статус: спиннер-глагол + время + токены (из TUI-лога) и
+            #    реальная модель (из транскрипта, после подмены прокси). Признак
+            #    «модель жива» и ЧЕМ занята, когда tool-событий нет (думает/ждёт).
             if sig["pulse"]:
                 try:
+                    pulse = sig["pulse"]
+                    if sig["tokens"]:
+                        pulse += f" · ↓{sig['tokens']} tok"
                     model = await asyncio.to_thread(self.manager.read_last_model, session)
-                    await self._status(name, pulse=sig["pulse"], model=model or "")
+                    await self._status(name, pulse=pulse, model=model or "")
                 except Exception as e:
                     logger.debug("status: %s", e)
 

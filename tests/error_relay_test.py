@@ -79,14 +79,15 @@ def main():
     assert rs["restarts"] == 2, rs["restarts"]
     print("OK detect: рестарт-баннеры считаются")
 
-    # живой пульс: спиннер-глагол Claude Code (активный «-ing…» приоритетнее)
-    assert _detect_log_signals("✻ Quantumizing…".encode())["pulse"] == "Quantumizing"
+    # живой пульс: глагол + время + токены (всё из TUI-спиннера)
+    s = _detect_log_signals("✻ Cogitating… (12s · ↓ 340 tokens)".encode())
+    assert s["pulse"] == "Cogitating · 12s" and s["tokens"] == 340, (s["pulse"], s["tokens"])
     assert _detect_log_signals("✻ Cogitated for 5m 57s".encode())["pulse"] == "Cogitated · 5m 57s"
     # активный побеждает завершённый в том же куске
     assert _detect_log_signals("Brewed for 1m 31s … Churning…".encode())["pulse"] == "Churning"
     # нет спиннера — None (не ложим прозу)
     assert _detect_log_signals("просто текст ответа модели".encode())["pulse"] is None
-    print("OK detect: пульс-глагол (active > done, без ложных)")
+    print("OK detect: пульс (глагол · время · токены; active > done, без ложных)")
 
     # quota-баннер БЕЗ 3-значного кода (Weekly/Monthly exhausted) — реальный noos
     q = _detect_log_signals(
