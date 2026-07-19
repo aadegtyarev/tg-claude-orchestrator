@@ -79,6 +79,28 @@ def main():
     assert rs["restarts"] == 2, rs["restarts"]
     print("OK detect: рестарт-баннеры считаются")
 
+    # живой пульс: спиннер-глагол Claude Code (активный «-ing…» приоритетнее)
+    assert _detect_log_signals("✻ Quantumizing…".encode())["pulse"] == "Quantumizing"
+    assert _detect_log_signals("✻ Cogitated for 5m 57s".encode())["pulse"] == "Cogitated · 5m 57s"
+    # активный побеждает завершённый в том же куске
+    assert _detect_log_signals("Brewed for 1m 31s … Churning…".encode())["pulse"] == "Churning"
+    # нет спиннера — None (не ложим прозу)
+    assert _detect_log_signals("просто текст ответа модели".encode())["pulse"] is None
+    print("OK detect: пульс-глагол (active > done, без ложных)")
+
+    # quota-баннер БЕЗ 3-значного кода (Weekly/Monthly exhausted) — реальный noos
+    q = _detect_log_signals(
+        ("API Error: Server is temporarily limiting requests (not your usage limit) "
+         "· [1310][Weekly/Monthly Limit Exhausted. Your limit will reset at "
+         "2026-07-23 07:17:46]").encode()
+    )
+    assert q["quota"] == "2026-07-23 07:17:46", q["quota"]
+    assert q["api_error"] is None  # 3-значного кода тут нет
+    # обычная 429 не попадает в quota, остаётся в api_error
+    q2 = _detect_log_signals(b"API Error: 429 rate limit exceeded")
+    assert q2["quota"] is None and q2["api_error"][1] == "ratelimit"
+    print("OK detect: лимит-баннер (quota+дата сброса), 429 не ложно-quota")
+
     print("ALL ERROR-RELAY OK")
 
 

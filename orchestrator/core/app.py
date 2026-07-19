@@ -81,7 +81,9 @@ class OrchestratorCore:
         self._last_tool: dict[str, str] = {}
         # Фоновые задачи хода (typing/watchdog/error-relay) и Stop-гейт —
         # единым владельцем (turn.py). Доставка — колбэками в адаптеры.
-        self.turns = TurnSupervisor(manager, self.t, self.notice, self._typing_any)
+        self.turns = TurnSupervisor(
+            manager, self.t, self.notice, self._typing_any, self.bubbles.set_pulse
+        )
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
         # Журнал событий per-сессия: показать историю в веб-интерфейсе после

@@ -67,6 +67,10 @@ class Bubble:
     # Ссылки на материализованные сообщения: имя адаптера -> ref адаптера.
     refs: dict[str, str] = field(default_factory=dict)
     entries: list[BubbleLine] = field(default_factory=list)
+    # «Живой пульс» — последний спиннер-глагол Claude Code (Cogitating…),
+    # обновляемая строка внизу бабла: видно, что модель жива, когда
+    # tool-событий нет (думает / ждёт API / фоновая задача).
+    pulse: str = ""
     sent_text: str = ""
     flush_task: asyncio.Task | None = None
     # Момент последнего добавления строки — метка «когда обновлено» в конце
@@ -142,16 +146,35 @@ class BubbleManager:
         text = f"<b>{self._t('bubble_working')}</b>\n" + "\n".join(
             e.render() for e in bubble.entries
         )
-        if bubble.entries:
+        if bubble.pulse:
+            # Спиннер-глагол внизу (перед временем) — «пульс жизни».
+            sep = "\n" if bubble.entries else ""
+            text += f"{sep}✻ {bubble.pulse}"
+        if bubble.entries or bubble.pulse:
             text += f"\n🕐 {updated}"
         return text
+
+    async def set_pulse(self, name: str, pulse: str) -> None:
+        """Обновить спиннер-глагол сессии (живой пульс). Создаёт бабл, если
+        его ещё нет (модель думает до первого тул-события). Только в активном
+        ходе; неизменный пульс не триггерит лишнюю правку."""
+        if name not in self._active or not pulse:
+            return
+        bubble = self._bubbles.setdefault(name, Bubble())
+        if bubble.pulse == pulse:
+            return
+        bubble.pulse = pulse
+        bubble.updated_at = time.time()
+        if bubble.flush_task is None or bubble.flush_task.done():
+            bubble.flush_task = asyncio.create_task(self._flush(name))
 
     async def _flush(self, name: str) -> None:
         # Коалесцируем всплеск событий в одну правку сообщения.
         await asyncio.sleep(EDIT_INTERVAL)
         bubble = self._bubbles.get(name)
         session = self._get_session(name)
-        if bubble is None or not bubble.entries or session is None:
+        # Рендерим при наличии строк ИЛИ пульса (модель думает без тул-событий).
+        if bubble is None or session is None or (not bubble.entries and not bubble.pulse):
             return
         text = self._render_text(bubble)
         if text == bubble.sent_text:
