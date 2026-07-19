@@ -49,6 +49,9 @@ class WebAdapter:
         # ref статус-бабла — просто счётчик: клиенту важна только уникальность
         # в рамках процесса, само состояние бабла держит ядро.
         self._bubble_seq = itertools.count(1)
+        # Последнее состояние бабла на сессию — для /bubble (снапшот при
+        # переключении/реконнекте): {ref, html, stop_button}.
+        self._bubble_state: dict[str, dict] = {}
         self._runner: web.AppRunner | None = None
         self.app = self._build_app()
 
@@ -144,6 +147,12 @@ class WebAdapter:
         self, session: Session, html: str, *, stop_button: bool
     ) -> str | None:
         ref = str(next(self._bubble_seq))
+        # Запоминаем последнее состояние бабла: клиент, переключившийся на
+        # работающую сессию (или переподключившийся), запросит его через
+        # /bubble — иначе бабл и кнопки ⏹/⛔ были бы невидимы до след. события.
+        self._bubble_state[session.name] = {
+            "ref": ref, "html": html, "stop_button": stop_button,
+        }
         await self._broadcast({
             "type": "bubble", "session": session.name, "ref": ref,
             "html": html, "stop_button": stop_button,
@@ -153,17 +162,22 @@ class WebAdapter:
     async def bubble_edit(
         self, session: Session, ref: str, html: str, *, stop_button: bool
     ) -> None:
+        self._bubble_state[session.name] = {
+            "ref": ref, "html": html, "stop_button": stop_button,
+        }
         await self._broadcast({
             "type": "bubble", "session": session.name, "ref": ref,
             "html": html, "stop_button": stop_button,
         })
 
     async def bubble_finish(self, session: Session, ref: str, *, delete: bool) -> None:
+        self._bubble_state.pop(session.name, None)
         await self._broadcast({
             "type": "bubble_close", "session": session.name, "ref": ref, "delete": delete,
         })
 
     async def bubble_freeze(self, session: Session, ref: str) -> None:
+        self._bubble_state.pop(session.name, None)
         await self._broadcast({
             "type": "bubble_freeze", "session": session.name, "ref": ref,
         })
@@ -203,6 +217,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/stop", self.h_stop)
         r.add_post("/api/sessions/{name}/interrupt", self.h_interrupt)
         r.add_post("/api/sessions/{name}/model", self.h_model)
+        r.add_get("/api/sessions/{name}/bubble", self.h_bubble)
         r.add_get("/api/sessions/{name}/stats", self.h_stats)
         r.add_get("/api/sessions/{name}/usage", self.h_usage)
         r.add_get("/api/sessions/{name}/history", self.h_history)
@@ -450,6 +465,15 @@ class WebAdapter:
         except UserError as e:
             return self._err(str(e))  # остановленная сессия и т.п.
         return web.json_response({"text": text})  # null — распарсить не удалось
+
+    async def h_bubble(self, request: web.Request) -> web.Response:
+        """Снапшот активного статус-бабла (или null) — клиент запрашивает при
+        переключении/реконнекте, иначе бабл и кнопки ⏹/⛔ невидимы до
+        следующего события."""
+        session = self._session_of(request)
+        if session is None:
+            return self._err("session not found", 404)
+        return web.json_response(self._bubble_state.get(session.name))
 
     async def h_history(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
