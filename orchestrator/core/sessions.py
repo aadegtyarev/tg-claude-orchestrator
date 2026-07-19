@@ -484,6 +484,16 @@ class SessionManager:
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
             # и настройки бота подсасываем флагами ниже (consent не просят).
             cwd = str(self.effective_cwd(session))
+            # Подсказка: под bwrap $HOME процесса подменён приватным домом
+            # сессии, поэтому реальный ~/.venv и глобальные инструменты не видны —
+            # окружение проекта держи В ПРОЕКТЕ (он смонтирован RW). Персистентный
+            # дом (.homes/<имя>) переживает рестарты, если агент ставит в ~.
+            if self.config.sandbox == "bwrap" and session.linked_path:
+                logger.info(
+                    "Сессия %s: под bwrap $HOME изолирован (реальный ~/.venv не "
+                    "виден) — держи окружение в проекте %s (RW) или в ~ сессии "
+                    "(персистентный дом)", session.name, session.linked_path,
+                )
             extra: list[str] = []
             mcp_json = session.session_dir / ".mcp.json"
             if mcp_json.exists():
@@ -886,20 +896,32 @@ class SessionManager:
         ) as resp:
             resp.raise_for_status()
 
+    def _send_raw(self, session: Session, data: bytes) -> None:
+        """Записать сырые байты (управляющие коды) прямо в PTY claude."""
+        if session.pty_master is None or not session.running:
+            raise SessionError("Сессия не запущена.")
+        try:
+            os.write(session.pty_master, data)
+        except OSError as e:
+            raise SessionError(f"Терминал сессии недоступен: {e}") from e
+
     def interrupt_turn(self, session: Session) -> None:
-        """Жёстко прервать текущий ход: Esc прямо в PTY-терминал Claude.
+        """Жёстко прервать текущий ход: Esc (\\x1b) в PTY-терминал Claude.
 
         В channels-протоколе прерывания нет, но интерактивный claude живёт под
         нашим PTY — байт \\x1b эквивалентен нажатию Esc в TUI и обрывает ход
         немедленно (в отличие от «мягкого стопа» push-сообщением, которое
         модель прочитает только когда доберётся). Контекст сессии сохраняется.
         """
-        if session.pty_master is None or not session.running:
-            raise SessionError("Сессия не запущена.")
-        try:
-            os.write(session.pty_master, b"\x1b")
-        except OSError as e:
-            raise SessionError(f"Терминал сессии недоступен: {e}") from e
+        self._send_raw(session, b"\x1b")
+
+    def background_turn(self, session: Session) -> None:
+        """Отправить текущую задачу в фон: Ctrl+B (\\x02) в PTY.
+
+        В TUI Claude Code Ctrl+B переводит долгую задачу (bash-команду) в фон —
+        ход продолжается, не блокируясь на ней. Эквивалент нажатия Ctrl+B в
+        терминале сессии."""
+        self._send_raw(session, b"\x02")
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""

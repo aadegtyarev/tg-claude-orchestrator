@@ -369,6 +369,16 @@ class OrchestratorCore:
         self._record(session, "status", status="interrupted")
         await self.notice(session, self.t("esc_done"))
 
+    async def background(self, session: Session) -> None:
+        """Отправить текущую задачу в фон: Ctrl+B в PTY (не прерывает ход —
+        долгая команда уходит в фон, модель продолжает). Бабл/сторожей НЕ
+        гасим: ход живой."""
+        try:
+            self.manager.background_turn(session)
+        except SessionError as e:
+            raise UserError(str(e)) from e
+        await self.bubbles.append(session.name, self.t("bubble_backgrounded"))
+
     async def slash_command(self, session: Session, cmd: str) -> None:
         """Неизвестные /команды — прямо в терминал Claude (команды Claude Code)."""
         try:

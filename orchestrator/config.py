@@ -64,6 +64,7 @@ class Config:
     claude_env: dict[str, str]  # доп. env для процесса claude (CLAUDE_ENV_*)
     sandbox: str  # "bwrap" (файловая песочница) | "agent-vm" (microVM) | "off"
     sandbox_extra_rw: tuple[Path, ...]  # доп. пути, доступные из песочницы на запись
+    sandbox_dbus: bool  # прокидывать ли system D-Bus для mDNS/avahi-browse (bwrap)
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
     agent_vm_memory_gib: float | None
     agent_vm_cpus: int | None
@@ -140,6 +141,10 @@ class Config:
             # отключает (нужно на машинах без bwrap/без unprivileged userns).
             sandbox=cls._parse_sandbox(os.getenv("SANDBOX", "bwrap")),
             sandbox_extra_rw=cls._parse_paths(os.getenv("SANDBOX_EXTRA_RW", "")),
+            # mDNS/локальная сеть через system D-Bus. По умолчанию включено
+            # (полезно: агент видит .local-хосты и сервисы), off — запретить
+            # доступ к system D-Bus из песочницы.
+            sandbox_dbus=cls._parse_bool(os.getenv("SANDBOX_DBUS", "true")),
             agent_vm_memory_gib=(
                 float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
             ),

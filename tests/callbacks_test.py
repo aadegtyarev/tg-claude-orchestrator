@@ -70,6 +70,9 @@ class FakeCore:
     async def hard_stop(self, s):
         calls.append(("esc_sent",))
 
+    async def background(self, s):
+        calls.append(("bg_sent",))
+
     def stats_text(self, s):
         return "stats"
 
@@ -135,6 +138,11 @@ async def main():
     await a.on_esc_button(cb("esc:7"))
     assert ("esc_sent",) in calls
     print("OK on_esc_button (жёсткое прерывание)")
+
+    calls.clear()
+    await a.on_bg_button(cb("bg:7"))
+    assert ("bg_sent",) in calls
+    print("OK on_bg_button (Ctrl+B в фон)")
 
     calls.clear()
     await a.on_esc_button(cb("esc:7", uid=999))  # чужой
