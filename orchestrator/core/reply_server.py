@@ -1,6 +1,6 @@
 """HTTP-сервер оркестратора.
 
-POST /reply         — ответы Claude (тул reply_to_telegram через channel_server)
+POST /reply         — ответы Claude (тул reply_to_user через channel_server)
 POST /event/{name}  — события PreToolUse-хука Claude Code (вызовы инструментов)
 POST /stop/{name}   — конец хода (Stop-хук) — фолбэк на «потерянный финал»
 """
@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from .config import Config
+from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,10 @@ async def start_reply_server(
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="127.0.0.1", port=config.orch_port)
+    # Слушаем на ORCH_HOST, а не хардкод 127.0.0.1: под agent-vm канал/хуки
+    # из гостя достучатся до хоста только если сервер слушает на адресе
+    # host-gateway (для bwrap/локального режима ORCH_HOST=127.0.0.1 как раньше).
+    site = web.TCPSite(runner, host=config.orch_host, port=config.orch_port)
     await site.start()
-    logger.info("Reply-сервер слушает 127.0.0.1:%d", config.orch_port)
+    logger.info("Reply-сервер слушает %s:%d", config.orch_host, config.orch_port)
     return runner

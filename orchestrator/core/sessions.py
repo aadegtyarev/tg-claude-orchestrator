@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pty
+import shutil
 import socket
 import sys
 import threading
@@ -32,18 +33,18 @@ from typing import IO, Awaitable, Callable
 import aiohttp
 
 from . import hookscript
-from . import runner as runner_mod
 from . import transcript
 from .ansi import strip_ansi
-from .config import Config
 from .proctree import proc_tree_signals
-from .slug import slugify  # реэкспорт: бот и тесты ждут sessions.slugify
+from .slug import slugify  # реэкспорт: адаптеры и тесты ждут sessions.slugify
+from .. import runners as runner_mod
+from ..config import Config
 
 logger = logging.getLogger(__name__)
 
-# Каталог пакета (channel_server.py) и корень репозитория (.venv, RO-бинд
-# песочницы) — после раскладки по папкам это разные пути.
-PKG_DIR = Path(__file__).resolve().parent
+# Каталог пакета orchestrator/ (channel_server.py) и корень репозитория
+# (.venv, RO-бинд песочницы) — этот модуль лежит в orchestrator/core/.
+PKG_DIR = Path(__file__).resolve().parent.parent
 ROOT = PKG_DIR.parent
 
 # Сколько ждать, пока Claude стартует и поднимет channel-сервер.
@@ -112,12 +113,14 @@ def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
 
 @dataclass
 class Session:
-    name: str  # slug: папка, MCP-ключ, хук, get_by_name — только [A-Za-z0-9_-]
-    thread_id: int
+    name: str  # slug: первичный ключ, папка, MCP-ключ, хук — только [A-Za-z0-9_-]
     port: int
     session_dir: Path
     claude_session_id: str
     title: str = ""  # отображаемое имя (топик, сообщения); по умолчанию = name
+    # Адреса сессии в транспорт-адаптерах: имя адаптера -> непрозрачная строка
+    # (Telegram: id форум-топика). Заполняется ядром через Transport.bind_session.
+    bindings: dict[str, str] = field(default_factory=dict)
     linked_path: str | None = None
     model: str | None = None  # None = модель Claude Code по умолчанию
     started_at: float = field(default_factory=time.time)
@@ -143,8 +146,8 @@ class SessionManager:
 
     def __init__(self, config: Config):
         self.config = config
-        self._lock = asyncio.Lock()  # защищает _by_thread и выдачу портов
-        self._by_thread: dict[int, Session] = {}
+        self._lock = asyncio.Lock()  # защищает _by_name и выдачу портов
+        self._by_name: dict[str, Session] = {}
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
         # Общий HTTP-пул к channel-серверам (keep-alive, без сессии на запрос —
@@ -174,7 +177,7 @@ class SessionManager:
         items = [
             {
                 "name": s.name,
-                "thread_id": s.thread_id,
+                "bindings": s.bindings,
                 "cwd": str(s.session_dir),
                 "port": s.port,
                 "claude_session_id": s.claude_session_id,
@@ -182,7 +185,7 @@ class SessionManager:
                 "linked_path": s.linked_path,
                 "model": s.model,
             }
-            for s in self._by_thread.values()
+            for s in self._by_name.values()
         ]
         state_file = self.config.sessions_dir / ".sessions.json"
         tmp = state_file.with_suffix(".json.tmp")
@@ -199,9 +202,14 @@ class SessionManager:
             logger.error("Не удалось прочитать %s: %s", state_file, e)
             return
         for item in items:
+            # Миграция старого формата (до мульти-адаптеров): thread_id топика
+            # Telegram становится binding'ом telegram-адаптера.
+            bindings = dict(item.get("bindings") or {})
+            if "thread_id" in item and "telegram" not in bindings:
+                bindings["telegram"] = str(item["thread_id"])
             session = Session(
                 name=item["name"],
-                thread_id=item["thread_id"],
+                bindings=bindings,
                 port=item.get("port", 0),
                 session_dir=Path(item["cwd"]),
                 claude_session_id=item["claude_session_id"],
@@ -209,33 +217,39 @@ class SessionManager:
                 linked_path=item.get("linked_path"),
                 model=item.get("model"),
             )
-            self._by_thread[session.thread_id] = session
+            self._by_name[session.name] = session
             logger.info("Восстановлена запись сессии %s (остановлена)", session.name)
 
     # ── чтение (без блокировки: единственный поток event loop) ──
 
-    def get(self, thread_id: int) -> Session | None:
-        return self._by_thread.get(thread_id)
+    def get(self, name: str) -> Session | None:
+        return self._by_name.get(name)
+
+    # Синоним для явности в местах, где имя приходит извне (хуки, URL).
+    get_by_name = get
 
     def list_all(self) -> list[Session]:
-        return list(self._by_thread.values())
+        return list(self._by_name.values())
 
     def count(self) -> int:
-        return len(self._by_thread)
-
-    def get_by_name(self, name: str) -> Session | None:
-        return next((s for s in self._by_thread.values() if s.name == name), None)
+        return len(self._by_name)
 
     def has_name(self, name: str) -> bool:
-        return self.get_by_name(name) is not None
+        return name in self._by_name
+
+    def get_by_binding(self, adapter: str, address: str) -> Session | None:
+        """Сессия по адресу в адаптере (Telegram: id топика)."""
+        return next(
+            (s for s in self._by_name.values() if s.bindings.get(adapter) == address),
+            None,
+        )
 
     # ── создание ────────────────────────────────────────────────
 
-    async def create(self, title: str, thread_id: int, project_path: str | None = None) -> Session:
+    async def create(self, title: str, project_path: str | None = None) -> Session:
         slug = slugify(title)
         session = Session(
             name=slug,
-            thread_id=thread_id,
             port=0,
             session_dir=self.config.sessions_dir / slug,
             claude_session_id=str(uuid.uuid4()),
@@ -247,7 +261,7 @@ class SessionManager:
             async with self._lock:
                 if self.has_name(slug):
                     raise SessionError(f"Сессия «{slug}» уже существует.")
-                if len(self._by_thread) >= self.config.max_instances:
+                if len(self._by_name) >= self.config.max_instances:
                     raise SessionError(
                         f"Достигнут лимит сессий ({self.config.max_instances})."
                     )
@@ -255,12 +269,13 @@ class SessionManager:
                 if port is None:
                     raise SessionError("Нет свободных портов для channel-сервера.")
                 session.port = port
-                self._by_thread[thread_id] = session
+                self._by_name[slug] = session
 
             try:
                 session.session_dir.mkdir(parents=True, exist_ok=True)
                 if project_path:
                     session.linked_path = self._link_project(project_path)
+                self._guard_unique_cwd(session)
                 self._write_mcp_json(session)
                 self._write_claude_settings(session)
                 await self._start_claude(session)
@@ -268,13 +283,32 @@ class SessionManager:
             except Exception:
                 await self._terminate(session)
                 async with self._lock:
-                    self._by_thread.pop(thread_id, None)
+                    self._by_name.pop(slug, None)
                 self.save_state()
                 raise
 
             self._start_watcher(session)
             self.save_state()
             return session
+
+    def _guard_unique_cwd(self, session: Session) -> None:
+        """Раннеры с unique_cwd (agent-vm: имя VM = hash(cwd)) не допускают
+        двух сессий на один рабочий каталог — вторая молча убила бы VM первой."""
+        if not getattr(self.runner, "unique_cwd", False):
+            return
+        cwd = self.effective_cwd(session)
+        clash = next(
+            (
+                s for s in self._by_name.values()
+                if s is not session and self.effective_cwd(s) == cwd
+            ),
+            None,
+        )
+        if clash is not None:
+            raise SessionError(
+                f"Раннер «{self.runner.name}» допускает одну сессию на каталог: "
+                f"{cwd} уже занят сессией «{clash.name}»."
+            )
 
     def _find_free_port(self) -> int | None:
         lo, hi = self.config.channel_port_start, self.config.channel_port_end
@@ -285,7 +319,7 @@ class SessionManager:
                 return s.getsockname()[1]
         # Фиксированный пул: порт остановленной сессии уже свободен (процесс
         # убит) — учитываем только работающие, иначе resume ложно упадёт.
-        used = {sess.port for sess in self._by_thread.values() if sess.running}
+        used = {sess.port for sess in self._by_name.values() if sess.running}
         for port in range(lo, hi + 1):
             if port in used:
                 continue
@@ -317,7 +351,7 @@ class SessionManager:
         """
         mcp = {
             "mcpServers": {
-                f"tg-channel-{session.name}": {
+                f"channel-{session.name}": {
                     "command": sys.executable,
                     "args": [str(PKG_DIR / "channel_server.py")],
                     "env": {
@@ -349,7 +383,7 @@ class SessionManager:
           /event/<имя> → статус-бабл;
         - Stop-хук (всегда): конец хода → POST /stop/<имя> с
           last_assistant_message → фолбэк, если ход завершился голым текстом
-          вместо reply_to_telegram (REVIEW: 9/9 длинных ходов в живой сессии
+          вместо reply_to_user (REVIEW: 9/9 длинных ходов в живой сессии
           теряли финал именно так — см. bot.py handle_stop_event).
           Оба события ловит один скрипт-диспетчер (hookscript.py), никогда не
           блокирует Claude (except+exit 0).
@@ -362,14 +396,14 @@ class SessionManager:
         perms: dict = {
             "deny": ["AskUserQuestion"],  # интерактивный вопрос-меню — под ботом
             # виснет без TUI-клика; Claude получит «tool not allowed» и (по
-            # системному промпту) переспросит через reply_to_telegram.
+            # системному промпту) переспросит через reply_to_user.
             # Внимание: в режиме bypass проверки разрешений нет — там страж
             # только системный промпт.
         }
         if self.config.permission_mode != "bypass":
             perms["allow"] = [
-                f"mcp__tg-channel-{session.name}__reply_to_telegram",
-                f"mcp__tg-channel-{session.name}__send_file_to_telegram",
+                f"mcp__channel-{session.name}__reply_to_user",
+                f"mcp__channel-{session.name}__send_file_to_user",
             ]
         settings["permissions"] = perms
 
@@ -398,6 +432,9 @@ class SessionManager:
         """
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        # CLI-обвязка оркестратора (bin/wallet и т.п.): репозиторий RO-виден
+        # и в песочнице, поэтому PATH работает и там.
+        env["PATH"] = f"{ROOT / 'bin'}:{env.get('PATH', '')}"
         if self.config.claude_config_dir is not None:
             env["CLAUDE_CONFIG_DIR"] = str(self.config.claude_config_dir)
         # Явные переменные для Claude Code (CLAUDE_ENV_ANTHROPIC_BASE_URL=…
@@ -454,10 +491,12 @@ class SessionManager:
                     *session_arg,
                     *extra,
                     "--dangerously-load-development-channels",
-                    f"server:tg-channel-{session.name}",
+                    f"server:channel-{session.name}",
                 ],
                 chdir=Path(cwd),
                 extra_rw=extra_rw,
+                home_dir=self.session_home(session),
+                publish_ports=[session.port],
             )
             session.process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -530,12 +569,18 @@ class SessionManager:
             self.save_state()
 
     async def delete(self, session: Session) -> None:
-        """Полностью удалить сессию (процесс + запись)."""
+        """Полностью удалить сессию (процесс + запись + приватный дом)."""
         async with session.ops:
             async with self._lock:
-                self._by_thread.pop(session.thread_id, None)
+                self._by_name.pop(session.name, None)
                 self._cpu.pop(session.name, None)
             await self._stop_process(session)
+            # Приватный дом песочницы: без удаления /new с тем же slug
+            # унаследовал бы прежний $HOME (ключи, ~/.wallet.json, ~/.bashrc-
+            # foothold) и каталоги копились бы вечно.
+            home = self.config.sessions_dir / ".homes" / session.name
+            if home.is_dir():
+                await asyncio.to_thread(shutil.rmtree, home, ignore_errors=True)
             self.save_state()
 
     async def resume(self, session: Session) -> bool:
@@ -551,6 +596,10 @@ class SessionManager:
             return await self._resume_locked(session)
 
     async def _resume_locked(self, session: Session) -> bool:
+        # Раннеры с unique_cwd (agent-vm): гвард нужен и на resume/clear, не
+        # только на create — иначе восстановленные из .sessions.json две сессии
+        # на один cwd убьют VM друг друга при первом сообщении.
+        self._guard_unique_cwd(session)
         async with self._lock:
             port = self._find_free_port()
             if port is None:
@@ -653,7 +702,7 @@ class SessionManager:
         code = await proc.wait()
         if session.process is not proc:
             return  # процесс уже заменён resume/clear — не наш клиент
-        if self._by_thread.get(session.thread_id) is not session:
+        if self._by_name.get(session.name) is not session:
             return  # уже удалена
         session.process = None
         session.watcher = None
@@ -777,11 +826,19 @@ class SessionManager:
         before = log.stat().st_size if log.exists() else 0
         self.type_into_pty(session, cmd)
         await asyncio.sleep(wait)
-        try:
-            raw = log.read_bytes()[before:]
-        except OSError:
-            return ""
-        return strip_ansi(raw).decode(errors="replace")
+
+        def _read_delta() -> str:
+            # Читаем приращение через seek, а не весь файл в память (лог под
+            # LOG_MAX_MB — десятки МБ); в потоке, чтобы не стопорить event loop.
+            try:
+                with open(log, "rb") as fh:
+                    fh.seek(before)
+                    raw = fh.read()
+            except OSError:
+                return ""
+            return strip_ansi(raw).decode(errors="replace")
+
+        return await asyncio.to_thread(_read_delta)
 
     async def close_idle(self) -> list[Session]:
         """Остановить работающие сессии, простаивавшие дольше IDLE_TIMEOUT_H.
@@ -810,6 +867,21 @@ class SessionManager:
             headers=self._channel_headers(),
         ) as resp:
             resp.raise_for_status()
+
+    def interrupt_turn(self, session: Session) -> None:
+        """Жёстко прервать текущий ход: Esc прямо в PTY-терминал Claude.
+
+        В channels-протоколе прерывания нет, но интерактивный claude живёт под
+        нашим PTY — байт \\x1b эквивалентен нажатию Esc в TUI и обрывает ход
+        немедленно (в отличие от «мягкого стопа» push-сообщением, которое
+        модель прочитает только когда доберётся). Контекст сессии сохраняется.
+        """
+        if session.pty_master is None or not session.running:
+            raise SessionError("Сессия не запущена.")
+        try:
+            os.write(session.pty_master, b"\x1b")
+        except OSError as e:
+            raise SessionError(f"Терминал сессии недоступен: {e}") from e
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""
@@ -848,12 +920,29 @@ class SessionManager:
             self._runner = r
         return r
 
-    def sandbox_prefix(self, chdir: Path, extra_rw: list[Path]) -> list[str]:
+    def session_home(self, session: Session) -> Path:
+        """Персистентный приватный $HOME сессии для песочницы.
+
+        Живёт в SESSIONS_DIR/.homes/<имя> (вне папки сессии, чтобы не
+        светиться в её RW-бинде вторым путём): venv/кэши, которые агент
+        кладёт «к себе домой», переживают рестарты — в отличие от прежнего
+        tmpfs. Каталог создаётся здесь же (раннеру нужен существующий путь).
+        """
+        home = self.config.sessions_dir / ".homes" / session.name
+        home.mkdir(parents=True, exist_ok=True)
+        return home
+
+    def sandbox_prefix(
+        self, chdir: Path, extra_rw: list[Path], session: Session | None = None
+    ) -> list[str]:
         """Префикс argv для запуска команды в изоляции текущего раннера.
 
-        Пусто при SANDBOX=off. Политика allowlist — в runner.BwrapRunner.
+        Пусто при SANDBOX=off. Политика allowlist — в runners.bwrap.
+        session задана — команда получает тот же персистентный $HOME, что и
+        claude этой сессии (/bash видит venv, который агент себе поставил).
         """
-        return self.runner.wrap([], chdir=chdir, extra_rw=extra_rw)
+        home_dir = self.session_home(session) if session is not None else None
+        return self.runner.wrap([], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir)
 
     def transcript_path(self, session: Session) -> Path:
         """Транскрипт сессии в профиле Claude Code (см. transcript.py)."""

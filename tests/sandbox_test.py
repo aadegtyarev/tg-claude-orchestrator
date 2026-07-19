@@ -18,9 +18,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from orchestrator import sandbox  # noqa: E402
-from orchestrator.bashshell import BashSession  # noqa: E402
-from orchestrator.sessions import SessionManager  # noqa: E402
+from orchestrator.runners import sandbox  # noqa: E402
+from orchestrator.core.bashshell import BashSession  # noqa: E402
+from orchestrator.core.sessions import SessionManager  # noqa: E402
 
 
 def test_build_argv_order():
@@ -45,7 +45,22 @@ def test_build_argv_order():
         assert flag in argv, flag
     # сеть НЕ изолируется (нужна для API/localhost)
     assert "--unshare-net" not in argv
-    print("OK build_argv: порядок tmpfs<RO<RW, die-with-parent, сеть общая")
+    # DNS при systemd-resolved: цель симлинка /etc/resolv.conf возвращена в /run
+    assert "--ro-bind-try /run/systemd/resolve /run/systemd/resolve" in s
+    print("OK build_argv: порядок tmpfs<RO<RW, die-with-parent, сеть общая, DNS-бинд")
+
+
+def test_build_argv_persistent_home():
+    home = Path("/home/tester")
+    argv = sandbox.build_argv(
+        home=home, chdir=home / "proj", rw_paths=[], ro_paths=[],
+        home_dir=Path("/data/homes/sess"),
+    )
+    s = " ".join(argv)
+    # Персистентный дом монтируется НА МЕСТО $HOME вместо tmpfs.
+    assert "--bind /data/homes/sess /home/tester" in s
+    assert f"--tmpfs {home}" not in s
+    print("OK build_argv: персистентный $HOME вместо tmpfs")
 
 
 def _mgr(mode: str) -> SessionManager:
@@ -115,6 +130,26 @@ def test_real_isolation():
             print("OK real_isolation: cwd пишется, ~/.ssh скрыт, записи в $HOME не текут на диск")
         finally:
             sh.close()
+        # Персистентный дом: запись в ~ остаётся в home_dir и переживает шелл.
+        priv = work / "privhome"
+        priv.mkdir()
+        wrapper2 = sandbox.build_argv(
+            home=home, chdir=work, rw_paths=[work],
+            ro_paths=[home / ".local"], home_dir=priv,
+        )
+        sh2 = BashSession(work, wrapper2)
+        try:
+            sh2.write("echo -n kept > ~/kept.txt; echo PHDONE\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if b"PHDONE" in sh2.snapshot():
+                    break
+                time.sleep(0.3)
+        finally:
+            sh2.close()
+        assert (priv / "kept.txt").read_text() == "kept", "персистентный $HOME не сохранил файл"
+        assert not (home / "kept.txt").exists(), "УТЕЧКА в реальный $HOME"
+        print("OK real_isolation: персистентный $HOME сохраняет записи")
     finally:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
@@ -123,6 +158,7 @@ def test_real_isolation():
 
 def main():
     test_build_argv_order()
+    test_build_argv_persistent_home()
     test_prefix_off_empty()
     test_prefix_allowlist()
     test_real_isolation()

@@ -116,32 +116,41 @@ class BashSession:
 
 
 class BashShellManager:
-    """thread_id -> BashSession. Одна оболочка на топик, создаётся лениво."""
+    """ключ -> BashSession. Одна оболочка на ключ, создаётся лениво.
+
+    Ключи даёт ядро (OrchestratorCore.bash_key): "s:<имя-сессии>:<scope>" для
+    оболочек сессии (scope — контекст адаптера) и "main:<scope>" вне сессий.
+    """
 
     def __init__(self) -> None:
-        self._sessions: dict[int, BashSession] = {}
+        self._sessions: dict[str, BashSession] = {}
 
     def get_or_create(
-        self, thread_id: int, cwd: Path, wrapper: list[str] | None = None
+        self, key: str, cwd: Path, wrapper: list[str] | None = None
     ) -> BashSession:
-        sess = self._sessions.get(thread_id)
+        sess = self._sessions.get(key)
         if sess is None or not sess.running:
             sess = BashSession(cwd, wrapper)
-            self._sessions[thread_id] = sess
-            logger.info("bash-терминал открыт (топик %s, cwd %s)", thread_id, cwd)
+            self._sessions[key] = sess
+            logger.info("bash-терминал открыт (%s, cwd %s)", key, cwd)
         return sess
 
-    def get(self, thread_id: int) -> BashSession | None:
-        sess = self._sessions.get(thread_id)
+    def get(self, key: str) -> BashSession | None:
+        sess = self._sessions.get(key)
         return sess if sess is not None and sess.running else None
 
-    def close(self, thread_id: int) -> None:
-        sess = self._sessions.pop(thread_id, None)
+    def close(self, key: str) -> None:
+        sess = self._sessions.pop(key, None)
         if sess is not None:
             sess.close()
-            logger.info("bash-терминал закрыт (топик %s)", thread_id)
+            logger.info("bash-терминал закрыт (%s)", key)
+
+    def close_for_session(self, name: str) -> None:
+        """Закрыть все оболочки сессии (все адаптеры) — при её остановке."""
+        for key in [k for k in self._sessions if k.startswith(f"s:{name}:")]:
+            self.close(key)
 
     def close_all(self) -> None:
-        """Прибрать все bash-оболочки (остановка launcher'а)."""
-        for tid in list(self._sessions):
-            self.close(tid)
+        """Прибрать все bash-оболочки (остановка оркестратора)."""
+        for key in list(self._sessions):
+            self.close(key)

@@ -7,7 +7,7 @@ Raw JSON-RPC, а не MCP SDK: SDK не умеет push-уведомления �
 
 Потоки данных:
   launcher ──HTTP POST /notify──> этот процесс ──JSON-RPC push──> Claude
-  Claude ──tools/call reply_to_telegram──> этот процесс ──HTTP POST /reply──> launcher
+  Claude ──tools/call reply_to_user──> этот процесс ──HTTP POST /reply──> launcher
 """
 
 from __future__ import annotations
@@ -50,22 +50,23 @@ CAPABILITIES = {
 
 # Попадает в системный промпт Claude (поле instructions в initialize).
 INSTRUCTIONS = (
-    f'Messages from Telegram arrive as <channel source="tg-channel-{SESSION_NAME}" '
-    'context_id="tg:...">text</channel>. Always reply with the reply_to_telegram '
+    f'Messages from the user arrive as <channel source="channel-{SESSION_NAME}" '
+    'context_id="...">text</channel>. The channel connects you to the user\'s '
+    "chat (Telegram, web console, ...). Always reply with the reply_to_user "
     "tool, passing the context_id attribute exactly as received. Use "
     "complete=false for short intermediate progress updates while you work and "
     "complete=true exactly once with the final answer.\n"
     "CRITICAL: plain text you write is INVISIBLE to the user — this channel "
-    "only relays explicit reply_to_telegram tool calls, nothing else. If you "
-    "stop working (end your turn) without having called reply_to_telegram since "
+    "only relays explicit reply_to_user tool calls, nothing else. If you "
+    "stop working (end your turn) without having called reply_to_user since "
     "your last one, whatever you were thinking never reaches the user, even if "
     "it reads like a message to them (\"I'll continue once CI is green\", \"done "
     "for now\"). Before ending ANY turn — including turns that end while you're "
     "waiting on a background command, a CI run, or another async condition — "
-    "call reply_to_telegram one more time (complete=false if you'll keep going "
+    "call reply_to_user one more time (complete=false if you'll keep going "
     "when it resolves, complete=true if you're truly done) to state where things "
     "stand. Never let a turn end on bare text.\n"
-    "The user only sees your tool calls and reply_to_telegram messages — nothing "
+    "The user only sees your tool calls and reply_to_user messages — nothing "
     "else. A long silent stretch (reading files, thinking, running a slow "
     "command) looks identical to being stuck from their side. So: right after "
     "you receive a message, send one short complete=false line — what you "
@@ -78,24 +79,24 @@ INSTRUCTIONS = (
     "Keep these updates and any status check-in answers (e.g. \"how's it "
     "going?\", \"что как?\") brief — one or two sentences. The user wants a "
     "quick pulse, not an essay; save detail for the final answer.\n"
-    "send_file_to_telegram is ONLY for when the user explicitly asks you to send "
+    "send_file_to_user is ONLY for when the user explicitly asks you to send "
     "them a file, image, or artifact. Files you create or edit while working stay "
-    "in the project — do NOT push them to Telegram automatically. When you write "
-    "code or files, just report what you did via reply_to_telegram; attach a file "
+    "in the project — do NOT push them to the chat automatically. When you write "
+    "code or files, just report what you did via reply_to_user; attach a file "
     "only on explicit request (\"send me the file\", \"скинь файл\").\n"
     "You have NO interactive terminal — the user is only reachable through this "
     "channel. Never use plan mode, ExitPlanMode, or interactive question tools "
     "like AskUserQuestion: they would block invisibly. When you need a decision "
-    "or clarification, ask the user via reply_to_telegram (list options as "
+    "or clarification, ask the user via reply_to_user (list options as "
     "numbered choices) and stop your turn; the user's answer arrives as the next "
     "channel message. Permission prompts are handled automatically — just proceed."
 )
 
 TOOLS = [
     {
-        "name": "reply_to_telegram",
+        "name": "reply_to_user",
         "description": (
-            "Send a Telegram reply for a message received via this channel. "
+            "Send the user a reply for a message received via this channel. "
             "Use complete=false liberally for short intermediate progress "
             "updates while you work — each one is sent as its own message, so "
             "the user can see you're alive and what you're doing/finding, not "
@@ -110,12 +111,12 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Context ID from the incoming notification "
-                        "(e.g. tg:12345:678:90). REQUIRED — pass it exactly as received."
+                        "(e.g. telegram:demo:123:45:6). REQUIRED — pass it exactly as received."
                     ),
                 },
                 "text": {
                     "type": "string",
-                    "description": "Reply text to send to Telegram.",
+                    "description": "Reply text to send to the user.",
                 },
                 "complete": {
                     "type": "boolean",
@@ -130,10 +131,10 @@ TOOLS = [
         },
     },
     {
-        "name": "send_file_to_telegram",
+        "name": "send_file_to_user",
         "description": (
-            "Send a local file (document, image, archive, ...) to the user "
-            "in Telegram. Use ONLY when the user explicitly asks to receive a "
+            "Send a local file (document, image, archive, ...) to the user. "
+            "Use ONLY when the user explicitly asks to receive a "
             "file — do not push files you created while working. Max 50 MB."
         ),
         "inputSchema": {
@@ -249,7 +250,7 @@ class ChannelServer:
             "result": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": CAPABILITIES,
-                "serverInfo": {"name": f"tg-channel-{SESSION_NAME}", "version": "2.1.0"},
+                "serverInfo": {"name": f"channel-{SESSION_NAME}", "version": "2.1.0"},
                 "instructions": INSTRUCTIONS,
             },
         })
@@ -278,7 +279,7 @@ class ChannelServer:
             await self._write_message({
                 "jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS},
             })
-        elif method == "tools/call" and params.get("name") == "reply_to_telegram":
+        elif method == "tools/call" and params.get("name") == "reply_to_user":
             # В фоне: пока оркестратор отвечает, read-loop должен читать stdin
             # (иначе блокируются permission_request и следующие запросы).
             self._spawn(self._forward_to_orchestrator(msg_id, {
@@ -286,7 +287,7 @@ class ChannelServer:
                 "text": (params.get("arguments") or {}).get("text", ""),
                 "complete": bool((params.get("arguments") or {}).get("complete", False)),
             }, ok_text="Reply sent"))
-        elif method == "tools/call" and params.get("name") == "send_file_to_telegram":
+        elif method == "tools/call" and params.get("name") == "send_file_to_user":
             self._spawn(self._forward_to_orchestrator(msg_id, {
                 "context_id": (params.get("arguments") or {}).get("context_id", ""),
                 "file_path": (params.get("arguments") or {}).get("file_path", ""),
@@ -370,7 +371,7 @@ class ChannelServer:
         return web.Response(text="OK")
 
     async def _http_permission(self, request: web.Request) -> web.Response:
-        """Вердикт из Telegram — уведомлением в Claude Code."""
+        """Вердикт пользователя — уведомлением в Claude Code."""
         try:
             data = await request.json()
         except ValueError:
