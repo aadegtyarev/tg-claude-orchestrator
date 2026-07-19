@@ -82,5 +82,8 @@ def main():
     print("ALL ERROR-RELAY OK")
 
 
+def test_error_relay():
+    main()
+
 if __name__ == "__main__":
     main()

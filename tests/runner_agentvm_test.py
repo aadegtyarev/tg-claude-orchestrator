@@ -64,5 +64,8 @@ def main():
     print("ALL RUNNER OK")
 
 
+def test_runner_agentvm():
+    main()
+
 if __name__ == "__main__":
     main()

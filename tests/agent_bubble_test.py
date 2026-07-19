@@ -124,5 +124,8 @@ async def main():
     print("ALL AGENT-BUBBLE OK")
 
 
+async def test_agent_bubble():
+    await main()
+
 if __name__ == "__main__":
     asyncio.run(main())

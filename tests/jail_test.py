@@ -70,5 +70,8 @@ def main():
     print("ALL JAIL OK")
 
 
+def test_jail():
+    main()
+
 if __name__ == "__main__":
     main()
