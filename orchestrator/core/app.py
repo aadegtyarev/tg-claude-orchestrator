@@ -721,15 +721,6 @@ class OrchestratorCore:
         session = self.manager.get(session_name)
         if session is None:
             return
-        # Диагностика: какие поля несёт запрос разрешения (ищем причину/вердикт
-        # судьи, чтобы показать её пользователю). Временный INFO-лог.
-        logger.info(
-            "perm payload keys=%s reason-ish=%s",
-            sorted(payload.keys()),
-            {k: payload[k] for k in payload
-             if any(w in k.lower() for w in
-                    ("reason", "suggest", "rule", "denial", "message", "explan", "classif"))},
-        )
         raw_preview = str(payload.get("input_preview", ""))
         if len(raw_preview) > PERM_PREVIEW_LIMIT:
             raw_preview = raw_preview[:PERM_PREVIEW_LIMIT] + " …(обрезано)"

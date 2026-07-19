@@ -274,16 +274,18 @@ class WalletModule:
         # Провижн (~/.wallet.json в приватном доме сессии) виден CLI только
         # когда дом смонтирован КАК $HOME процесса claude — это делает лишь
         # BwrapRunner. Под off/agent-vm CLI не найдёт конфиг → предупреждаем.
-        if self.config.sandbox == "off":
+        if self.config.sandbox != "bwrap":
+            # Кошелёк НЕ страхует без песочницы: без bwrap $HOME не изолирован,
+            # модель читает secrets.toml/keyring/env напрямую — весь смысл
+            # (секрет вне досягаемости модели) пропадает. Не блокируем (кошелёк
+            # может работать), но громко предупреждаем — использовать ТОЛЬКО в
+            # связке с SANDBOX=bwrap (см. docs/secrets-wallet.md).
             logger.warning(
-                "wallet: SANDBOX=off — модель может прочитать %s напрямую, "
-                "кошелёк в таком режиме бессмыслен", self.config.wallet_secrets_file,
-            )
-        elif self.config.sandbox != "bwrap":
-            logger.warning(
-                "wallet: SANDBOX=%s пока не поддержан кошельком (провижн "
-                "~/.wallet.json завязан на bwrap-дом сессии) — `wallet` в сессии "
-                "не найдёт конфиг. Поддержан режим bwrap.", self.config.sandbox,
+                "wallet: SANDBOX=%s — кошелёк НЕ страхует от утечки секретов! Без "
+                "SANDBOX=bwrap модель читает %s напрямую (нет изоляции $HOME). "
+                "Используй кошелёк ТОЛЬКО вместе с SANDBOX=bwrap. Под off/agent-vm "
+                "также `wallet` в сессии не найдёт ~/.wallet.json.",
+                self.config.sandbox, self.config.wallet_secrets_file,
             )
         if not self.config.wallet_secrets_file.exists():
             logger.warning(

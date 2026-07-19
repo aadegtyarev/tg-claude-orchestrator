@@ -579,7 +579,13 @@ class WebAdapter:
             return self._err("path outside session workspace", 403)
         if not path.is_file():
             return self._err("file not found", 404)
-        return web.FileResponse(path)
+        # ВСЕГДА как вложение + nosniff: иначе присланный моделью report.html с
+        # <script> отрендерился бы на origin веб-интерфейса и через cookie угнал
+        # бы API (bash/approve/чтение сессий). Ссылки на файлы и так download.
+        return web.FileResponse(path, headers={
+            "Content-Disposition": f'attachment; filename="{path.name}"',
+            "X-Content-Type-Options": "nosniff",
+        })
 
     async def h_log(self, request: web.Request) -> web.StreamResponse:
         """Скачать полный claude.log сессии (для отладки формата Claude Code).
