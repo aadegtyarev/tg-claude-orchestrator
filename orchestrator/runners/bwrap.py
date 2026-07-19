@@ -52,6 +52,7 @@ class BwrapRunner:
             self.root,                              # channel_server.py + .venv
         ]
         prefix = sandbox.build_argv(
-            home=home, chdir=chdir, rw_paths=rw, ro_paths=ro, home_dir=home_dir
+            home=home, chdir=chdir, rw_paths=rw, ro_paths=ro, home_dir=home_dir,
+            system_dbus=self.config.sandbox_dbus,
         )
         return prefix + list(argv)

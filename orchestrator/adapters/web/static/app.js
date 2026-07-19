@@ -81,11 +81,24 @@ function scrollDown(force) {
 
 /* ── список сессий ─────────────────────────────────────────── */
 
+function showAuthError() {
+  // Явная подсказка вместо тихой «нет связи» + пустого списка, когда токена
+  // нет или он отвергнут (частый случай: открыли 127.0.0.1:8180 без ?token=).
+  els.emptyHint.innerHTML =
+    "🔑 Нужен токен доступа.<br><br>" +
+    "Открой ссылку с токеном из журнала сервиса:<br>" +
+    "<code>journalctl --user -u claude-orchestrator | grep Веб-интерфейс</code>";
+  els.emptyHint.hidden = false;
+  els.chatArea.hidden = true;
+}
+
 async function fetchSessions() {
   try {
     sessions = await apiJson("/api/sessions");
   } catch (e) {
-    return; // нет связи/авторизации — статус покажет WS-индикатор
+    // 401 (нет/неверный токен) — показать понятную подсказку, а не молчать.
+    if (/\b401\b|unauthorized/i.test(e.message) || !TOKEN) showAuthError();
+    return;
   }
   renderSessions();
 }
@@ -512,6 +525,12 @@ $("btn-interrupt").onclick = async () => {
   catch (e) { addMsg("notice", "⚠ " + esc(e.message)); }
 };
 
+$("btn-bg").onclick = async () => {
+  if (!current) return;
+  try { await postJson(sesUrl("/background"), {}); }
+  catch (e) { addMsg("notice", "⚠ " + esc(e.message)); }
+};
+
 /* ── bash-панель ───────────────────────────────────────────── */
 
 $("btn-bash").onclick = () => { els.bashPanel.hidden = !els.bashPanel.hidden; };
@@ -565,5 +584,9 @@ $("new-form").addEventListener("submit", async (e) => {
 
 /* ── старт ─────────────────────────────────────────────────── */
 
-fetchSessions();
-wsConnect();
+if (!TOKEN) {
+  showAuthError();  // открыли без ?token= и без сохранённого — сразу подсказка
+} else {
+  fetchSessions();
+  wsConnect();
+}
