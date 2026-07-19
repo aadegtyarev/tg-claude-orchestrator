@@ -19,6 +19,7 @@ import os
 import secrets
 import sys
 import time
+import urllib.request
 
 import aiohttp
 from aiohttp import web
@@ -106,25 +107,56 @@ INSTRUCTIONS = (
 # («автоматом с подсказками»). Под bwrap $HOME процесса подменён приватным домом
 # сессии, поэтому файл лежит ровно по ~/.wallet.json. Значений секретов тут нет —
 # только факт наличия; конкретику модель узнаёт из `wallet ls`.
-if os.path.exists(os.path.expanduser("~/.wallet.json")):
+def _wallet_catalog() -> str | None:
+    """Каталог доступных сессии секретов ИЗ POLICY (демон /secrets), а не хардкод.
+
+    Возвращает готовый текст «доступно: <секрет> — команды …» либо None, если
+    кошелёк сессии не выдан. Список строится из secrets.toml (что оператор
+    разрешил, то и в подсказке) — не зашиваем gh/git/ssh руками. Ошибка запроса
+    → общий текст (кошелёк есть, конкретику возьми из `wallet ls`)."""
+    wf = os.path.expanduser("~/.wallet.json")
+    if not os.path.exists(wf):
+        return None
+    try:
+        cfg = json.loads(open(wf, encoding="utf-8").read())
+        req = urllib.request.Request(
+            cfg["url"] + "/secrets",
+            headers={"Authorization": "Bearer " + cfg["token"]},
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            secrets_list = json.load(r)
+    except Exception:
+        return "Run `wallet ls` to see which secrets and commands you may use."
+    if not secrets_list:
+        return "Run `wallet ls` — this session currently has no wallet secrets."
+    lines = []
+    for s in secrets_list:
+        cmds = ", ".join(s.get("commands", [])) or "—"
+        desc = f" ({s['description']})" if s.get("description") else ""
+        inj = (
+            f" [inject → use ${s['env']} in the command]"
+            if s.get("mode") == "inject" and s.get("env") else ""
+        )
+        lines.append(f"  • `{s['name']}`{desc} — {cmds}{inj}")
+    return "You may run these via `wallet run <name> -- <cmd>`:\n" + "\n".join(lines)
+
+
+_WALLET_CATALOG = _wallet_catalog()
+if _WALLET_CATALOG is not None:
     INSTRUCTIONS += (
         "\nSECRETS WALLET: this session has a secrets wallet — the `wallet` CLI "
         "runs credential-bearing commands on the host so tokens never enter your "
-        "context or terminal. Run `wallet ls` to see which secrets you may use and "
-        "for which commands. Whenever a command needs credentials you don't "
-        "otherwise have — pushing/pulling with git, any `gh` call, ssh/scp to a "
-        "server, curl to an authenticated API — DON'T give up or ask the user for "
-        "a token: route it through the wallet, `wallet run <name> -- <cmd>`. Wallet "
+        "context or terminal. " + _WALLET_CATALOG + "\n"
+        "Whenever a command needs credentials you don't otherwise have, DON'T give "
+        "up or ask the user for a token: route it through the wallet. Wallet "
         "commands run WITHOUT a terminal, so make them non-interactive (e.g. ssh "
         "`-o StrictHostKeyChecking=accept-new -o BatchMode=yes`); an interactive "
-        "prompt can't be answered and will fail. Examples: "
-        "`wallet run host -- git push`, `wallet run host -- gh pr create ...`, "
-        "`wallet run host -- ssh -o StrictHostKeyChecking=accept-new user@host '<cmd>'`, and for "
-        "an API token `wallet run <name> -- sh -c 'curl -H \"Authorization: Bearer "
-        "$TOKEN\" https://...'` (the wallet injects $TOKEN into the command on the "
-        "host; write the literal `$TOKEN`, never a real value). Local git that "
-        "needs no credentials (status, diff, add, commit) runs normally — only "
-        "route the network operations.\n"
+        "prompt can't be answered and will fail. For an inject secret write the "
+        "literal `$VAR` (as shown above), e.g. `wallet run <name> -- sh -c 'curl "
+        "-H \"Authorization: Bearer $VAR\" https://...'` — the real value is "
+        "substituted on the host, never in your view. Local git that needs no "
+        "credentials (status, diff, add, commit) runs normally — only route the "
+        "network operations.\n"
         "IMPORTANT — do not try to obtain the secret VALUE. The wallet hides "
         "values from you BY DESIGN; that is the point, not an obstacle to work "
         "around. Needing a token to finish the task is NOT a reason to dig it out — "
