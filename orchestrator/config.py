@@ -212,12 +212,28 @@ class Config:
 
     @staticmethod
     def _parse_paths(raw: str) -> tuple[Path, ...]:
-        """Список путей из PATH-подобной строки (разделитель ':')."""
+        """Список путей из PATH-подобной строки (разделитель ':').
+
+        Широкий RW-путь (дом/корень) молча разворачивает песочницу — ругаемся
+        в лог, чтобы оператор не открыл наружу больше, чем хотел."""
         out: list[Path] = []
+        home = Path.home()
         for part in raw.split(":"):
             part = part.strip()
-            if part:
-                out.append(Path(part).expanduser())
+            if not part:
+                continue
+            p = Path(part).expanduser()
+            out.append(p)
+            try:
+                rp = p.resolve()
+            except OSError:
+                continue
+            if rp == home or rp in home.parents:
+                logger.warning(
+                    "SANDBOX_EXTRA_RW открывает широкий путь %s (дом/корень) — "
+                    "песочница фактически разворачивается. Указывай узкие каталоги.",
+                    p,
+                )
         return tuple(out)
 
     @staticmethod

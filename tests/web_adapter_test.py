@@ -100,6 +100,15 @@ async def main():
                 assert r.status == 200 and "text/html" in r.headers["Content-Type"]
             print("OK auth: /api без токена → 401, статика открыта")
 
+            # / с не-ASCII ?token= не должен падать 500 (compare_digest на байтах)
+            async with http.get(f"{base}/?token=пароль") as r:
+                assert r.status == 200, r.status
+            # / с верным ?token= ставит HttpOnly-cookie
+            async with http.get(f"{base}/?token=test-token") as r:
+                assert r.status == 200
+                assert "orch_web_token=" in r.headers.get("Set-Cookie", "")
+            print("OK h_index: не-ASCII token не 500; верный token ставит cookie")
+
             # ?token= тоже работает (вход по ссылке из лога)
             async with http.get(f"{base}/api/sessions?token=test-token") as r:
                 assert r.status == 200

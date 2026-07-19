@@ -264,7 +264,11 @@ class WebAdapter:
         браузер авторизован без токена в каждой ссылке (как у Jupyter)."""
         resp = web.FileResponse(STATIC_DIR / "index.html")
         tok = request.query.get("token")
-        if tok and self._token and secrets.compare_digest(tok, self._token):
+        # Сравнение на байтах (как _authorized): compare_digest на str бросает
+        # TypeError при не-ASCII ?token= → был бы 500 вместо тихого игнора.
+        if tok and self._token and secrets.compare_digest(
+            tok.encode("utf-8", "replace"), self._token.encode("utf-8")
+        ):
             resp.set_cookie(
                 COOKIE_NAME, self._token, httponly=True, samesite="Lax", path="/"
             )
