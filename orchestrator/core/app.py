@@ -30,6 +30,7 @@ from typing import Awaitable, Callable
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
 from .sessions import Session, SessionError, SessionManager
+from .slug import slugify
 from .texts import get_texts
 from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line
 from .transport import Origin, PermissionRequest, Transport
@@ -202,7 +203,21 @@ class OrchestratorCore:
     # ── команды: жизненный цикл сессий ──────────────────────────
 
     async def create_session(self, title: str, project_path: str | None = None) -> Session:
-        """Создать сессию и привязать её ко всем адаптерам (топик и т.п.)."""
+        """Создать сессию и привязать её ко всем адаптерам (топик и т.п.).
+
+        Если адаптер, которому поверхность обязательна (requires_binding —
+        Telegram), не смог привязаться, сессия откатывается: «сессия-призрак»
+        без интерфейса заняла бы слот/порт и держала бы процесс claude, куда
+        никто не может писать. Адаптеры без привязки (веб) на None не влияют.
+        """
+        # Пре-чек с локализованными сообщениями: manager.create бросает
+        # SessionError с русским текстом (гонка-защита под локом), который при
+        # BOT_LANG=en дал бы смесь языков. Здесь — на языке бота.
+        slug = slugify(title)
+        if self.manager.has_name(slug):
+            raise UserError(self.t("name_exists", name=slug))
+        if self.manager.count() >= self.config.max_instances:
+            raise UserError(self.t("limit_reached", limit=self.config.max_instances))
         try:
             session = await self.manager.create(title, project_path)
         except SessionError as e:
@@ -210,9 +225,15 @@ class OrchestratorCore:
         for tr in self._transports():
             try:
                 address = await tr.bind_session(session)
-            except Exception:
+            except Exception as e:
                 logger.exception("Адаптер %s: bind_session(%s)", tr.name, session.name)
+                if getattr(tr, "requires_binding", False):
+                    await self._rollback_session(session)
+                    raise UserError(self.t("bind_fail", adapter=tr.name, error=e)) from e
                 address = None
+            if address is None and getattr(tr, "requires_binding", False):
+                await self._rollback_session(session)
+                raise UserError(self.t("bind_none", adapter=tr.name))
             if address is not None:
                 session.bindings[tr.name] = address
         self.manager.save_state()
@@ -223,8 +244,22 @@ class OrchestratorCore:
                 logger.exception("session_hook для %s", session.name)
         return session
 
+    async def _rollback_session(self, session: Session) -> None:
+        """Снести только что созданную сессию (привязка не удалась): гасим
+        процесс, освобождаем слот/порт, убираем уже сделанные привязки."""
+        bindings = dict(session.bindings)
+        await self.manager.delete(session)
+        for tr in self._transports():
+            address = bindings.get(tr.name)
+            if address is not None:
+                try:
+                    await tr.unbind_session(session, address)
+                except Exception:
+                    logger.exception("Адаптер %s: unbind при откате(%s)", tr.name, session.name)
+
     async def close_session(self, session: Session) -> None:
         self.turns.stop(session.name)
+        self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         await self.manager.close(session)
@@ -232,6 +267,7 @@ class OrchestratorCore:
 
     async def delete_session(self, session: Session) -> None:
         self.turns.forget(session.name)
+        self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         bindings = dict(session.bindings)
@@ -248,6 +284,11 @@ class OrchestratorCore:
 
     async def clear_session(self, session: Session) -> None:
         """Чистый контекст: перезапуск Claude с новым UUID, привязки остаются."""
+        # Гасим фоновые задачи прошлого хода (typing/watchdog/error-relay) —
+        # иначе после /clear «печатает…» крутится вечно на уже пустой сессии,
+        # а error-relay тайлит лог нового процесса (как close/switch_model).
+        self.turns.stop(session.name)
+        self._drop_pending_perms(session)
         await self.bubbles.close(session.name)
         try:
             await self.manager.clear(session)
@@ -259,6 +300,7 @@ class OrchestratorCore:
     async def switch_model(self, session: Session, model: str) -> bool:
         """Сменить модель; вернуть resumed (контекст продолжен?)."""
         self.turns.stop(session.name)
+        self._drop_pending_perms(session)
         await self.bubbles.close(session.name)
         try:
             return await self.manager.set_model(session, model)
@@ -292,6 +334,11 @@ class OrchestratorCore:
             )
         except Exception as e:
             logger.error("Сессия %s: не удалось передать сообщение: %s", session.name, e)
+            # Бабл уже открыт (freeze_and_open) — закрываем, иначе сессия
+            # навсегда числится «working» (session_status по bubbles.has),
+            # а _active копит поздние хук-события в бабл, который никто не
+            # закроет.
+            await self.bubbles.close(session.name)
             raise UserError(self.t("forward_fail", error=e)) from e
         self._record(session, "user", text=text, via=origin.adapter)
         snippet = html.escape(shorten(text, 28))
@@ -299,8 +346,9 @@ class OrchestratorCore:
         self.turns.start(session.name)
 
     async def soft_stop(self, session: Session, origin: Origin) -> None:
-        """Мягкий стоп: просим Claude свернуть текущую работу (Esc в channels
-        нет; жёсткий вариант — /close_session)."""
+        """Мягкий стоп: просим Claude свернуть работу и отчитаться (push-
+        сообщение, модель прочитает его, когда доберётся). Жёсткое немедленное
+        прерывание — hard_stop (Esc в PTY)."""
         await self.manager.send_to_claude(
             session, self.t("stop_message"), self.context_id(session, origin)
         )
@@ -376,15 +424,20 @@ class OrchestratorCore:
         """Рабочие папки, откуда Клоду разрешено отправлять файлы в чат:
         cwd проекта (или папка сессии), сама папка сессии и incoming-каталог.
         """
-        roots: list[Path] = [
+        return [
             self.manager.effective_cwd(session),
             session.session_dir,
+            self.incoming_dir(session),
         ]
+
+    def incoming_dir(self, session: Session) -> Path:
+        """Каталог для присланных файлов: INCOMING_DIR относительный — внутри
+        папки сессии, абсолютный — общий. Единый источник правды для обоих
+        адаптеров и jail'а send_file (иначе куда кладут ≠ что отдают)."""
         inc = Path(self.config.incoming_dir).expanduser()
         if not inc.is_absolute():
             inc = session.session_dir / inc
-        roots.append(inc)
-        return roots
+        return inc
 
     def path_in_workspace(self, path: Path, session: Session) -> bool:
         """Лежит ли path (после resolve, со симлинками) внутри одной из рабочих
@@ -435,13 +488,19 @@ class OrchestratorCore:
         if session is None:
             return
         tool = str(payload.get("tool_name") or "?")
+        # Наш канальный тул — mcp__channel-<slug>__reply_to_user; сверяем по
+        # ХВОСТУ имени, а не подстрокой: `"reply_to_user" in tool` ложно
+        # срабатывало бы на чужом MCP-туле (mcp__notes__draft_reply_to_user),
+        # ставя reply-флаг и глуша Stop-фолбэк «потерянного финала».
+        is_reply = tool.endswith("__reply_to_user")
+        is_file = tool.endswith("__send_file_to_user")
         # reply_to_user — единственное действие, после которого «до Stop больше
         # ничего не потерять» истинно; ЛЮБОЙ другой тул (в т.ч. send_file_to_user)
         # сбрасывает флаг — см. turn.TurnSupervisor.
-        self.turns.note_tool(session.name, "reply_to_user" in tool)
-        if "reply_to_user" in tool:
+        self.turns.note_tool(session.name, is_reply)
+        if is_reply:
             return  # результат и так придёт сообщением — в бабле это шум
-        if "send_file_to_user" in tool:
+        if is_file:
             return  # тоже придёт сообщением; не считается «текстовым» ответом
         tool_input = payload.get("tool_input") or {}
         # agent_id/agent_type — на каждом тул-вызове ВНУТРИ сабагента.
@@ -538,29 +597,37 @@ class OrchestratorCore:
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
+            # Истёк без ответа: гасим кнопки во всех адаптерах, иначе они
+            # висят вечно, а поздний клик потом молча проваливается.
+            await self._broadcast_perm_resolved(session, request_id, "deny", "timeout")
             return False
         finally:
             self._local_perms.pop(key, None)
 
+    async def _broadcast_perm_resolved(
+        self, session: Session, request_id: str, behavior: str, via: str
+    ) -> None:
+        self._record(session, "perm_resolved", request_id=request_id, behavior=behavior)
+        for tr in self._transports():
+            try:
+                await tr.permission_resolved(session, request_id, behavior, via)
+            except Exception:
+                logger.exception("permission_resolved через %s", tr.name)
+
     async def permission_verdict(
         self, session: Session, request_id: str, behavior: str, via: str
     ) -> bool:
-        """Вердикт из адаптера via. False — запрос уже разрешён другим ответом."""
+        """Вердикт из адаптера via. False — запрос уже разрешён/снят (адаптеру
+        стоит просто убрать кнопки: см. Transport.permission_resolved)."""
         key = (session.name, request_id)
         # Локальное подтверждение (request_confirmation): будим ожидающего,
         # в Claude Code ничего не шлём.
         local = self._local_perms.get(key)
         if local is not None:
-            if not local.done():
-                local.set_result(behavior == "allow")
-            self._record(
-                session, "perm_resolved", request_id=request_id, behavior=behavior
-            )
-            for tr in self._transports():
-                try:
-                    await tr.permission_resolved(session, request_id, behavior, via)
-                except Exception:
-                    logger.exception("permission_resolved через %s", tr.name)
+            if local.done():
+                return False  # уже отвечено/истекло — повторный клик игнорируем
+            local.set_result(behavior == "allow")
+            await self._broadcast_perm_resolved(session, request_id, behavior, via)
             return True
         if key not in self._pending_perms:
             return False
@@ -570,13 +637,19 @@ class OrchestratorCore:
             logger.error("Сессия %s: не удалось передать вердикт: %s", session.name, e)
             raise UserError(self.t("perm_fail", error=e)) from e
         self._pending_perms.discard(key)
-        self._record(session, "perm_resolved", request_id=request_id, behavior=behavior)
-        for tr in self._transports():
-            try:
-                await tr.permission_resolved(session, request_id, behavior, via)
-            except Exception:
-                logger.exception("permission_resolved через %s", tr.name)
+        await self._broadcast_perm_resolved(session, request_id, behavior, via)
         return True
+
+    def _drop_pending_perms(self, session: Session) -> None:
+        """Снять все ожидающие запросы разрешений сессии (close/clear/delete):
+        иначе _pending_perms растёт вечно, а старая кнопка после resume била бы
+        по чужому (новому) процессу с несуществующим request_id."""
+        stale = [k for k in self._pending_perms if k[0] == session.name]
+        for k in stale:
+            self._pending_perms.discard(k)
+        for k, fut in list(self._local_perms.items()):
+            if k[0] == session.name and not fut.done():
+                fut.set_result(False)  # разбудить ожидающего request_confirmation
 
     # ── статистика и справки ────────────────────────────────────
 
@@ -614,8 +687,12 @@ class OrchestratorCore:
 
     async def usage_text(self, session: Session) -> str | None:
         """Расходы и лимиты плана: прогнать /cost в терминале Claude и разобрать.
-        None — распарсить не удалось."""
-        delta = await self.manager.run_and_capture(session, "/cost")
+        None — распарсить не удалось. Требует запущенной сессии (иначе
+        type_into_pty бросит SessionError → UserError для адаптера)."""
+        try:
+            delta = await self.manager.run_and_capture(session, "/cost")
+        except SessionError as e:
+            raise UserError(self.t("send_fail", error=e)) from e
         data = self._parse_cost(delta)
         if not data:
             return None
@@ -740,10 +817,20 @@ class OrchestratorCore:
         return f"s:{session.name}:{scope}" if session is not None else f"main:{scope}"
 
     def bash_cwd(self, session: Session | None) -> Path:
-        """Стартовый cwd терминала: папка проекта сессии, иначе sessions_dir."""
+        """Стартовый cwd терминала: папка проекта сессии, иначе отдельный
+        каталог для main-chat /bash.
+
+        Для session=None НЕ отдаём весь SESSIONS_DIR: иначе его RW-бинд в
+        песочнице открыл бы приватные дома всех сессий (.homes/*, ключи,
+        ~/.wallet.json) и state-файл .sessions.json на запись. Выделяем
+        нейтральный SESSIONS_DIR/.bash-main (пользователь при желании cd
+        куда угодно — но по умолчанию не видит чужого).
+        """
         if session is not None:
             return self.manager.effective_cwd(session)
-        return self.config.sessions_dir
+        main = self.config.sessions_dir / ".bash-main"
+        main.mkdir(parents=True, exist_ok=True)
+        return main
 
     async def run_bash(
         self,
@@ -765,27 +852,42 @@ class OrchestratorCore:
         if shell.busy:
             raise UserError(self.t("bash_busy"))
         shell.busy = True
-        marker = f"__DONE_{uuid.uuid4().hex}__"
-        start = len(shell.snapshot())
+        # Маркеры начала И конца: смещение по длине буфера ненадёжно —
+        # BashSession тримит буфер до _BUF_CAP, и после переполнения
+        # len(snapshot) залипает на пределе, snapshot()[start:] становится
+        # пустым, а маркер конца никогда не находится (ложный таймаут на
+        # каждой команде). Ищем вывод МЕЖДУ маркерами в полном снепшоте —
+        # устойчиво к тримингу, пока сам вывод команды влезает в буфер.
+        token = uuid.uuid4().hex
+        start_marker = f"__BEG_{token}__"
+        done_marker = f"__DONE_{token}__"
+        interrupted = False
         try:
             # $? сразу за меткой — код возврата именно команды пользователя.
-            shell.write(f"{cmd}\necho {marker} $?\n")
+            shell.write(f"echo {start_marker}\n{cmd}\necho {done_marker} $?\n")
             out = b""
             code = None
             deadline = asyncio.get_running_loop().time() + BASH_TIMEOUT
             last_shown = ""
+            beg_re = re.escape(start_marker).encode()
+            done_re = re.escape(done_marker).encode() + rb"\s+(\d+)"
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(BASH_POLL_INTERVAL)
-                raw = shell.snapshot()[start:]
-                out = bash_clean(raw)
-                # Маркер ищем как «marker <цифры>»: интерактивный bash эхом
-                # прокручивает введённую `echo marker $?` (с литералом $?).
-                m = re.search(re.escape(marker).encode() + rb"\s+(\d+)", out)
+                raw = bash_clean(shell.snapshot())
+                # Берём последнее вхождение маркера начала (эхо команды выше
+                # тоже содержит его текст) и всё, что после.
+                begs = list(re.finditer(beg_re, raw))
+                region = raw[begs[-1].end():] if begs else b""
+                out = region
+                m = re.search(done_re, region)
                 if m:
                     code = m.group(1).decode()
-                    out = out[: m.start()]
-                mbytes = marker.encode()
-                out = b"\n".join(ln for ln in out.split(b"\n") if mbytes not in ln)
+                    out = region[: m.start()]
+                # Вымарываем эхо самих echo-маркеров из показа.
+                out = b"\n".join(
+                    ln for ln in out.split(b"\n")
+                    if done_marker.encode() not in ln and start_marker.encode() not in ln
+                )
                 shown = self.bash_render(cmd, out, code)
                 if shown != last_shown:
                     try:
@@ -797,10 +899,32 @@ class OrchestratorCore:
                     return
             # Таймаут: прерываем убежавшую команду (Ctrl-C), чтобы она не
             # гадила в общий буфер следующему вызову. Оболочка живёт.
+            interrupted = True
             shell.interrupt()
             await on_update(self.bash_render(cmd, out, None, timeout=True), True)
+        except asyncio.CancelledError:
+            # Клиент отвалился (веб: закрыл вкладку) — команда ещё бежит.
+            # Прерываем её, иначе её вывод перемешается со следующим /bash,
+            # а busy освободится под работающей командой.
+            interrupted = True
+            shell.interrupt()
+            raise
         finally:
-            shell.busy = False
+            if not interrupted:
+                shell.busy = False
+            else:
+                # Дать Ctrl-C дойти и осесть, потом освободить (в фоне, чтобы
+                # не держать вызывающего и не падать на отменённом таске).
+                async def _release():
+                    await asyncio.sleep(0.5)
+                    shell.busy = False
+                asyncio.ensure_future(_release())
+
+    def bash_busy(self, key: str) -> bool:
+        """Занят ли терминал (идёт команда) — адаптер спрашивает ДО поста
+        статус-сообщения, чтобы не оставить висящий «⏳ Выполняю…»."""
+        shell = self.bash.get(key)
+        return shell is not None and shell.busy
 
     def bash_input(self, key: str, text: str) -> bool:
         """Досыл сырого ввода в открытый терминал (ответ на y/n). False — нет
@@ -833,6 +957,7 @@ class OrchestratorCore:
     async def notify_session_dead(self, session: Session, code: int | str) -> None:
         """Колбэк SessionManager: Claude умер сам по себе."""
         self.turns.stop(session.name)
+        self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         text = self.t("session_died", name=session.title, code=code)

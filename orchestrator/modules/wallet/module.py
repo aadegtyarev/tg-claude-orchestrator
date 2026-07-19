@@ -152,10 +152,19 @@ class WalletModule:
 
     async def start(self, core) -> None:
         self.core = core
+        # Провижн (~/.wallet.json в приватном доме сессии) виден CLI только
+        # когда дом смонтирован КАК $HOME процесса claude — это делает лишь
+        # BwrapRunner. Под off/agent-vm CLI не найдёт конфиг → предупреждаем.
         if self.config.sandbox == "off":
             logger.warning(
                 "wallet: SANDBOX=off — модель может прочитать %s напрямую, "
                 "кошелёк в таком режиме бессмыслен", self.config.wallet_secrets_file,
+            )
+        elif self.config.sandbox != "bwrap":
+            logger.warning(
+                "wallet: SANDBOX=%s пока не поддержан кошельком (провижн "
+                "~/.wallet.json завязан на bwrap-дом сессии) — `wallet` в сессии "
+                "не найдёт конфиг. Поддержан режим bwrap.", self.config.sandbox,
             )
         if not self.config.wallet_secrets_file.exists():
             logger.warning(
@@ -280,12 +289,16 @@ class WalletModule:
                 preview=cmd_str,
             )
 
-        # Наблюдаемость: КАЖДАЯ попытка видна в статус-бабле и журнале —
-        # в том числе отказанная (промпт-инъекция не пройдёт незамеченной).
-        await self.core.bubbles.append(
-            session.name,
-            f"🔐 <b>wallet</b> <code>{html.escape(name + ' → ' + cmd_str[:120])}</code>",
-        )
+        # Наблюдаемость: КАЖДАЯ попытка видна — в том числе отказанная
+        # (промпт-инъекция не пройдёт незамеченной). Бабл живёт только во время
+        # активного хода (append дропается вне его), а wallet может вызываться
+        # из фонового шелла между ходами — поэтому пишем И в бабл (когда есть),
+        # И служебным уведомлением через notice (доходит всегда, во все
+        # адаптеры), И в журнал.
+        line = f"🔐 <b>wallet</b> <code>{html.escape(name + ' → ' + cmd_str[:120])}</code>"
+        await self.core.bubbles.append(session.name, line)
+        verdict = "" if allowed else " — " + self.core.t("wallet_denied")
+        await self.core.notice(session, self.core.t("wallet_use", line=line) + verdict)
         self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
             return web.json_response({"error": "denied"}, status=403)
@@ -301,9 +314,24 @@ class WalletModule:
 
         Это суть дизайна: секрет живёт только в env короткоживущего процесса
         на хосте и никогда — в адресном пространстве песочницы.
+
+        ⚠️ ОГРАНИЧЕНИЕ (см. docs/secrets-wallet.md): команда исполняется в
+        cwd проекта, куда модель имеет запись из песочницы. Узкий шаблон
+        (`git push*`) НЕ гарантирует безопасность — модель может подложить
+        `./.git/config` (core.sshCommand/hooksPath/alias) и получить исполнение
+        на хосте с секретом. Защита — исключительно policy: разрешать секрет
+        только доверенным сессиям и только тем командам, чьё поведение не
+        зависит от содержимого cwd; для git выставляем безопасные env ниже, но
+        полностью класс атак это не закрывает.
         """
         env = dict(os.environ)
         env[secret.env] = secret.value
+        # Частичная защита git от подложенного локального конфига: игнорируем
+        # системный/глобальный git-конфиг и (git ≥2.36) не читаем конфиг из
+        # рабочего дерева. Локальный ./.git/config это не отменяет — только
+        # снижает поверхность; основной барьер — policy.
+        env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+        env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

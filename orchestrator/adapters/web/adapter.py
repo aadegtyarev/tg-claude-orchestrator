@@ -36,6 +36,7 @@ COOKIE_NAME = "orch_web_token"
 
 class WebAdapter:
     name = "web"
+    requires_binding = False  # адресация по имени сессии, поверхность не нужна
 
     def __init__(self, config: Config, core: OrchestratorCore):
         self.config = config
@@ -88,13 +89,25 @@ class WebAdapter:
     # ── Transport: доставка (всё — событиями в WS) ──────────────
 
     async def _broadcast(self, event: dict) -> None:
-        """Разослать событие всем WS-клиентам. Best-effort: отвалившийся клиент
-        молча выкидывается, остальных это не задерживает и не роняет."""
-        for ws in list(self._ws_clients):
+        """Разослать событие всем WS-клиентам параллельно и с таймаутом.
+
+        Раньше слали последовательным await: один живой-но-зависший клиент
+        (усыплённая вкладка, полный TCP-буфер — heartbeat заметит лишь через
+        цикл) блокировал send_json, а через него — весь _broadcast и все
+        доставки ядра ПО ВСЕМ адаптерам (включая Telegram), т.к. ядро обходит
+        транспорты последовательно. gather + wait_for изолируют такого клиента.
+        """
+        clients = list(self._ws_clients)
+        if not clients:
+            return
+
+        async def _one(ws):
             try:
-                await ws.send_json(event)
+                await asyncio.wait_for(ws.send_json(event), timeout=5)
             except Exception:
                 self._ws_clients.discard(ws)
+
+        await asyncio.gather(*(_one(ws) for ws in clients))
 
     async def deliver_text(
         self, session: Session, text: str, *, origin: Origin | None = None,
@@ -302,13 +315,20 @@ class WebAdapter:
     async def h_create(self, request: web.Request) -> web.Response:
         data = await self._json_body(request)
         title = str(data.get("title", "")).strip()
-        path = str(data.get("path", "")).strip() or None
+        # data.get("path") может быть None (пустое поле формы шлёт null) —
+        # str(None) дал бы литерал "None" и сессия линковалась бы в каталог
+        # ./None. Берём path только если это непустая строка.
+        raw_path = data.get("path")
+        path = raw_path.strip() or None if isinstance(raw_path, str) else None
         if not title:
             return self._err("title required")
         try:
             session = await self.core.create_session(title, path)
         except UserError as e:
             return self._err(str(e))
+        except Exception:
+            logger.exception("Веб: ошибка создания сессии %s", title)
+            return self._err(self.t("create_fail", error="internal error"), 500)
         await self._sessions_changed()
         return web.json_response(self._session_info(session))
 
@@ -320,21 +340,25 @@ class WebAdapter:
         text = str(data.get("text", ""))
         if not text.strip():
             return self._err("text required")
+        # Слэш-команда — только однострочный ввод, начинающийся с '/':
+        # многострочный текст с '/' в первой строке (вставленный лог/diff) —
+        # это обычное сообщение, а не команда Claude Code (она всегда одна
+        # строка). Иначе первая строка ушла бы в PTY, остальное потерялось.
+        is_slash = text.lstrip().startswith("/") and "\n" not in text.strip()
         try:
             state = await self.core.ensure_running(session)
-            if text.lstrip().startswith("/"):
-                # Паритет с Telegram on_slash: неизвестные /команды — прямо
-                # в терминал Claude (команды Claude Code).
-                await self.core.slash_command(session, text.strip().splitlines()[0])
-                slash = True
+            if is_slash:
+                await self.core.slash_command(session, text.strip())
             else:
                 await self.core.user_message(session, text, self._origin())
-                slash = False
         except UserError as e:
             return self._err(str(e))
+        except Exception:
+            logger.exception("Веб: ошибка сообщения в сессию %s", session.name)
+            return self._err(self.t("forward_fail", error="internal error"), 500)
         if state != "running":
             await self._sessions_changed()  # resume — статус в списке поменялся
-        return web.json_response({"ok": True, "slash": slash})
+        return web.json_response({"ok": True, "slash": is_slash})
 
     async def h_close(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
@@ -421,20 +445,29 @@ class WebAdapter:
         session = self._session_of(request)
         if session is None:
             return self._err("session not found", 404)
-        text = await self.core.usage_text(session)
+        try:
+            text = await self.core.usage_text(session)
+        except UserError as e:
+            return self._err(str(e))  # остановленная сессия и т.п.
         return web.json_response({"text": text})  # null — распарсить не удалось
 
     async def h_history(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
         if session is None:
             return self._err("session not found", 404)
-        items = []
-        for ev in self.core.history(session.name):
-            ev = dict(ev)
-            if ev.get("kind") in ("reply", "intermediate", "notice"):
-                ev["html"] = md_to_html(str(ev.get("text", "")))
-            items.append(ev)
-        return web.json_response(items)
+
+        def _render() -> list[dict]:
+            items = []
+            for ev in self.core.history(session.name):
+                ev = dict(ev)
+                if ev.get("kind") in ("reply", "intermediate", "notice"):
+                    ev["html"] = md_to_html(str(ev.get("text", "")))
+                items.append(ev)
+            return items
+
+        # md_to_html по до 300 событиям — в поток, чтобы клик по сессии не
+        # стопорил event loop (regex-рендер каждого блока).
+        return web.json_response(await asyncio.to_thread(_render))
 
     async def h_permission(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
@@ -455,14 +488,6 @@ class WebAdapter:
 
     # ── HTTP: файлы ─────────────────────────────────────────────
 
-    def _incoming_dir(self, session: Session) -> Path:
-        """INCOMING_DIR: относительный — внутри папки сессии, абсолютный —
-        общий для всех сессий (та же логика, что в Telegram on_file)."""
-        incoming = Path(self.config.incoming_dir).expanduser()
-        if not incoming.is_absolute():
-            incoming = session.session_dir / incoming
-        return incoming
-
     async def h_upload(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
         if session is None:
@@ -472,18 +497,22 @@ class WebAdapter:
         except Exception:
             return self._err("multipart body required")
         caption, dest = "", None
-        incoming = self._incoming_dir(session)
+        # incoming-каталог — единый источник правды ядра (тот же, что видит
+        # jail send_file); иначе загрузка легла бы вне whitelist'а скачивания.
+        incoming = self.core.incoming_dir(session)
         async for part in reader:
             if part.name == "caption":
                 caption = (await part.text()).strip()
             elif part.name == "file" and part.filename:
                 # .name отрезает возможные ../ из имени файла клиента.
                 fname = Path(part.filename).name or f"file_{int(time.time())}"
-                incoming.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(incoming.mkdir, parents=True, exist_ok=True)
                 dest = incoming / fname
+                # Запись — в поток: синхронный f.write per-chunk на event loop
+                # заморозил бы все сессии на время большой загрузки.
                 with dest.open("wb") as f:
                     while chunk := await part.read_chunk(65536):
-                        f.write(chunk)
+                        await asyncio.to_thread(f.write, chunk)
         if dest is None:
             return self._err("file field required")
         text = self.t("file_received", path=dest)
