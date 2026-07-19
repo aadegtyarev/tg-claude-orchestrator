@@ -18,6 +18,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• текст — отправить Claude (остановленная сессия возобновится сама)\n"
             "• фото/файл — сохранится в папку сессии, Claude получит путь\n"
             "• <code>/stats</code> — контекст и статистика\n"
+            "• <code>/log</code> — скачать полный лог сессии (для отладки)\n"
             "• <code>/usage</code> — расходы и лимиты плана\n"
             "• <code>/model</code> — модель: fable/opus/sonnet/haiku или точное имя\n"
             "• <code>/compact</code> — сжать контекст\n"
@@ -64,7 +65,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… и ещё {n}",
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа могут быть недоступны, пока не обновлю парсер.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n{tail}\n📥 Полный лог для разработчиков: /log",
+        "log_caption": "🗒 Полный лог сессии «{name}» (claude.log) — для отладки.",
+        "log_empty": "(лог пуст)",
         "stats_body": (
             "{header}\n"
             "Модель: {model}\n"
@@ -220,6 +223,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• text — send to Claude (a stopped session resumes automatically)\n"
             "• photo/file — saved into the session folder, Claude gets the path\n"
             "• <code>/stats</code> — context and usage stats\n"
+            "• <code>/log</code> — download the full session log (for debugging)\n"
             "• <code>/usage</code> — cost and plan limits\n"
             "• <code>/model</code> — model: fable/opus/sonnet/haiku or an exact name\n"
             "• <code>/compact</code> — compact the context\n"
@@ -266,7 +270,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… and {n} more",
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers may be unavailable until the parser is updated.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n{tail}\n📥 Full log for developers: /log",
+        "log_caption": "🗒 Full session log «{name}» (claude.log) — for debugging.",
+        "log_empty": "(log empty)",
         "stats_body": (
             "{header}\n"
             "Model: {model}\n"

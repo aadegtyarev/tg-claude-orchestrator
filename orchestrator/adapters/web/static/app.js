@@ -453,6 +453,12 @@ $("btn-stats").onclick = async () => {
   } catch (e) { addMsg("notice", "⚠ " + esc(e.message)); }
 };
 
+$("btn-log").onclick = () => {
+  if (!current) return;
+  // Скачивание авторизуется HttpOnly-cookie (токен в ссылку не кладём).
+  window.location.href = sesUrl("/log");
+};
+
 $("btn-usage").onclick = async () => {
   if (!current) return;
   addMsg("notice", "⏳ собираю данные о расходах…");

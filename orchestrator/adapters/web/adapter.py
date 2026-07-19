@@ -222,6 +222,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/permission", self.h_permission)
         r.add_post("/api/sessions/{name}/upload", self.h_upload)
         r.add_get("/api/sessions/{name}/file", self.h_file)
+        r.add_get("/api/sessions/{name}/log", self.h_log)
         r.add_post("/api/sessions/{name}/bash", self.h_bash)
         r.add_post("/api/sessions/{name}/bash_input", self.h_bash_input)
         r.add_get("/api/ls", self.h_ls)
@@ -579,6 +580,21 @@ class WebAdapter:
         if not path.is_file():
             return self._err("file not found", 404)
         return web.FileResponse(path)
+
+    async def h_log(self, request: web.Request) -> web.StreamResponse:
+        """Скачать полный claude.log сессии (для отладки формата Claude Code).
+        Отдаём как вложение с осмысленным именем; путь фиксирован (session_dir),
+        поэтому jail не нужен."""
+        session = self._session_of(request)
+        if session is None:
+            return self._err("session not found", 404)
+        log = session.session_dir / "claude.log"
+        if not log.is_file():
+            return self._err("log not found", 404)
+        return web.FileResponse(log, headers={
+            "Content-Disposition": f'attachment; filename="{session.name}-claude.log"',
+            "Content-Type": "text/plain; charset=utf-8",
+        })
 
     # ── HTTP: bash-терминал ─────────────────────────────────────
 

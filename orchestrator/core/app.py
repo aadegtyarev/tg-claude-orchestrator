@@ -501,6 +501,15 @@ class OrchestratorCore:
                 continue
         return False
 
+    async def send_log(self, session: Session, origin: Origin | None = None) -> None:
+        """Отправить полный claude.log сессии файлом — для отладки (формат Claude
+        Code сменился, парсер молчит и т.п.). Лог в session_dir (внутри jail),
+        доставляется документом во все адаптеры; если файла нет — notice."""
+        log = session.session_dir / "claude.log"
+        await self._send_file(
+            session, str(log), self.t("log_caption", name=session.title), origin
+        )
+
     async def _send_file(
         self, session: Session, file_path: str, caption: str, origin: Origin | None
     ) -> None:
@@ -735,8 +744,13 @@ class OrchestratorCore:
             return self.t("stats_no_transcript", header=header, uptime=uptime)
         if stats.get("stale_schema"):
             # Транскрипт есть и валиден, но ни одного ожидаемого поля не
-            # извлекли — вероятно, поменялась схема Claude Code.
-            return self.t("stats_stale_schema", header=header, uptime=uptime)
+            # извлекли — вероятно, поменялась схема Claude Code. Показываем хвост
+            # claude.log и зовём скачать полный лог (/log) для разработчиков.
+            tail = self.manager.tail_log(session, 12)
+            return self.t(
+                "stats_stale_schema", header=header, uptime=uptime,
+                tail=tail or self.t("log_empty"),
+            )
         ctx = stats["context_tokens"]
         return self.t(
             "stats_body",

@@ -377,6 +377,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_compact, Command("compact"))
         dp.message.register(self.cmd_clear, Command("clear"))
         dp.message.register(self.cmd_stats, Command("stats"))
+        dp.message.register(self.cmd_log, Command("log"))
         dp.message.register(self.cmd_usage, Command("usage", "cost"))
         dp.message.register(self.cmd_model, Command("model"))
         dp.message.register(self.cmd_skills, Command("skills"))
@@ -690,6 +691,16 @@ class TelegramAdapter:
             await message.reply(self.t("only_topic"))
             return
         await message.reply(await asyncio.to_thread(self.core.stats_text, session))
+
+    async def cmd_log(self, message: Message) -> None:
+        """/log — прислать полный claude.log сессии документом (для отладки)."""
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        if session is None:
+            await message.reply(self.t("only_topic"))
+            return
+        await self.core.send_log(session, self._origin(message))
 
     async def cmd_usage(self, message: Message) -> None:
         """Расходы и лимиты плана (парсит /cost Claude Code)."""
