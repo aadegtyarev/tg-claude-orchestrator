@@ -724,6 +724,14 @@ class SessionManager:
             logger.warning("Сессия %s: resume не удался, чистый старт", session.name)
             resumed = False
             await self._stop_process(session, save=False)
+            # Чистый рестарт переиспользует session.port, но _stop_process снял
+            # его из _inflight_ports — в окне до подъёма нового channel-сервера
+            # конкурентный _find_free_port отдал бы этот порт другой сессии, и
+            # два сервера сели бы на один порт (сообщения перепутались бы).
+            # Заново резервируем; снимется в _start_watcher (успех) или в
+            # _stop_process ниже (провал).
+            async with self._lock:
+                self._inflight_ports.add(session.port)
             await self._wait_port_free(session.port)
             session.claude_session_id = str(uuid.uuid4())
             try:
