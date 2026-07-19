@@ -405,19 +405,61 @@ class SessionManager:
         settings_dir.mkdir(exist_ok=True)
         if session.linked_path is None:
             settings["enableAllProjectMcpServers"] = True
-        perms: dict = {
-            "deny": ["AskUserQuestion"],  # интерактивный вопрос-меню — под ботом
-            # виснет без TUI-клика; Claude получит «tool not allowed» и (по
-            # системному промпту) переспросит через reply_to_user.
-            # Внимание: в режиме bypass проверки разрешений нет — там страж
-            # только системный промпт.
-        }
+        deny = ["AskUserQuestion"]  # интерактивный вопрос-меню виснет без TUI;
+        # Claude получит «tool not allowed» и переспросит через reply_to_user.
+
+        # Анти-утечка секретов имеет смысл ТОЛЬКО в связке кошелёк + песочница —
+        # это единая схема, звенья не работают порознь:
+        #   • песочница прячет сырые креды хоста (~/.ssh, ~/.config/gh, keyring);
+        #   • кошелёк даёт контролируемый доступ к ним (команда на хосте);
+        #   • эти deny/autoMode-правила блокируют попытки достать секрет в обход.
+        # Без песочницы модель видит все хостовые креды напрямую — правила были
+        # бы театром; без кошелька нет и легитимного доступа, который защищаем.
+        wallet_active = (
+            "wallet" in self.config.modules and self.config.sandbox == "bwrap"
+        )
+        if wallet_active:
+            # Чтение кред-файлов/keyring — жёсткий deny (работает во ВСЕХ режимах,
+            # включая bypass). `env`/`printenv` глобально НЕ режем (ломает легит
+            # `env VAR=x cmd`) — это отдаём судье auto-режима, он умнее glob.
+            deny += [
+                "Read(~/.config/gh/**)",
+                "Read(~/.netrc)",
+                "Read(~/.ssh/**)",
+                "Read(~/.aws/**)",
+                "Read(~/.git-credentials)",
+                "Bash(security find-generic-password*)",
+                "Bash(pass show*)",
+            ]
+        perms: dict = {"deny": deny}
         if self.config.permission_mode != "bypass":
             perms["allow"] = [
                 f"mcp__channel-{session.name}__reply_to_user",
                 f"mcp__channel-{session.name}__send_file_to_user",
             ]
         settings["permissions"] = perms
+
+        # Судья auto-режима — отдельный классификатор (в 2.1.2x по умолчанию
+        # Sonnet 5). Его ПРОМПТ не кастомизируется, но кастомизируются ПРАВИЛА,
+        # которые он читает. Дополняем их (только в auto + при активном кошельке):
+        # жёстко запретить добычу секретов и проверять ВСЕ bash-команды.
+        if wallet_active and self.config.permission_mode == "auto":
+            settings["autoMode"] = {
+                "environment": [
+                    "$defaults",
+                    "Секреты держатся вне досягаемости модели (кошелёк/keyring): "
+                    "~/.config/gh, ~/.netrc, ~/.ssh, ~/.aws и env-переменные с токенами.",
+                ],
+                "hard_deny": [
+                    "$defaults",
+                    "Никогда не добывай значения секретов: не дампи переменные "
+                    "окружения (env, printenv, set) ради токенов; не читай кред-сторы "
+                    "(~/.config/gh, ~/.netrc, ~/.ssh, ~/.aws, keyring); не кодируй "
+                    "(base64/hex/reverse) и не пересылай секреты наружу. Для git/gh "
+                    "используй кошелёк: wallet run <секрет> -- <команда>.",
+                ],
+                "classifyAllShell": True,
+            }
 
         # Токен уходит в 0600-скрипт (см. hookscript.py), команда хука = только
         # путь к интерпретатору и скрипту — ничего секретного в
