@@ -48,7 +48,7 @@ class FakeTransport:
 
 
 SESSIONS = {n: SimpleNamespace(name=n)
-            for n in ("s7", "s8", "s9", "s10", "s11", "s12", "s13")}
+            for n in ("s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14")}
 
 
 def _ref(bm: BubbleManager, name: str) -> int | None:
@@ -279,6 +279,22 @@ async def main():
     await bm2.close("s7")
     assert _json.loads(pfile.read_text()) == []  # закрыт штатно — сирот нет
     print("OK персист: после close персист пуст")
+
+    # ── #18: текущий bash — подробно (full_html/pre), не-текущий — коротко ──
+    bm.open("s14")
+    await bm.append("s14", "⚡ <b>Bash</b> <code>grep foo</code>", tool="Bash",
+                    full_html="⚡ <b>Bash</b>\n<pre>grep foo bar baz --long-flag</pre>")
+    await _settle(bm, "s14")
+    txt = bm._render_text(bm._bubbles["s14"])
+    assert "<pre>grep foo bar baz --long-flag</pre>" in txt, txt
+    print("OK #18: текущий bash рендерится полно (pre)")
+    # приходит следующий тул → предыдущий bash больше не текущий → короткая строка
+    await bm.append("s14", "📖 <b>Read</b> <code>x.py</code>", tool="Read")
+    await _settle(bm, "s14")
+    txt2 = bm._render_text(bm._bubbles["s14"])
+    assert "<pre>" not in txt2 and "grep foo</code>" in txt2, txt2
+    print("OK #18: не-текущий bash свёрнут в короткую строку")
+    await bm.close("s14")
 
     print("ALL BUBBLE OK")
 

@@ -175,3 +175,24 @@ def tool_line(tool: str, tool_input: dict, t: Callable[..., str]) -> str:
     detail = html.escape(shorten(detail))
     head = f"{icon} <b>{html.escape(tool)}</b>"
     return f"{head} <code>{detail}</code>" if detail else head
+
+
+# Полная команда текущего (in-flight) bash-вызова — в блок кода, чтобы было
+# видно ЧТО именно сейчас выполняется (короткая «голова» этого не показывает).
+_FULL_CMD_LIMIT = 600
+
+
+def tool_line_full(tool: str, tool_input: dict) -> str:
+    """Подробный вид ТЕКУЩЕГО вызова для бабла (иначе — пусто, берётся короткий).
+
+    Пока — только Bash: полная команда в <pre>. Когда вызов перестанет быть
+    текущим (пришёл следующий / завершился) — бабл покажет короткую строку.
+    """
+    if tool != "Bash":
+        return ""
+    cmd = " ".join(str(tool_input.get("command") or "").split())
+    if not cmd:
+        return ""
+    if len(cmd) > _FULL_CMD_LIMIT:
+        cmd = cmd[:_FULL_CMD_LIMIT] + "…"
+    return f"{TOOL_ICONS['Bash']} <b>Bash</b>\n<pre>{html.escape(cmd)}</pre>"

@@ -60,11 +60,15 @@ class BubbleLine:
     agent_id: str | None = None  # None = главный поток; иначе — id сабагента
     tool: str | None = None  # имя тула для схлопывания; None = не схлопывается
     count: int = 1
+    # Подробный вид (напр. полная bash-команда в <pre>) — показывается ТОЛЬКО
+    # пока эта строка «текущая» (in-flight); перестала быть текущей → короткий html.
+    full_html: str = ""
 
-    def render(self) -> str:
+    def render(self, full: bool = False) -> str:
         prefix = AGENT_INDENT if self.agent_id else ""
         count = f"{self.count}× " if self.count > 1 else ""
-        return f"{prefix}{count}{self.html}"
+        body = self.full_html if (full and self.full_html) else self.html
+        return f"{prefix}{count}{body}"
 
 
 @dataclass
@@ -74,6 +78,10 @@ class Bubble:
     # Ссылки на материализованные сообщения: имя адаптера -> ref адаптера.
     refs: dict[str, str] = field(default_factory=dict)
     entries: list[BubbleLine] = field(default_factory=list)
+    # «Текущая» строка (последний tool-вызов, in-flight) — рендерится подробно
+    # (full_html), остальные коротко. Отвязана от позиции: из-за схлопывания
+    # последний вызов может обновить не последнюю по счёту строку.
+    current_line: "BubbleLine | None" = None
     # «Живой пульс» — последний спиннер-глагол Claude Code (Cogitating…),
     # обновляемая строка внизу бабла: видно, что модель жива, когда
     # tool-событий нет (думает / ждёт API / фоновая задача).
@@ -163,12 +171,15 @@ class BubbleManager:
         *,
         agent_id: str | None = None,
         tool: str | None = None,
+        full_html: str = "",
     ) -> None:
         """Добавить строку (или схлопнуть с предыдущей, если tool задан и
         совпадает с последней строкой по (tool, agent_id) — см. BubbleLine).
 
         tool=None — строка никогда не схлопывается (📨 сообщение юзера, ⏹ стоп
         запрошен и т.п.), agent_id=None — главный поток (без отступа).
+        full_html — подробный вид для «текущей» (in-flight) строки (напр. полная
+        bash-команда в <pre>); показывается, пока строка текущая.
         """
         # Событие после финала (запоздавший хук, «Стоп») не должно рождать
         # бабл-сироту — принимаем только внутри активного хода.
@@ -188,9 +199,13 @@ class BubbleManager:
             )
         if match is not None:
             match.html = html
+            match.full_html = full_html
             match.count += 1
+            line = match
         else:
-            bubble.entries.append(BubbleLine(html=html, agent_id=agent_id, tool=tool))
+            line = BubbleLine(html=html, agent_id=agent_id, tool=tool, full_html=full_html)
+            bubble.entries.append(line)
+        bubble.current_line = line  # последний вызов — «текущий» (рендерится полно)
         bubble.updated_at = time.time()
         # Переполнение: вытесняем старые строки с начала.
         while len(bubble.entries) > 1 and len(self._render_text(bubble)) > TEXT_LIMIT:
@@ -256,7 +271,7 @@ class BubbleManager:
         if bubble.model:
             head += f" · {html_escape(bubble.model)}"
         text = f"<b>{head}</b>\n" + "\n".join(
-            e.render() for e in bubble.entries
+            e.render(full=(e is bubble.current_line)) for e in bubble.entries
         )
         if bubble.pulse:
             # Пульс жизни (спиннер-глагол · время · токены) — внизу, ОТДЕЛЁН

@@ -34,7 +34,7 @@ from .bubble import BubbleManager
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
 from .texts import get_texts
-from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line
+from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line, tool_line_full
 from .transport import Origin, PermissionRequest, Transport
 from .turn import TurnSupervisor
 from ..config import Config
@@ -636,6 +636,7 @@ class OrchestratorCore:
             tool_line(tool, tool_input, self.t),
             agent_id=str(agent_id) if agent_id else None,
             tool=tool if collapsible else None,
+            full_html=tool_line_full(tool, tool_input),  # текущий bash — полно
         )
 
     def _unblock_available(self, name: str) -> bool:
