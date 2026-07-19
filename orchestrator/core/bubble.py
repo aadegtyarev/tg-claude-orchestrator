@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 # Лимит текста бабла и минимальный интервал редактирования сообщения.
 TEXT_LIMIT = 3800
 EDIT_INTERVAL = 1.5
+# Фоновый бабл (активность между ходами: wallet-поллинг и т.п.) авто-закрывается
+# через N сек простоя — чтобы не висел вечно, если ход так и не начнётся.
+BG_IDLE_SEC = 90.0
 # Отступ для строк, приписанных сабагенту (agent_id задан) — визуально
 # отделяет их от тулов главного потока.
 AGENT_INDENT = "  ↳ "
@@ -75,6 +78,9 @@ class Bubble:
     # Реальная модель последнего ответа (после подмены прокси) — в заголовке.
     model: str = ""
     sent_text: str = ""
+    # Фоновый бабл (открыт вне хода — append_background): другой заголовок и
+    # авто-закрытие по простою. Начало хода (open) сбрасывает флаг в False.
+    background: bool = False
     flush_task: asyncio.Task | None = None
     # Момент последнего добавления строки — метка «когда обновлено» в конце
     # списка. Замораживаем, чтобы бабл не перепечатывался каждую секунду:
@@ -103,14 +109,24 @@ class BubbleManager:
         # docstring) — убираются все разом на финальном close().
         self._frozen: dict[str, list[Bubble]] = {}
         self._active: set[str] = set()  # сессии, где сейчас идёт ход Claude
+        # Дедлайны авто-закрытия фоновых баблов (session -> monotonic deadline)
+        # и их сторож-таски. Фоновый бабл живёт только между ходами.
+        self._bg_deadline: dict[str, float] = {}
+        self._bg_task: dict[str, asyncio.Task] = {}
 
     def has(self, name: str) -> bool:
         """Есть ли активный бабл (используется как признак «работает»)."""
         return name in self._bubbles
 
     def open(self, name: str) -> None:
-        """Начало хода: с этого момента append создаёт/наполняет бабл."""
+        """Начало хода: с этого момента append создаёт/наполняет бабл. Если был
+        фоновый бабл (активность между ходами) — он становится обычным ходовым:
+        снимаем авто-закрытие и флаг background (его строки продолжатся в ходе)."""
         self._active.add(name)
+        self._bg_deadline.pop(name, None)  # сторож увидит отсутствие дедлайна и выйдет
+        bubble = self._bubbles.get(name)
+        if bubble is not None:
+            bubble.background = False
 
     async def append(
         self,
@@ -154,10 +170,61 @@ class BubbleManager:
         if bubble.flush_task is None or bubble.flush_task.done():
             bubble.flush_task = asyncio.create_task(self._flush(name))
 
+    async def append_background(
+        self, name: str, html: str, *, agent_id: str | None = None, tool: str | None = None,
+    ) -> None:
+        """Строка ФОНОВОЙ активности (между ходами: wallet-поллинг и т.п.) — в
+        один саморедактируемый бабл, а не десятком отдельных сообщений.
+
+        Работает и когда хода нет: сам открывает бабл (помечает background) и
+        ставит авто-закрытие по простою (BG_IDLE_SEC). Если ход УЖЕ идёт —
+        это обычный append (строка едет в ходовой бабл, без фонового режима).
+        Схлопывание по (tool, agent_id) то же, что в append: серия одинаковых
+        фоновых вызовов сжимается в одну «N× …» строку.
+        """
+        cur = self._bubbles.get(name)
+        # Настоящий ход — активна сессия И бабл НЕ фоновый: обычный append.
+        # (Только `name in _active` мало: фоновый бабл сам добавляет сессию в
+        # _active, и повторные фоновые вызовы иначе не продлевали бы дедлайн.)
+        if name in self._active and (cur is None or not cur.background):
+            await self.append(name, html, agent_id=agent_id, tool=tool)
+            return
+        # Хода нет — открываем/продлеваем фоновый бабл.
+        self._active.add(name)
+        bubble = self._bubbles.setdefault(name, Bubble())
+        bubble.background = True
+        await self.append(name, html, agent_id=agent_id, tool=tool)
+        # Продлить простой и убедиться, что сторож живёт.
+        self._bg_deadline[name] = asyncio.get_running_loop().time() + BG_IDLE_SEC
+        task = self._bg_task.get(name)
+        if task is None or task.done():
+            self._bg_task[name] = asyncio.create_task(self._bg_watch(name))
+
+    async def _bg_watch(self, name: str) -> None:
+        """Сторож фонового бабла: спит до дедлайна и закрывает, если бабл всё
+        ещё фоновый и ход не начался. Продление дедлайна — в append_background;
+        начало хода/финал снимают дедлайн, и сторож просто выходит."""
+        loop = asyncio.get_running_loop()
+        while True:
+            deadline = self._bg_deadline.get(name)
+            if deadline is None:
+                return  # ход начался (open) или бабл закрыт — сторож не нужен
+            now = loop.time()
+            if now < deadline:
+                await asyncio.sleep(deadline - now)
+                continue
+            # Простой истёк. Закрываем ТОЛЬКО если бабл всё ещё фоновый.
+            self._bg_deadline.pop(name, None)
+            bubble = self._bubbles.get(name)
+            if bubble is not None and bubble.background:
+                await self.close(name)
+            return
+
     def _render_text(self, bubble: Bubble) -> str:
         updated = time.strftime("%H:%M:%S", time.localtime(bubble.updated_at))
-        # Заголовок + реальная модель (после подмены прокси), если известна.
-        head = self._t("bubble_working")
+        # Заголовок: фоновая активность (между ходами) или обычный ход;
+        # + реальная модель (после подмены прокси), если известна.
+        head = self._t("bubble_background" if bubble.background else "bubble_working")
         if bubble.model:
             head += f" · {html_escape(bubble.model)}"
         text = f"<b>{head}</b>\n" + "\n".join(
@@ -273,6 +340,7 @@ class BubbleManager:
         активный бабл и все замороженные сообщения, накопленные с начала
         цикла (см. freeze_and_open) — «групповое схлопывание на финале»."""
         self._active.discard(name)  # ход завершён — append больше не создаёт бабл
+        self._bg_deadline.pop(name, None)  # снять авто-закрытие фонового бабла
         bubble = self._bubbles.pop(name, None)
         frozen = self._frozen.pop(name, [])
         session = self._get_session(name)

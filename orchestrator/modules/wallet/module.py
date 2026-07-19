@@ -40,9 +40,6 @@ logger = logging.getLogger(__name__)
 
 # Таймаут команды под секретом; CLI ждёт чуть дольше (310с).
 RUN_TIMEOUT = 300.0
-# Не спамить одинаковым фоновым уведомлением кошелька чаще, чем раз в N сек
-# (модель поллит CI в цикле — иначе десятки одинаковых сообщений).
-NOTICE_DEDUP_SEC = 45.0
 # Потолок каждого потока вывода — защита от заливки памяти/чата гигабайтами.
 STREAM_LIMIT = 200_000
 # Чем заменяем значения секретов в выводе.
@@ -269,9 +266,6 @@ class WalletModule:
         # Токен → имя сессии. Session-объект резолвим на каждый запрос через
         # manager.get: сессия могла быть удалена после выдачи токена.
         self._tokens: dict[str, str] = {}
-        # Дедуп фоновых уведомлений: session → (cmd, monotonic). Модель часто
-        # поллит (gh pr checks в цикле) — одинаковый фоновый вызов не спамим.
-        self._last_notice: dict[str, tuple[str, float]] = {}
 
     # ── жизненный цикл ──────────────────────────────────────────
 
@@ -473,25 +467,21 @@ class WalletModule:
         # оба, и notice показывал сырой «<code>…</code>».
         cmd_disp = f"{name} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.core.bubbles.append(session.name, bubble_line)
+        # В бабл — ходовой ИЛИ фоновый (между ходами: поллинг CI и т.п.);
+        # append_background сам разрулит. tool="wallet" схлопывает серию
+        # одинаковых вызовов в одну «N× …» строку — поллинг не спамит, «всё в
+        # одном месте». Отдельным сообщением НЕ дублируем.
+        await self.core.bubbles.append_background(
+            session.name, bubble_line, tool="wallet"
+        )
         self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
-        if not allowed or not self.core.bubbles.has(session.name):
-            # Фоновый вызов (нет активного бабла) или отказ. Дедуп: одинаковую
-            # разрешённую команду не чаще раза в NOTICE_DEDUP_SEC (глушим спам
-            # поллинга). Отказ показываем всегда.
-            now = asyncio.get_running_loop().time()
-            prev = self._last_notice.get(session.name)
-            dup = (
-                allowed and prev is not None
-                and prev[0] == cmd_disp and now - prev[1] < NOTICE_DEDUP_SEC
+        if not allowed:
+            # Отказ — отдельным уведомлением: нужно внимание, бабл может быть незаметен.
+            notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # md code-спан
+            await self.core.notice(
+                session,
+                self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
             )
-            self._last_notice[session.name] = (cmd_disp, now)
-            if not dup:
-                notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # md code-спан
-                verdict = "" if allowed else " — " + self.core.t("wallet_denied")
-                await self.core.notice(
-                    session, self.core.t("wallet_use", line=notice_md) + verdict
-                )
         if not allowed:
             # Прозрачность: reason объясняет модели ЧТО не так и КАК правильно —
             # это доходит до её терминала (bin/wallet печатает reason), а не

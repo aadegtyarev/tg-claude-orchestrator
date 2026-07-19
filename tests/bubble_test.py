@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
 
-_TEXTS = {"bubble_working": "Работаю", "bubble_stop": "Стоп"}
+_TEXTS = {"bubble_working": "Работаю", "bubble_stop": "Стоп",
+          "bubble_background": "🌙 Фоновая активность"}
 
 
 class FakeTransport:
@@ -209,6 +210,43 @@ async def main():
     assert bm._bubbles["s7"].sent_text == prev
     await bm.close("s7")
     print("OK статус: глагол+модель в бабле, обновляются на месте, дубль не копит")
+
+    # ── фоновый бабл: активность между ходами (wallet-поллинг CI) ──
+    import orchestrator.core.bubble as _bubmod
+    _bubmod.BG_IDLE_SEC = 0.3       # быстрый простой для теста
+    _bubmod.EDIT_INTERVAL = 0.05    # быстрый flush для теста
+
+    # без активного хода append_background САМ открывает фоновый бабл
+    await bm.append_background("s10", "🔐 wallet gh pr checks", tool="wallet")
+    await _settle(bm, "s10")
+    assert bm.has("s10") and bm._bubbles["s10"].background is True
+    assert "Фоновая активность" in bm._render_text(bm._bubbles["s10"])
+    print("OK фоновый бабл: открывается без хода, свой заголовок")
+
+    # серия одинаковых фоновых вызовов схлопывается в одну строку (не спам)
+    for i in range(5):
+        await bm.append_background("s10", f"🔐 wallet gh pr checks {i}", tool="wallet")
+    await _settle(bm, "s10")
+    b10 = bm._bubbles["s10"]
+    assert len(b10.entries) == 1 and b10.entries[0].count == 6, [e.render() for e in b10.entries]
+    print("OK фоновый бабл: поллинг схлопывается в одну строку (не спам)")
+
+    # начало хода превращает фоновый бабл в обычный (флаг и авто-закрытие сняты)
+    bm.open("s10")
+    assert bm._bubbles["s10"].background is False and "s10" not in bm._bg_deadline
+    await bm.append("s10", "⚡ <b>Bash</b> <code>ls</code>", tool="Bash")
+    await _settle(bm, "s10")
+    assert "Работаю" in bm._render_text(bm._bubbles["s10"])
+    print("OK начало хода: фоновый бабл становится обычным")
+    await bm.close("s10")
+
+    # авто-закрытие по простою: фоновый бабл сам закрывается сторожем
+    await bm.append_background("s11", "🔐 wallet poll", tool="wallet")
+    await _settle(bm, "s11")
+    assert bm.has("s11")
+    await asyncio.wait_for(bm._bg_task["s11"], timeout=5)  # дождаться сторожа
+    assert not bm.has("s11"), "фоновый бабл должен авто-закрыться по простою"
+    print("OK фоновый бабл: авто-закрытие по простою")
 
     print("ALL BUBBLE OK")
 

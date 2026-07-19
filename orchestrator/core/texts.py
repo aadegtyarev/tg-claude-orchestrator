@@ -122,6 +122,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Вывод команды — в claude.log; в чат придёт только то, что Claude отправит сам."
         ),
         "bubble_working": "⏳ Работаю…",
+        "bubble_background": "🌙 Фоновая активность…",
         "bubble_stop": "⏹ Стоп-отчёт",
         "bubble_esc": "⛔ Прервать ход",
         "bubble_unblock": "⏭ Разблокировать",
@@ -327,6 +328,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Command output stays in claude.log; only what Claude sends arrives here."
         ),
         "bubble_working": "⏳ Working…",
+        "bubble_background": "🌙 Background activity…",
         "bubble_stop": "⏹ Stop report",
         "bubble_esc": "⛔ Interrupt turn",
         "bubble_unblock": "⏭ Unblock input",
