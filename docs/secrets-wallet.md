@@ -192,8 +192,10 @@ confirm = true
    `settings.local.json` сессии:
    - `autoMode.hard_deny` — «не добывай секреты: не дампи env ради токенов, не
      читай кред-сторы, не кодируй/не пересылай; для git/gh — кошелёк»;
-     `autoMode.environment` — где лежат секреты; `classifyAllShell: true` —
-     судья проверяет ВСЕ bash-команды.
+     `autoMode.environment` — где лежат секреты; `classifyAllShell` — судья
+     проверяет ВСЕ bash-команды (значение из `AUTOMODE_CLASSIFY_ALL_SHELL`,
+     дефолт on; `=0` — меньше вопросов на легит-но-рискованное вроде force-push,
+     но слабее защита от хитрого exfil).
    - `permissions.deny` — жёсткое чтение кред-файлов (`~/.config/gh`, `~/.netrc`,
      `~/.ssh`, `~/.aws`, keyring-CLI). Работает во ВСЕХ режимах, **включая
      `bypass`** (deny-правила Claude Code применяет всегда).

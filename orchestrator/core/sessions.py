@@ -396,7 +396,7 @@ class SessionManager:
         - Stop-хук (всегда): конец хода → POST /stop/<имя> с
           last_assistant_message → фолбэк, если ход завершился голым текстом
           вместо reply_to_user (REVIEW: 9/9 длинных ходов в живой сессии
-          теряли финал именно так — см. bot.py handle_stop_event).
+          теряли финал именно так — см. core/app.py handle_stop_event).
           Оба события ловит один скрипт-диспетчер (hookscript.py), никогда не
           блокирует Claude (except+exit 0).
         """
