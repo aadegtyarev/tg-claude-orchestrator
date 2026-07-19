@@ -576,8 +576,13 @@ class SessionManager:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
             if asyncio.get_running_loop().time() > deadline:
+                # Частая причина при обновлении Claude Code: channels —
+                # research preview, флаги/протокол могут поменяться, и тогда
+                # claude не спавнит channel_server или не отвечает handshake.
                 raise SessionError(
                     f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
+                    "Возможно, обновилась версия Claude Code и изменился протокол "
+                    "каналов (research preview) — проверь лог и совместимость. "
                     f"Лог: {session.session_dir / 'claude.log'}"
                 )
             await asyncio.sleep(1)
@@ -995,6 +1000,11 @@ class SessionManager:
         """Статистика из транскрипта (None — ещё не создан). Блокирующее
         чтение — вызывать через asyncio.to_thread. Логика — transcript.py."""
         return transcript.read_stats(self.transcript_path(session))
+
+    def read_last_model(self, session: Session) -> str | None:
+        """Реальная модель последнего ответа (после подмены прокси) — дёшево
+        из хвоста транскрипта. Логика — transcript.read_last_model."""
+        return transcript.read_last_model(self.transcript_path(session))
 
     def read_pollution_excerpt(self, session: Session, max_entries: int = 25) -> str | None:
         """Эксцепт загрязнения чужим бэкендом из хвоста транскрипта (или None).

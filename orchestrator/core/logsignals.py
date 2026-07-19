@@ -15,6 +15,16 @@ import re
 # ложный алерт. Баннер с кодом модель дословно не цитирует — это надёжный сигнал.
 # group(1)=код, group(2)=хвост строки с деталями (для класса).
 API_ERR_BANNER_RE = re.compile(rb"API Error:\s*(\d{3})\b([^\n]{0,140})", re.IGNORECASE)
+# Лимит-баннер БЕЗ 3-значного HTTP-кода: «API Error: Server is temporarily
+# limiting requests … [1310][Weekly/Monthly Limit Exhausted. Your limit will
+# reset at <дата>]». HTTP-код тут не 3-значный (1310 в скобках), поэтому
+# основной регекс его не ловил — а именно на нём noos часами «молчал».
+_QUOTA_BANNER_RE = re.compile(
+    rb"API Error:[^\n]*?(?:temporarily limiting requests|Limit Exhausted)"
+    rb"[^\n]{0,160}",
+    re.IGNORECASE,
+)
+_QUOTA_RESET_RE = re.compile(rb"reset at\s*([0-9:\- ]{10,25})", re.IGNORECASE)
 # Класс ошибки по деталям баннера (код разбираем отдельно).
 _RL_DETAIL_RE = re.compile(rb"rate[\s_-]?limit|overloaded|\bcapacity\b", re.IGNORECASE)
 _PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d|thinking", re.IGNORECASE)
@@ -23,6 +33,21 @@ _PROTO_DETAIL_RE = re.compile(rb"server_tool_use|tool_result|messages\.\d|thinki
 #  • краш-рестарт — баннер «Resume this session with» / «Welcome back».
 RETRY_RE = re.compile(rb"attempt\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 RESTART_RE = re.compile(rb"Resume this session with|Welcome back", re.IGNORECASE)
+# «Живой пульс» из TUI-спиннера Claude Code: забавные глаголы + таймер, напр.
+# «✻ Cogitating…», «✳ Quantumizing…» (сейчас думает) или «✻ Cogitated for 5m 57s»
+# (только что думал). Показываем последний в бабле как признак «модель жива»,
+# когда tool-событий нет. Эллипсис — юникодный (…, \xe2\x80\xa6) или три точки.
+# Спиннер целиком несёт три живых сигнала: глагол, прошедшее время и счётчик
+# выходных токенов, напр. «✻ Cogitating… (1m 23s · ↓ 340 tokens)» или
+# «✻ Cogitated for 5m 57s». Собираем их в одну строку пульса.
+# Активный глагол «…»: за ним в скобках часто время «(12s ·».
+_VERB_ACTIVE_RE = re.compile(
+    rb"\b([A-Z][a-z]{2,}ing)(?:\xe2\x80\xa6|\.{3})(?:\s*\((\d+[hms][\dhms ]*?)[ )\xc2\xb7])?"
+)
+# Завершённый «Verb for <time>».
+_VERB_DONE_RE = re.compile(rb"\b([A-Z][a-z]{2,}(?:ed|ing))\s+for\s+(\d[\dhms ]*[hms])")
+# Счётчик выходных токенов («↓ 128 tokens») — растёт по мере генерации.
+_TOKENS_RE = re.compile(rb"(\d{1,7})\s*tokens\b")
 
 
 def classify_api_error(code: bytes, detail: bytes) -> str:
@@ -49,12 +74,49 @@ def detect_log_signals(chunk: bytes) -> dict:
       • retry — (attempt, total) из «attempt K/M», последний в куске, либо None;
       • restarts — сколько баннеров рестарта.
     """
-    out: dict = {"api_error": None, "retry": None, "restarts": 0}
+    out: dict = {
+        "api_error": None, "retry": None, "restarts": 0, "pulse": None, "quota": None,
+    }
     m = API_ERR_BANNER_RE.search(chunk)
     if m:
         out["api_error"] = (m.group(1), classify_api_error(m.group(1), m.group(2)))
+    # Лимит-баннер без 3-значного кода (Weekly/Monthly exhausted и т.п.).
+    qm = _QUOTA_BANNER_RE.search(chunk)
+    if qm:
+        reset = _QUOTA_RESET_RE.search(qm.group(0))
+        out["quota"] = (
+            b" ".join(reset.group(1).split()).decode("ascii", "replace") if reset else ""
+        )
     rm = RETRY_RE.search(chunk)
     if rm:
         out["retry"] = (int(rm.group(1)), int(rm.group(2)))
     out["restarts"] = len(RESTART_RE.findall(chunk))
+    out["pulse"] = _extract_pulse(chunk)
+    tok = _TOKENS_RE.findall(chunk)
+    out["tokens"] = int(tok[-1]) if tok else None
     return out
+
+
+def _extract_pulse(chunk: bytes) -> str | None:
+    """Последний спиннер-глагол Claude Code (+время, если рядом) из куска лога
+    → строка для бабла (напр. «Cogitating · 12s» или «Cogitated · 5m 57s»)
+    либо None.
+
+    Всё это — из TUI-вывода в claude.log (в транскрипте спиннера нет). Приоритет
+    активному «-ing…» (думает сейчас); иначе последний завершённый «… for <time>».
+    Парсинг TUI хрупок: изменится рендер — вернётся None, бабл просто без пульса.
+    """
+    active = list(_VERB_ACTIVE_RE.finditer(chunk))
+    if active:
+        verb = active[-1].group(1).decode("ascii", "replace")
+        elapsed = active[-1].group(2)  # опц. время из «(12s ·»
+        if elapsed:
+            dur = b" ".join(elapsed.split()).decode("ascii", "replace")
+            return f"{verb} · {dur}"
+        return verb
+    done = list(_VERB_DONE_RE.finditer(chunk))
+    if done:
+        verb = done[-1].group(1).decode("ascii", "replace")
+        dur = b" ".join(done[-1].group(2).split()).decode("ascii", "replace")
+        return f"{verb} · {dur}"
+    return None

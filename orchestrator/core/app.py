@@ -81,7 +81,9 @@ class OrchestratorCore:
         self._last_tool: dict[str, str] = {}
         # Фоновые задачи хода (typing/watchdog/error-relay) и Stop-гейт —
         # единым владельцем (turn.py). Доставка — колбэками в адаптеры.
-        self.turns = TurnSupervisor(manager, self.t, self.notice, self._typing_any)
+        self.turns = TurnSupervisor(
+            manager, self.t, self.notice, self._typing_any, self.bubbles.set_status
+        )
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
         # Журнал событий per-сессия: показать историю в веб-интерфейсе после
@@ -731,6 +733,10 @@ class OrchestratorCore:
         )
         if stats is None:
             return self.t("stats_no_transcript", header=header, uptime=uptime)
+        if stats.get("stale_schema"):
+            # Транскрипт есть и валиден, но ни одного ожидаемого поля не
+            # извлекли — вероятно, поменялась схема Claude Code.
+            return self.t("stats_stale_schema", header=header, uptime=uptime)
         ctx = stats["context_tokens"]
         return self.t(
             "stats_body",
