@@ -81,13 +81,30 @@ def main():
 
     # живой пульс: глагол + время + токены (всё из TUI-спиннера)
     s = _detect_log_signals("✻ Cogitating… (12s · ↓ 340 tokens)".encode())
-    assert s["pulse"] == "Cogitating · 12s" and s["tokens"] == 340, (s["pulse"], s["tokens"])
+    assert s["pulse"] == "Cogitating · 12s" and s["tokens"] == "340", (s["pulse"], s["tokens"])
+    # токены с суффиксом «k» (реальный формат при >1000, прежде терялись целиком)
+    k = _detect_log_signals("✻ Deciphering… (1m 11s · ↓2.6k tokens)".encode())
+    assert k["tokens"] == "2.6k" and k["pulse"] == "Deciphering · 1m 11s", (k["tokens"], k["pulse"])
+    # свежее время из блока статистики тикает, даже если строка глагола перебита
+    # анимацией спиннера (реальный лог: «Deciphering…94✶13*…» + отдельный блок)
+    g = _detect_log_signals("Deciphering…94✶13*✢·Deciphering… (33s · ↓ 683 tokens)".encode())
+    assert g["pulse"] == "Deciphering · 33s" and g["tokens"] == "683", (g["pulse"], g["tokens"])
     assert _detect_log_signals("✻ Cogitated for 5m 57s".encode())["pulse"] == "Cogitated · 5m 57s"
     # активный побеждает завершённый в том же куске
     assert _detect_log_signals("Brewed for 1m 31s … Churning…".encode())["pulse"] == "Churning"
     # нет спиннера — None (не ложим прозу)
     assert _detect_log_signals("просто текст ответа модели".encode())["pulse"] is None
-    print("OK detect: пульс (глагол · время · токены; active > done, без ложных)")
+    # компакция контекста — явный пульс (тоже «тупняк», ввод заблокирован)
+    assert _detect_log_signals("✻ Compacting conversation…".encode())["pulse"] == "Сжимаю контекст"
+    # компакция ПОСЛЕ завершённого глагола в том же куске — компакция текущая
+    assert _detect_log_signals(
+        "Cogitated for 3s … Compacting conversation…".encode()
+    )["pulse"] == "Сжимаю контекст"
+    # активный глагол (модель уже думает после сжатия) побеждает компакцию
+    assert _detect_log_signals(
+        "Compacting conversation… ✻ Thundering…".encode()
+    )["pulse"] == "Thundering"
+    print("OK detect: пульс (глагол · время · токены; compact; active > compact > done)")
 
     # quota-баннер БЕЗ 3-значного кода (Weekly/Monthly exhausted) — реальный noos
     q = _detect_log_signals(

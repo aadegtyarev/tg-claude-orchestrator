@@ -46,8 +46,21 @@ _VERB_ACTIVE_RE = re.compile(
 )
 # Завершённый «Verb for <time>».
 _VERB_DONE_RE = re.compile(rb"\b([A-Z][a-z]{2,}(?:ed|ing))\s+for\s+(\d[\dhms ]*[hms])")
-# Счётчик выходных токенов («↓ 128 tokens») — растёт по мере генерации.
-_TOKENS_RE = re.compile(rb"(\d{1,7})\s*tokens\b")
+# Свежайший блок статистики спиннера «(<время> · ↓ <токены> tokens)» —
+# оба живых числа разом. Токены реально с суффиксом «k/m» («↓2.6k tokens»,
+# «↓1.8k tokens»); прежний `\d+ tokens` ломался о «k» и при >1000 токенов
+# (почти всегда во время генерации) счётчик пропадал. Держим строкой как есть
+# («2.6k»). Тащим отдельным regex, т.к. строка глагола часто перебита анимацией
+# спиннера («Deciphering…94✶1305…») и время рядом с ней теряется — а этот блок
+# TUI перерисовывает целиком, из него берём тикающее время для «живости».
+_STATS_RE = re.compile(
+    rb"\((\d+\s*[hms](?:\s*\d+\s*[hms])*)\s*\xc2\xb7"       # (<время>·
+    rb"\s*\xe2\x86\x93\s*(\d[\d.]*[kmKM]?)\s*tokens",       #  ↓<токены> tokens
+)
+# Компакция контекста: Claude Code сжимает историю («Compacting conversation…»
+# в TUI), ввод заблокирован и глаголов-спиннера нет — для человека это такой же
+# «тупняк», как долгий ход. Показываем явным пульсом, чтобы было видно ЧТО идёт.
+_COMPACTING_RE = re.compile(rb"Compacting conversation", re.IGNORECASE)
 
 
 def classify_api_error(code: bytes, detail: bytes) -> str:
@@ -91,16 +104,24 @@ def detect_log_signals(chunk: bytes) -> dict:
     if rm:
         out["retry"] = (int(rm.group(1)), int(rm.group(2)))
     out["restarts"] = len(RESTART_RE.findall(chunk))
-    out["pulse"] = _extract_pulse(chunk)
-    tok = _TOKENS_RE.findall(chunk)
-    out["tokens"] = int(tok[-1]) if tok else None
+    # Свежайший блок «(<время> · ↓ <токены>)»: тикающее время и счётчик токенов
+    # (строкой, с суффиксом «2.6k»). Оба — самый надёжный признак «модель жива».
+    stats = _STATS_RE.findall(chunk)
+    if stats:
+        live_elapsed, tok = stats[-1]
+        out["tokens"] = tok.decode("ascii", "replace")
+    else:
+        live_elapsed = None
+        out["tokens"] = None
+    out["pulse"] = _extract_pulse(chunk, live_elapsed)
     return out
 
 
-def _extract_pulse(chunk: bytes) -> str | None:
+def _extract_pulse(chunk: bytes, live_elapsed: bytes | None = None) -> str | None:
     """Последний спиннер-глагол Claude Code (+время, если рядом) из куска лога
     → строка для бабла (напр. «Cogitating · 12s» или «Cogitated · 5m 57s»)
-    либо None.
+    либо None. live_elapsed — свежайшее время из блока статистики (тикает даже
+    когда строка глагола перебита анимацией спиннера); приоритетнее inline-времени.
 
     Всё это — из TUI-вывода в claude.log (в транскрипте спиннера нет). Приоритет
     активному «-ing…» (думает сейчас); иначе последний завершённый «… for <time>».
@@ -109,11 +130,15 @@ def _extract_pulse(chunk: bytes) -> str | None:
     active = list(_VERB_ACTIVE_RE.finditer(chunk))
     if active:
         verb = active[-1].group(1).decode("ascii", "replace")
-        elapsed = active[-1].group(2)  # опц. время из «(12s ·»
+        elapsed = live_elapsed or active[-1].group(2)  # свежее время > inline
         if elapsed:
             dur = b" ".join(elapsed.split()).decode("ascii", "replace")
             return f"{verb} · {dur}"
         return verb
+    # Компакция — блокирующее состояние без спиннера; выше «завершённого» глагола
+    # (после «Cogitated for 3s» модель могла уйти в сжатие — оно и есть текущее).
+    if _COMPACTING_RE.search(chunk):
+        return "Сжимаю контекст"
     done = list(_VERB_DONE_RE.finditer(chunk))
     if done:
         verb = done[-1].group(1).decode("ascii", "replace")
