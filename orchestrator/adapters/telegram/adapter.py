@@ -229,27 +229,24 @@ class TelegramAdapter:
 
     # ── Transport: статус-бабл ──────────────────────────────────
 
-    def _stop_markup(self, thread_id: int) -> InlineKeyboardMarkup:
+    def _stop_markup(self, thread_id: int, unblock_active: bool = False) -> InlineKeyboardMarkup:
         # ⏹ — мягкий стоп (push «сверни работу и отчитайся»);
-        # ⏬ — Ctrl+B: текущую задачу в фон (ход не прерывается);
-        # ⛔ — жёсткое прерывание: Esc в PTY, как в TUI (ход обрывается сразу).
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)
-            ),
-            InlineKeyboardButton(
-                text=self.t("bubble_unblock"), callback_data=cbdata.bg_cb(thread_id)
-            ),
-            InlineKeyboardButton(
-                text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)
-            ),
-        ]])
+        # ⏭ — разблокировать ввод (Ctrl+B/Esc): в Telegram нет «серых» кнопок,
+        #     поэтому ПОКАЗЫВАЕМ её только когда есть что разблокировать
+        #     (unblock_active) — иначе бесполезная кнопка-no-op;
+        # ⛔ — жёсткое прерывание хода: Esc в PTY (ход обрывается сразу).
+        row = [InlineKeyboardButton(
+            text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id))]
+        if unblock_active:
+            row.append(InlineKeyboardButton(
+                text=self.t("bubble_unblock"), callback_data=cbdata.bg_cb(thread_id)))
+        row.append(InlineKeyboardButton(
+            text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)))
+        return InlineKeyboardMarkup(inline_keyboard=[row])
 
     async def bubble_post(
         self, session: Session, html_text: str, *, stop_button: bool, unblock_active: bool = False
     ) -> str | None:
-        # unblock_active игнорируем: у Telegram нет «серых» inline-кнопок, ⏬ всегда
-        # видима (нажатие когда сворачивать нечего — безвредный no-op).
         if self.chat_id is None:
             return None
         thread_id = self._thread_of(session)
@@ -260,7 +257,7 @@ class TelegramAdapter:
             text=html_text,
             message_thread_id=thread_id,
             disable_notification=True,
-            reply_markup=self._stop_markup(thread_id) if stop_button else None,
+            reply_markup=self._stop_markup(thread_id, unblock_active) if stop_button else None,
             parse_mode="HTML",
         )
         return str(msg.message_id)
@@ -278,7 +275,8 @@ class TelegramAdapter:
             message_id=int(ref),
             text=html_text,
             reply_markup=(
-                self._stop_markup(thread_id) if stop_button and thread_id else None
+                self._stop_markup(thread_id, unblock_active)
+                if stop_button and thread_id else None
             ),
             parse_mode="HTML",
         )

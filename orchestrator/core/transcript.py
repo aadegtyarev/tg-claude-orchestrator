@@ -88,12 +88,18 @@ def read_stats(path: Path) -> dict | None:
     total_output = 0
     last_usage: dict = {}
     model = ""
-    with open(path, encoding="utf-8") as f:
+    parsed_lines = 0
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        return None
+    with f:
         for line in f:
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
+            parsed_lines += 1
             if entry.get("type") == "user":
                 content = (entry.get("message") or {}).get("content")
                 # tool_result тоже приходит user-записью — не считаем его.
@@ -117,12 +123,22 @@ def read_stats(path: Path) -> dict | None:
         + last_usage.get("cache_read_input_tokens", 0)
         + last_usage.get("cache_creation_input_tokens", 0)
     )
+    size = path.stat().st_size
+    # Детект «формат Claude Code изменился»: транскрипт заметного размера
+    # распарсился (JSONL валиден), но НИ одного ожидаемого поля не извлекли
+    # (ни ходов, ни usage, ни модели) — вероятно, поменялась схема записей.
+    # Пустой/крошечный транскрипт (новая сессия) под это не подпадает.
+    stale_schema = (
+        size > 4096 and parsed_lines > 5
+        and turns == 0 and total_output == 0 and not last_usage and not model
+    )
     return {
         "model": model,
         "context_tokens": context,
         "output_tokens": total_output,
         "turns": turns,
-        "transcript_bytes": path.stat().st_size,
+        "transcript_bytes": size,
+        "stale_schema": stale_schema,
     }
 
 
