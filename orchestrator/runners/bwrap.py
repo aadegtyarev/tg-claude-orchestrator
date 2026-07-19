@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 class BwrapRunner:
     name = "bwrap"
     unique_cwd = False
+    supports_prefix = True  # /bash можно изолировать (или off — на хосте, как и весь режим)
 
     def __init__(self, config: "Config", root: Path):
         self.config = config

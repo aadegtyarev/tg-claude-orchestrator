@@ -31,6 +31,7 @@ class Runner(Protocol):
     # имя VM = hash(cwd), вторая сессия убьёт VM первой). SessionManager
     # проверяет это при создании сессии.
     unique_cwd: bool
+    supports_prefix: bool  # можно ли изолировать отдельный /bash (agent-vm — нет)
 
     def preflight(self) -> tuple[bool, str]:
         """Готов ли раннер к работе: (ok, причина-если-нет).

@@ -242,6 +242,9 @@ async def main():
 
         # guard (_always_denied): печать токена и git-RCE — независимо от commands
         assert _always_denied(["gh", "auth", "token"]) is not None
+        assert _always_denied(["gh", "--verbose", "auth", "token"]) is not None  # флаг до auth не спасает
+        assert _always_denied(["gh", "pr", "create", "--title", "auth token"]) is None  # не ложно-блок
+        assert _always_denied(["gh", "auth", "login"]) is None  # не печатает токен
         assert _always_denied(["gh", "auth", "status", "--show-token"]) is not None
         assert _always_denied(["gh", "auth", "status"]) is None        # без --show-token ок
         assert _always_denied(["git", "-c", "core.sshCommand=evil", "push"]) is not None

@@ -32,6 +32,9 @@ AGENT_VM_BIN = "agent-vm"
 class AgentVmRunner:
     name = "agent-vm"
     unique_cwd = True  # имя VM = hash(cwd): вторая сессия убила бы VM первой
+    # Отдельный /bash в VM не изолировать (unique_cwd) — отказываем, а не гоним
+    # без изоляции (см. run_bash).
+    supports_prefix = False
 
     def __init__(self, config: "Config", root: Path):
         self.config = config

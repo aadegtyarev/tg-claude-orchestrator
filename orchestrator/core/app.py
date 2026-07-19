@@ -1041,6 +1041,11 @@ class OrchestratorCore:
         у claude). Стримит рендер (HTML) через on_update(html, done); в конце —
         код возврата. Если терминал занят — UserError.
         """
+        # agent-vm не может изолировать отдельный /bash (одна VM на cwd) —
+        # молча гнать его на хосте, пока claude в VM, нельзя (принцип «без
+        # изоляции не деградируем»). Отказываем понятной ошибкой.
+        if not self.manager.runner.supports_prefix:
+            raise UserError(self.t("bash_no_isolation", sandbox=self.config.sandbox))
         cwd = self.bash_cwd(session)
         extra_rw = [cwd] + ([session.session_dir] if session is not None else [])
         wrapper = self.manager.sandbox_prefix(

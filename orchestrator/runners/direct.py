@@ -11,6 +11,7 @@ class DirectRunner:
 
     name = "direct"
     unique_cwd = False
+    supports_prefix = True  # /bash можно изолировать (или off — на хосте, как и весь режим)
 
     def preflight(self) -> tuple[bool, str]:
         return True, "ok"

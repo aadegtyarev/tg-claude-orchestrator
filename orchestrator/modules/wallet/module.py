@@ -65,11 +65,16 @@ def _always_denied(cmd: list[str]) -> str | None:
     только доверием к сессии (см. docs «Известные дыры»).
     """
     binary = os.path.basename(cmd[0]) if cmd else ""
-    # 1. Печатают сам секрет — редакция literal-only их не всегда ловит.
-    if cmd[:2] == ["gh", "auth"] and ("token" in cmd[2:3] or "--show-token" in cmd):
-        return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
-                "секретов. Используй gh для операций (gh pr …, gh api …, gh release …), "
-                "а не для печати токена.")
+    # 1. Печатают сам секрет — редакция literal-only их не всегда ловит. Смотрим
+    # ПЕРВУЮ не-флаговую подкоманду (чтобы `gh --флаг auth token` не проскочил, но
+    # `gh pr create --title "auth token"` не ложно-сработал: там первая подкоманда
+    # «pr», а не «auth»).
+    if binary == "gh":
+        subs = [a for a in cmd[1:] if not a.startswith("-")]
+        if subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd):
+            return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
+                    "секретов. Используй gh для операций (gh pr …, gh api …, gh release …), "
+                    "а не для печати токена.")
     # 2. git → произвольное исполнение на хосте через конфиг/транспорт/флаги.
     if binary == "git":
         toks = cmd[1:]

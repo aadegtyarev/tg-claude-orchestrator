@@ -130,6 +130,8 @@ class BashShellManager:
     ) -> BashSession:
         sess = self._sessions.get(key)
         if sess is None or not sess.running:
+            if sess is not None:
+                sess.close()  # умершую оболочку закрыть — иначе утечёт master fd
             sess = BashSession(cwd, wrapper)
             self._sessions[key] = sess
             logger.info("bash-терминал открыт (%s, cwd %s)", key, cwd)
