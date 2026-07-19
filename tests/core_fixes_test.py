@@ -89,11 +89,11 @@ async def test_taskoutput_and_bg_available():
         lines.append(html)
     core.bubbles = SimpleNamespace(append=fake_append, close=lambda n: asyncio.sleep(0))
 
-    # is_busy управляем через фейк-менеджер.
+    # has_children управляем через фейк-менеджер (кнопка ⏭ теперь на нём, не is_busy).
     busy = {"v": True}
-    core.manager.is_busy = lambda s: busy["v"]
+    core.manager.has_children = lambda s: busy["v"]
 
-    # Обычный Bash идёт (is_busy) → можно свернуть в фон (⏭ активна, Ctrl+B).
+    # Обычный Bash идёт (has_children) → можно свернуть в фон (⏭ активна, Ctrl+B).
     await core.handle_tool_event("noos", {"tool_name": "Bash",
                                           "tool_input": {"command": "make build"}})
     assert core._unblock_available("noos") is True
