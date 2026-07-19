@@ -238,7 +238,7 @@ class TelegramAdapter:
                 text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)
             ),
             InlineKeyboardButton(
-                text=self.t("bubble_bg"), callback_data=cbdata.bg_cb(thread_id)
+                text=self.t("bubble_unblock"), callback_data=cbdata.bg_cb(thread_id)
             ),
             InlineKeyboardButton(
                 text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)
@@ -246,8 +246,10 @@ class TelegramAdapter:
         ]])
 
     async def bubble_post(
-        self, session: Session, html_text: str, *, stop_button: bool
+        self, session: Session, html_text: str, *, stop_button: bool, unblock_active: bool = False
     ) -> str | None:
+        # unblock_active игнорируем: у Telegram нет «серых» inline-кнопок, ⏬ всегда
+        # видима (нажатие когда сворачивать нечего — безвредный no-op).
         if self.chat_id is None:
             return None
         thread_id = self._thread_of(session)
@@ -264,7 +266,8 @@ class TelegramAdapter:
         return str(msg.message_id)
 
     async def bubble_edit(
-        self, session: Session, ref: str, html_text: str, *, stop_button: bool
+        self, session: Session, ref: str, html_text: str, *, stop_button: bool,
+        unblock_active: bool = False,
     ) -> None:
         if self.chat_id is None:
             return
@@ -993,8 +996,8 @@ class TelegramAdapter:
             await callback.answer(self.t("stop_not_active"))
             return
         try:
-            await self.core.background(session)
-            await callback.answer(self.t("bg_requested"))
+            await self.core.unblock(session)
+            await callback.answer(self.t("unblock_requested"))
         except UserError as e:
             await callback.answer(str(e))
         except Exception as e:

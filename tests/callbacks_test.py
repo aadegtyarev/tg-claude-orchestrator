@@ -70,8 +70,8 @@ class FakeCore:
     async def hard_stop(self, s):
         calls.append(("esc_sent",))
 
-    async def background(self, s):
-        calls.append(("bg_sent",))
+    async def unblock(self, s):
+        calls.append(("unblock_sent",))
 
     def stats_text(self, s):
         return "stats"
@@ -141,7 +141,7 @@ async def main():
 
     calls.clear()
     await a.on_bg_button(cb("bg:7"))
-    assert ("bg_sent",) in calls
+    assert ("unblock_sent",) in calls
     print("OK on_bg_button (Ctrl+B в фон)")
 
     calls.clear()

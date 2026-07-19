@@ -73,8 +73,12 @@ class OrchestratorCore:
         self.adapters: dict[str, Transport] = {}
         self.modules: list = []  # модули (modules/*) — start/stop вместе с ядром
         self.bubbles = BubbleManager(
-            self._transports, manager.get, self.t, config.delete_bubble
+            self._transports, manager.get, self.t, config.delete_bubble,
+            unblock_available=self._unblock_available,
         )
+        # Последний значимый тул на сессию — для детекта состояния «ждёт
+        # фоновую задачу» (TaskOutput) и активности кнопки ⏬.
+        self._last_tool: dict[str, str] = {}
         # Фоновые задачи хода (typing/watchdog/error-relay) и Stop-гейт —
         # единым владельцем (turn.py). Доставка — колбэками в адаптеры.
         self.turns = TurnSupervisor(manager, self.t, self.notice, self._typing_any)
@@ -341,6 +345,7 @@ class OrchestratorCore:
             await self.bubbles.close(session.name)
             raise UserError(self.t("forward_fail", error=e)) from e
         self._record(session, "user", text=text, via=origin.adapter)
+        self._last_tool.pop(session.name, None)  # новый ход — сброс bg-состояния
         snippet = html.escape(shorten(text, 28))
         await self.bubbles.append(session.name, f"📨 {snippet}")
         self.turns.start(session.name)
@@ -369,15 +374,36 @@ class OrchestratorCore:
         self._record(session, "status", status="interrupted")
         await self.notice(session, self.t("esc_done"))
 
-    async def background(self, session: Session) -> None:
-        """Отправить текущую задачу в фон: Ctrl+B в PTY (не прерывает ход —
-        долгая команда уходит в фон, модель продолжает). Бабл/сторожей НЕ
-        гасим: ход живой."""
+    def unblock_action(self, name: str) -> str | None:
+        """Что сделает кнопка ⏭ сейчас: "kick" (Esc — прервать ожидание фона),
+        "background" (Ctrl+B — свернуть идущую задачу) или None (нечего)."""
+        session = self.manager.get(name)
+        if session is None:
+            return None
+        if self._last_tool.get(name) == "TaskOutput":
+            return "kick"
+        if self.manager.is_busy(session):
+            return "background"
+        return None
+
+    async def unblock(self, session: Session) -> None:
+        """Разблокировать ввод модели, НЕ прерывая ход насмерть (для этого —
+        hard_stop). Контекстно (см. unblock_action):
+          * модель ждёт фоновую задачу (TaskOutput) → Esc прерывает именно
+            ожидание, модель принимает новый ввод;
+          * идёт долгая foreground-команда → Ctrl+B сворачивает её в фон.
+        Оба случая освобождают ввод. Бабл/сторожей не гасим — ход живой."""
+        action = self.unblock_action(session.name)
         try:
-            self.manager.background_turn(session)
+            if action == "kick":
+                self.manager.interrupt_turn(session)  # Esc — пинок ожидания
+                await self.bubbles.append(session.name, self.t("bubble_kicked"))
+            else:
+                # background или "нечего" — Ctrl+B безвреден как no-op.
+                self.manager.background_turn(session)  # Ctrl+B — в фон
+                await self.bubbles.append(session.name, self.t("bubble_backgrounded"))
         except SessionError as e:
             raise UserError(str(e)) from e
-        await self.bubbles.append(session.name, self.t("bubble_backgrounded"))
 
     async def slash_command(self, session: Session, cmd: str) -> None:
         """Неизвестные /команды — прямо в терминал Claude (команды Claude Code)."""
@@ -420,12 +446,20 @@ class OrchestratorCore:
             # пока работает дальше.
             if text:
                 await self._deliver_text(session, text, origin, intermediate=True)
+                # Бабл, если он был, «застрял» бы ВЫШЕ этого 💬 (у него свой
+                # message_id). Замораживаем его на месте и открываем новый —
+                # дальнейшие события хода пойдут ПОД ответом модели, как бабл
+                # шёл под сообщением пользователя (freeze_and_open, линейная
+                # история без прыжков). Только если бабл активен.
+                if self.bubbles.has(session.name):
+                    await self.bubbles.freeze_and_open(session.name)
             return
 
         # Финал (даже с пустым текстом): гасим typing и бабл, чтобы индикатор
         # не крутился вечно. Сначала сообщение, потом чистка бабла — окна
         # «ответа ещё нет» не остаётся.
         self.turns.stop(session.name)
+        self._last_tool.pop(session.name, None)  # ход завершён — сброс bg-состояния
         if text:
             await self._deliver_text(session, text, origin, intermediate=False)
         await self.bubbles.close(session.name)
@@ -512,7 +546,17 @@ class OrchestratorCore:
             return  # результат и так придёт сообщением — в бабле это шум
         if is_file:
             return  # тоже придёт сообщением; не считается «текстовым» ответом
+        # Запоминаем последний значимый тул: TaskOutput = модель ждёт фоновую
+        # задачу (заглушка-ожидание в TUI), в этом состоянии кнопка ⏬ неактивна
+        # (сворачивать нечего — уже в фоне), а ⛔ прерывает именно ожидание.
+        self._last_tool[session.name] = tool
         tool_input = payload.get("tool_input") or {}
+        if tool == "TaskOutput":
+            # Явно показываем «ждёт фон» — иначе для пользователя это выглядит
+            # как молчание (эксперимент подтвердил: Bash run_in_background →
+            # TaskOutput). Строка не схлопывается (tool=None).
+            await self.bubbles.append(session.name, self.t("bubble_waiting_bg"))
+            return
         # agent_id/agent_type — на каждом тул-вызове ВНУТРИ сабагента.
         agent_id = payload.get("agent_id")
         # Спавн сабагента (описание всегда разное) и TodoWrite (состояние
@@ -524,6 +568,11 @@ class OrchestratorCore:
             agent_id=str(agent_id) if agent_id else None,
             tool=tool if collapsible else None,
         )
+
+    def _unblock_available(self, name: str) -> bool:
+        """Есть ли что разблокировать (для активности кнопки ⏭): ждёт фон
+        (Esc) или идёт команда (Ctrl+B). В покое — нечего."""
+        return self.unblock_action(name) is not None
 
     async def handle_stop_event(self, session_name: str, payload: dict) -> None:
         """Stop-хук — конец хода Claude Code.

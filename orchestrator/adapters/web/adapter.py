@@ -144,31 +144,28 @@ class WebAdapter:
         return bool(self._ws_clients)
 
     async def bubble_post(
-        self, session: Session, html: str, *, stop_button: bool
+        self, session: Session, html: str, *, stop_button: bool, unblock_active: bool = False
     ) -> str | None:
         ref = str(next(self._bubble_seq))
         # Запоминаем последнее состояние бабла: клиент, переключившийся на
         # работающую сессию (или переподключившийся), запросит его через
         # /bubble — иначе бабл и кнопки ⏹/⛔ были бы невидимы до след. события.
-        self._bubble_state[session.name] = {
-            "ref": ref, "html": html, "stop_button": stop_button,
+        state = {
+            "ref": ref, "html": html, "stop_button": stop_button, "unblock_active": unblock_active,
         }
-        await self._broadcast({
-            "type": "bubble", "session": session.name, "ref": ref,
-            "html": html, "stop_button": stop_button,
-        })
+        self._bubble_state[session.name] = state
+        await self._broadcast({"type": "bubble", "session": session.name, **state})
         return ref
 
     async def bubble_edit(
-        self, session: Session, ref: str, html: str, *, stop_button: bool
+        self, session: Session, ref: str, html: str, *, stop_button: bool,
+        unblock_active: bool = False,
     ) -> None:
-        self._bubble_state[session.name] = {
-            "ref": ref, "html": html, "stop_button": stop_button,
+        state = {
+            "ref": ref, "html": html, "stop_button": stop_button, "unblock_active": unblock_active,
         }
-        await self._broadcast({
-            "type": "bubble", "session": session.name, "ref": ref,
-            "html": html, "stop_button": stop_button,
-        })
+        self._bubble_state[session.name] = state
+        await self._broadcast({"type": "bubble", "session": session.name, **state})
 
     async def bubble_finish(self, session: Session, ref: str, *, delete: bool) -> None:
         self._bubble_state.pop(session.name, None)
@@ -216,7 +213,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/compact", self.h_compact)
         r.add_post("/api/sessions/{name}/stop", self.h_stop)
         r.add_post("/api/sessions/{name}/interrupt", self.h_interrupt)
-        r.add_post("/api/sessions/{name}/background", self.h_background)
+        r.add_post("/api/sessions/{name}/unblock", self.h_unblock)
         r.add_post("/api/sessions/{name}/model", self.h_model)
         r.add_get("/api/sessions/{name}/bubble", self.h_bubble)
         r.add_get("/api/sessions/{name}/stats", self.h_stats)
@@ -441,12 +438,12 @@ class WebAdapter:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_background(self, request: web.Request) -> web.Response:
+    async def h_unblock(self, request: web.Request) -> web.Response:
         session = self._session_of(request)
         if session is None:
             return self._err("session not found", 404)
         try:
-            await self.core.background(session)
+            await self.core.unblock(session)
         except UserError as e:
             return self._err(str(e))
         return web.json_response({"ok": True})
