@@ -219,7 +219,9 @@ class BubbleManager:
         bubble.updated_at = time.time()
         # Переполнение: вытесняем старые строки с начала.
         while len(bubble.entries) > 1 and len(self._render_text(bubble)) > TEXT_LIMIT:
-            bubble.entries.pop(0)
+            dropped = bubble.entries.pop(0)
+            if dropped is bubble.current_line:  # «текущую» вытеснили — не in-flight
+                bubble.current_line = None
         if bubble.flush_task is None or bubble.flush_task.done():
             bubble.flush_task = asyncio.create_task(self._flush(name))
 
@@ -238,10 +240,16 @@ class BubbleManager:
                 (e for e in reversed(bubble.entries) if e.tool_use_id == tool_use_id),
                 None,
             )
-        if line is None:
+            # id задан, но строки нет (уехала в заморозку / вытеснена по лимиту) —
+            # НЕ вешаем итог на чужую строку (был баг «📨 привет ✓ · 5023мс»).
+            if line is None:
+                return
+        else:
+            # Фолбэк без id — только на «текущую» И только если это bash-строка
+            # (current_line может быть 📨 сообщением юзера после freeze_and_open).
             line = bubble.current_line
-        if line is None:
-            return
+            if line is None or line.tool != "Bash":
+                return
         line.status = status
         if bubble.current_line is line:
             bubble.current_line = None  # завершился → короткий вид (не in-flight)
@@ -378,6 +386,12 @@ class BubbleManager:
         if delivered:
             bubble.sent_text = text
             self._save_live()  # ref появился/обновился — зафиксировать для очистки сирот
+        # Событие, пришедшее пока мы были в сетевом await, могло НЕ перепланировать
+        # flush (task ещё не done) — его текст уже не попал в эту отправку. Добиваем
+        # последний апдейт, иначе бабл минуты показывает устаревшее (а при
+        # DELETE_BUBBLE=false «журнальный» бабл навсегда без последних строк).
+        if self._bubbles.get(name) is bubble and self._render_text(bubble) != bubble.sent_text:
+            bubble.flush_task = asyncio.create_task(self._flush(name))
 
     async def _await_flush(self, bubble: Bubble) -> None:
         """Дождаться отложенной правки (или отправки), если она в очереди —

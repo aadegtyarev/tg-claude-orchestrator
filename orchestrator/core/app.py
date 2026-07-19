@@ -143,7 +143,9 @@ class OrchestratorCore:
             if session is None or tr is None or ref is None:
                 continue
             try:
-                await tr.bubble_finish(session, str(ref), delete=True)
+                # Уважаем DELETE_BUBBLE: журнальные баблы (delete=False) — снять
+                # мёртвые кнопки, но сообщение оставить; иначе — удалить.
+                await tr.bubble_finish(session, str(ref), delete=self.config.delete_bubble)
                 removed += 1
             except Exception as ex:
                 logger.debug("cleanup сироты бабла %s: %s", e.get("session"), ex)

@@ -274,7 +274,8 @@ async def main():
         r = await cli("run", "deploy", "--", "sh", "-c", "echo cli=$GITHUB_TOKEN")
         assert r.returncode == 0 and "cli=•••" in r.stdout, (r.stdout, r.stderr)
         r = await cli("run", "deploy", "--", "evil-cmd")
-        assert r.returncode == 3 and "отказано" in r.stderr, (r.returncode, r.stderr)
+        # policy-промах теперь тоже даёт прозрачный reason (не глухое «denied»).
+        assert r.returncode == 3 and "не в списке" in r.stderr, (r.returncode, r.stderr)
         print("OK bin/wallet: ls + run + отказ policy (end-to-end)")
     finally:
         await module.stop()

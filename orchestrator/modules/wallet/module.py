@@ -459,35 +459,37 @@ class WalletModule:
         # из фонового шелла между ходами — поэтому пишем И в бабл (когда есть),
         # И служебным уведомлением через notice (доходит всегда, во все
         # адаптеры), И в журнал.
-        # Наблюдаемость без спама. Во время активного хода вызов уже виден
-        # строкой в статус-бабле — отдельным top-level сообщением НЕ дублируем.
-        # notice шлём только когда бабла нет (фоновый вызов между ходами) или это
-        # ОТКАЗ (нужно внимание). Форматы разные: бабл рендерит HTML напрямую, а
-        # notice идёт через md_to_html (markdown) — раньше один HTML-line шёл в
-        # оба, и notice показывал сырой «<code>…</code>».
+        # Наблюдаемость. Успешный вызов виден строкой в статус-бабле (ходовом
+        # ИЛИ фоновом — append_background сам разрулит; tool="wallet" схлопывает
+        # серию одинаковых, поллинг не спамит). Отдельное top-level уведомление
+        # шлём ТОЛЬКО на ОТКАЗ (нужно внимание, бабл может быть незаметен). Формат
+        # notice — markdown (идёт через md_to_html); бабл — HTML напрямую.
         cmd_disp = f"{name} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        # В бабл — ходовой ИЛИ фоновый (между ходами: поллинг CI и т.п.);
-        # append_background сам разрулит. tool="wallet" схлопывает серию
-        # одинаковых вызовов в одну «N× …» строку — поллинг не спамит, «всё в
-        # одном месте». Отдельным сообщением НЕ дублируем.
         await self.core.bubbles.append_background(
             session.name, bubble_line, tool="wallet"
         )
         self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
-            # Отказ — отдельным уведомлением: нужно внимание, бабл может быть незаметен.
+            # Прозрачность: причина у ВСЕХ отказов. guard/deny заполнили reason
+            # выше; policy-промах и отказ кнопкой — здесь. reason доходит до
+            # терминала модели (bin/wallet печатает его), а не глухое «denied».
+            if reason is None:
+                if secret is None:
+                    reason = f"нет секрета «{name}» для этой сессии (см. `wallet ls`)"
+                elif not secret.session_allowed(session.name):
+                    reason = "секрет не разрешён этой сессии (policy sessions)"
+                elif not secret.command_allowed(cmd):
+                    reason = "команда не в списке разрешённых (policy commands)"
+                else:
+                    reason = "отклонено кнопкой подтверждения"
             notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # md code-спан
             await self.core.notice(
                 session,
                 self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
             )
-        if not allowed:
-            # Прозрачность: reason объясняет модели ЧТО не так и КАК правильно —
-            # это доходит до её терминала (bin/wallet печатает reason), а не
-            # глухое «denied».
             return web.json_response(
-                {"error": "denied", "reason": reason} if reason else {"error": "denied"},
+                {"error": "denied", "reason": reason},
                 status=403,
             )
 

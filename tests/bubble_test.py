@@ -309,6 +309,19 @@ async def main():
     print("OK #18B: завершение по tool_use_id → короткая строка + статус")
     await bm.close("s14")
 
+    # ── фикс регрессии: complete() не вешает статус на ЧУЖУЮ строку ──
+    bm.open("s14")
+    await bm.append("s14", "⚡ <b>Bash</b> <code>sleep</code>", tool="Bash", tool_use_id="tuX")
+    await bm.append("s14", "📨 <b>привет</b>")  # юзер-строка → current_line (не bash)
+    await _settle(bm, "s14")
+    await bm.complete("s14", "tuMISSING", "✓ · 99мс")  # id не найден (уехал в заморозку) → no-op
+    await bm.complete("s14", "", "⚠ · 1мс")            # фолбэк, но current не Bash → no-op
+    await _settle(bm, "s14")
+    tf = bm._render_text(bm._bubbles["s14"])
+    assert "✓ · 99мс" not in tf and "⚠ · 1мс" not in tf, tf
+    print("OK фикс: статус не прилипает к чужой строке (freeze/фолбэк)")
+    await bm.close("s14")
+
     print("ALL BUBBLE OK")
 
 
