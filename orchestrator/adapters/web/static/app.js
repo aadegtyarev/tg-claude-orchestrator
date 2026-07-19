@@ -145,7 +145,7 @@ async function restoreBubble(name, seq) {
   // после переключения были видны индикатор и кнопки ⏹/⛔.
   try {
     const b = await apiJson("/api/sessions/" + encodeURIComponent(name) + "/bubble");
-    if (seq === loadSeq && b && b.html) showBubble(b.ref, b.html, b.stop_button);
+    if (seq === loadSeq && b && b.html) showBubble(b.ref, b.html, b.stop_button, b.unblock_active);
   } catch (e) { /* нет бабла — не критично */ }
 }
 
@@ -257,11 +257,14 @@ async function loadHistory(name, seq) {
 
 /* ── статус-бабл ───────────────────────────────────────────── */
 
-function showBubble(ref, html, stopButton) {
+function showBubble(ref, html, stopButton, unblockActive) {
   bubbleRef = ref;
   bubbleHtml = html;
   els.bubbleBody.innerHTML = html;
   $("bubble-buttons").style.display = stopButton ? "" : "none";
+  // Кнопка ⏬ «В фон» — видимая всегда (вёрстка не прыгает), но неактивная,
+  // когда сворачивать нечего (нет идущей задачи или модель уже ждёт фон).
+  $("btn-bg").disabled = !unblockActive;
   els.bubble.hidden = false;
 }
 
@@ -343,7 +346,7 @@ function handleEvent(ev) {
       typingTimer = setTimeout(() => { els.typing.hidden = true; }, 6000);
       break;
     case "bubble":
-      showBubble(ev.ref, ev.html, ev.stop_button);
+      showBubble(ev.ref, ev.html, ev.stop_button, ev.unblock_active);
       break;
     case "bubble_close":
       closeBubble(ev.ref, !ev.delete);
@@ -527,7 +530,7 @@ $("btn-interrupt").onclick = async () => {
 
 $("btn-bg").onclick = async () => {
   if (!current) return;
-  try { await postJson(sesUrl("/background"), {}); }
+  try { await postJson(sesUrl("/unblock"), {}); }
   catch (e) { addMsg("notice", "⚠ " + esc(e.message)); }
 };
 

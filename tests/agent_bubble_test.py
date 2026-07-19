@@ -24,10 +24,10 @@ from orchestrator.core.turn import TurnSupervisor  # noqa: E402
 class FakeTransport:
     name = "fake"
 
-    async def bubble_post(self, session, html, *, stop_button):
+    async def bubble_post(self, session, html, *, stop_button, unblock_active=False):
         return "1"
 
-    async def bubble_edit(self, session, ref, html, *, stop_button):
+    async def bubble_edit(self, session, ref, html, *, stop_button, unblock_active=False):
         pass
 
     async def bubble_finish(self, session, ref, *, delete):
@@ -57,6 +57,7 @@ def make_core(bm: BubbleManager) -> OrchestratorCore:
     core = OrchestratorCore.__new__(OrchestratorCore)
     core.manager = FakeMgr()
     core._texts = {"subagent": "🤖 {agent}"}
+    core._last_tool = {}
     core.bubbles = bm
     core.turns = TurnSupervisor(
         core.manager, core.t,

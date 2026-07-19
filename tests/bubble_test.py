@@ -27,13 +27,13 @@ class FakeTransport:
         self.markup_cleared: list[int] = []
         self._next_id = 1
 
-    async def bubble_post(self, session, html, *, stop_button):
+    async def bubble_post(self, session, html, *, stop_button, unblock_active=False):
         mid = self._next_id
         self._next_id += 1
         self.sent.append({"ref": mid, "text": html, "stop": stop_button})
         return str(mid)
 
-    async def bubble_edit(self, session, ref, html, *, stop_button):
+    async def bubble_edit(self, session, ref, html, *, stop_button, unblock_active=False):
         self.sent.append({"ref": int(ref), "text": html, "stop": stop_button})
 
     async def bubble_finish(self, session, ref, *, delete):
