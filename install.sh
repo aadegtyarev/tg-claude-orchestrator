@@ -62,9 +62,15 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory=$DIR
+# Гарантия одного инстанса: перед стартом добить сбежавший из cgroup
+# «-m orchestrator» (осиротевший инстанс дублирует Telegram/уведомления — спам).
+ExecStartPre=/bin/sh -c 'pkill -TERM -f "python -m orchestrator"; sleep 1; exit 0'
 ExecStart=$DIR/.venv/bin/python -m orchestrator
 Restart=on-failure
 RestartSec=5
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=15
 Environment=PATH=$CLAUDE_PATH$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
