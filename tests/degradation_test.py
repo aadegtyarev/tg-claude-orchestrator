@@ -1,0 +1,96 @@
+"""Мягкая деградация при обновлении Claude Code.
+
+Если формат Claude Code поменялся и что-то не парсится — не падать молча, а
+деградировать с понятным сигналом:
+  * read_stats на «чужом» транскрипте (валидный JSONL, но неизвестная схема) →
+    stale_schema=True, а не тихие нули;
+  * read_stats не падает на битых строках/несуществующем файле;
+  * _parse_cost на мусоре → пусто (адаптер покажет usage_failed);
+  * Telegram: кнопка ⏭ показывается только когда есть что разблокировать.
+
+Запуск: .venv/bin/python tests/degradation_test.py
+"""
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.transcript import read_stats  # noqa: E402
+
+
+def test_read_stats_stale_schema():
+    tmp = Path(tempfile.mkdtemp())
+    # Валидный JSONL, но НИ одной ожидаемой записи (схема поменялась):
+    # много строк, заметный размер, но нет type=user/assistant с usage.
+    p = tmp / "t.jsonl"
+    p.write_text("\n".join(
+        '{"kind": "somethingNew", "payload": {"x": ' + str(i) + ', "pad": "' + "y" * 200 + '"}}'
+        for i in range(40)
+    ))
+    st = read_stats(p)
+    assert st is not None and st["stale_schema"] is True, st
+    assert st["turns"] == 0 and st["output_tokens"] == 0
+    print("OK read_stats: непонятная схема → stale_schema=True (не тихие нули)")
+
+    # Нормальный транскрипт — stale_schema=False.
+    p2 = tmp / "ok.jsonl"
+    p2.write_text(
+        '{"type": "user", "message": {"content": "привет"}}\n'
+        '{"type": "assistant", "message": {"model": "sonnet", '
+        '"usage": {"input_tokens": 100, "output_tokens": 20}}}\n'
+    )
+    st2 = read_stats(p2)
+    assert st2["stale_schema"] is False and st2["turns"] == 1 and st2["model"] == "sonnet"
+    print("OK read_stats: нормальный транскрипт → stale_schema=False, поля извлечены")
+
+    # Битые строки и мелкий файл — не падаем, не ложный stale.
+    p3 = tmp / "broken.jsonl"
+    p3.write_text("{битый json\nне json вообще\n")
+    st3 = read_stats(p3)
+    assert st3 is not None and st3["stale_schema"] is False  # мелкий → не stale
+    print("OK read_stats: битые строки не роняют, мелкий файл не ложно-stale")
+
+    # Несуществующий файл → None.
+    assert read_stats(tmp / "nope.jsonl") is None
+    print("OK read_stats: нет файла → None")
+
+
+def test_parse_cost_garbage():
+    # Мусор вместо /cost-вывода → пустой dict (адаптер → usage_failed).
+    assert OrchestratorCore._parse_cost("случайный текст без цифр") == {}
+    assert OrchestratorCore._parse_cost("") == {}
+    print("OK _parse_cost: мусор → {} (деградация в usage_failed)")
+
+
+def test_telegram_unblock_button_hidden():
+    import os
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
+    from orchestrator.adapters.telegram.adapter import TelegramAdapter
+    a = TelegramAdapter.__new__(TelegramAdapter)
+    a.t = lambda k, **kw: k
+    # Нечего разблокировать → только ⏹ и ⛔ (2 кнопки).
+    m = a._stop_markup(7, unblock_active=False)
+    labels = [b.text for row in m.inline_keyboard for b in row]
+    assert labels == ["bubble_stop", "bubble_esc"], labels
+    # Есть что → появляется ⏭ (3 кнопки).
+    m2 = a._stop_markup(7, unblock_active=True)
+    labels2 = [b.text for row in m2.inline_keyboard for b in row]
+    assert labels2 == ["bubble_stop", "bubble_unblock", "bubble_esc"], labels2
+    print("OK Telegram: ⏭ скрыта когда нечего разблокировать, видна когда есть")
+
+
+def main():
+    test_read_stats_stale_schema()
+    test_parse_cost_garbage()
+    test_telegram_unblock_button_hidden()
+    print("ALL DEGRADATION OK")
+
+
+def test_degradation():
+    main()
+
+
+if __name__ == "__main__":
+    main()

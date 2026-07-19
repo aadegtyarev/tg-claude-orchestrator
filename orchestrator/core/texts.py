@@ -64,6 +64,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… и ещё {n}",
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа могут быть недоступны, пока не обновлю парсер.",
         "stats_body": (
             "{header}\n"
             "Модель: {model}\n"
@@ -162,6 +163,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_protocol": "⚠️ Апстрим шлёт протокольную ошибку (кривой server_tool_use/tool_result — это z.ai, не лимит). Смена модели не поможет: попробуй /clear или /close_session и стартануть заново.",
         "api_error_pollution_tail": "🧪 Что именно загрязнено в контексте (чужой бэкенд):\n{excerpt}",
         "api_error_generic": "⚠️ Ошибка API — ответ может задержаться.",
+        "api_error_quota": "⛔ Недельный/месячный лимит бэкенда исчерпан (сброс {reset}). Модель ретраит запросы по кругу и продвигается медленно/рывками — это не зависание. До сброса смени бэкенд/модель (/model) или подожди.",
+        "api_error_quota_noreset": "⛔ Лимит бэкенда исчерпан — модель ретраит по кругу и продвигается рывками (не зависание). Смени бэкенд/модель (/model) или подожди сброса.",
         "api_retrying": "🔄 Ретраю API-ошибку (попытка {attempt}/{total}) — Клод на ней застрял, но не сдаётся.",
         "session_restart_loop": "🔁 Claude перезапустился ({count} раз с начала хода) — похоже, краш-луп. Можно /close_session и стартануть заново.",
         "sess_closed": "«{name}» остановлена.",
@@ -263,6 +266,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… and {n} more",
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers may be unavailable until the parser is updated.",
         "stats_body": (
             "{header}\n"
             "Model: {model}\n"
@@ -361,6 +365,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_protocol": "⚠️ Upstream protocol error (malformed server_tool_use/tool_result — that's z.ai, not a limit). Switching model won't help: try /clear or /close_session and restart.",
         "api_error_pollution_tail": "🧪 What's polluted in the context (foreign backend):\n{excerpt}",
         "api_error_generic": "⚠️ API error — the reply may be delayed.",
+        "api_error_quota": "⛔ Backend weekly/monthly limit exhausted (resets {reset}). The model keeps retrying and advances slowly/in bursts — this is NOT a hang. Switch backend/model (/model) or wait for the reset.",
+        "api_error_quota_noreset": "⛔ Backend limit exhausted — the model keeps retrying and advances in bursts (not a hang). Switch backend/model (/model) or wait for the reset.",
         "api_retrying": "🔄 Retrying an API error (attempt {attempt}/{total}) — Claude is stuck on it but keeps trying.",
         "session_restart_loop": "🔁 Claude restarted ({count} times this turn) — looks like a crash loop. Try /close_session and start fresh.",
         "sess_closed": "“{name}” stopped.",

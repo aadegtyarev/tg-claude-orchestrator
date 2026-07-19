@@ -79,11 +79,15 @@ class TurnSupervisor:
         t: Callable[..., str],
         send: Callable[["Session", str], Awaitable[None]],
         typing: Callable[["Session"], Awaitable[bool]],
+        status: Callable[..., Awaitable[None]] | None = None,
     ):
         self.manager = manager
         self.t = t
         self._send = send
         self._typing_action = typing
+        # Колбэк живого статуса (спиннер-глагол + реальная модель → бабл).
+        # None = не показывать. Сигнатура: (name, pulse=…, model=…).
+        self._status = status or (lambda name, **kw: asyncio.sleep(0))
         # session.name -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
         self._typing: dict[str, asyncio.Task] = {}
         # имя сессии -> сторож зависаний (стартует/гаснет вместе с typing).
@@ -232,6 +236,7 @@ class TurnSupervisor:
         last_retry_at = -RETRY_SURFACE_INTERVAL
         restart_count = 0
         last_restart_at = -ERROR_RELAY_COOLDOWN
+        last_quota_at = -ERROR_RELAY_REPEAT
         loop_time = asyncio.get_running_loop().time
 
         async def _surf(text: str) -> None:
@@ -252,6 +257,31 @@ class TurnSupervisor:
             chunk = strip_ansi(delta)
             sig = detect_log_signals(chunk)
             now = loop_time()
+
+            # 0. Живой статус: спиннер-глагол + время + токены (из TUI-лога) и
+            #    реальная модель (из транскрипта, после подмены прокси). Признак
+            #    «модель жива» и ЧЕМ занята, когда tool-событий нет (думает/ждёт).
+            if sig["pulse"]:
+                try:
+                    pulse = sig["pulse"]
+                    if sig["tokens"]:
+                        pulse += f" · ↓{sig['tokens']} tok"
+                    model = await asyncio.to_thread(self.manager.read_last_model, session)
+                    await self._status(name, pulse=pulse, model=model or "")
+                except Exception as e:
+                    logger.debug("status: %s", e)
+
+            # 0б. Лимит-баннер (Weekly/Monthly exhausted, серверный throttle без
+            #     3-значного кода) — частая причина «часами молчит и не едет»:
+            #     модель ретраит недельный лимит по кругу. Показываем причину и
+            #     дату сброса; редко (раз в REPEAT), чтобы не спамить в цикле.
+            if sig["quota"] is not None and now - last_quota_at >= ERROR_RELAY_REPEAT:
+                last_quota_at = now
+                reset = sig["quota"]
+                await _surf(
+                    self.t("api_error_quota", reset=reset) if reset
+                    else self.t("api_error_quota_noreset")
+                )
 
             # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
             if sig["api_error"]:
