@@ -210,6 +210,7 @@ class WalletModule:
         await web.SockSite(self._runner, sock).start()
         logger.info("wallet: демон на 127.0.0.1:%d", self.port)
 
+        self._provision_cli()
         for session in core.manager.list_all():
             await self._provision(session)
         core.session_hooks.append(self._provision)
@@ -224,6 +225,31 @@ class WalletModule:
             await self._runner.cleanup()
             self._runner = None
         self._tokens.clear()
+
+    def _provision_cli(self) -> None:
+        """Симлинк ~/.local/bin/wallet → <репо>/bin/wallet, чтобы CLI был в PATH
+        внутри песочницы.
+
+        bwrap биндит и ~/.local/bin, и корень репо (RO, по тем же путям), поэтому
+        симлинк разрешается внутри песочницы и самообновляется при обновлении
+        bin/wallet. Без этого агент получит «wallet: command not found» — сам
+        файл лежит в репо, а в PATH сессии его нет.
+        """
+        cli = Path(__file__).resolve().parents[3] / "bin" / "wallet"
+        link = Path.home() / ".local" / "bin" / "wallet"
+        try:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if link.is_symlink():
+                if link.readlink() == cli:
+                    return  # уже указывает куда надо
+                link.unlink()
+            elif link.exists():
+                logger.warning("wallet: %s — не наш файл, CLI не провижу", link)
+                return
+            link.symlink_to(cli)
+            logger.info("wallet: CLI в PATH сессии (%s → %s)", link, cli)
+        except OSError as e:
+            logger.error("wallet: не удалось провизить CLI %s: %s", link, e)
 
     async def _provision(self, session) -> None:
         """Выдать сессии токен и записать ~/.wallet.json в её приватный $HOME.
