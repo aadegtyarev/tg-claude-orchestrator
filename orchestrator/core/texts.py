@@ -27,7 +27,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/delete_session</code> — удалить сессию вместе с топиком\n"
             "• другие <code>/команды</code> — уходят в терминал Claude Code\n\n"
             "Пока Claude работает, в топике живёт статус-бабл: вызовы\n"
-            "инструментов, сабагенты и промежуточные ответы, кнопка ⏹ Стоп.\n"
+            "инструментов, сабагенты и промежуточные ответы, кнопки 📋 Отчёт / ⛔ Прервать.\n"
             "Файлы Claude присылает сам (тул send_file_to_user).\n"
             "Запросы разрешений приходят кнопками ✅/❌ (permission relay)."
         ),
@@ -65,7 +65,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… и ещё {n}",
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n{tail}\n📥 Полный лог для разработчиков: /log",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n```\n{tail}\n```\n📥 Полный лог для разработчиков: /log",
         "log_caption": "🗒 Полный лог сессии «{name}» (claude.log) — для отладки.",
         "log_empty": "(лог пуст)",
         "stats_body": (
@@ -148,7 +148,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "💀 Сессия «{name}»: Claude завершился (код {code}).\n"
             "Напиши в топик — перезапущу сессию."
         ),
-        "session_died_tail": "Хвост лога:\n{tail}",
+        "session_died_tail": "Хвост лога:\n```\n{tail}\n```",
         "idle_closed": "😴 Сессия остановлена по простою (> {hours} ч). Напиши — возобновлю.",
         "startup": (
             "🟢 Бот онлайн. Восстановлено сессий: {n} (возобновятся по сообщению).\n"
@@ -234,7 +234,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/delete_session</code> — delete the session and its topic\n"
             "• other <code>/commands</code> — typed into the Claude Code terminal\n\n"
             "While Claude works, a status bubble lives in the topic: tool calls,\n"
-            "subagents, intermediate replies, and a ⏹ Stop button.\n"
+            "subagents, intermediate replies, and 📋 Report / ⛔ Interrupt buttons.\n"
             "Claude can send files back (send_file_to_user tool).\n"
             "Permission prompts arrive as ✅/❌ buttons (permission relay)."
         ),
@@ -272,7 +272,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_more": "… and {n} more",
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n{tail}\n📥 Full log for developers: /log",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n```\n{tail}\n```\n📥 Full log for developers: /log",
         "log_caption": "🗒 Full session log «{name}» (claude.log) — for debugging.",
         "log_empty": "(log empty)",
         "stats_body": (
@@ -355,7 +355,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "💀 Session “{name}”: Claude exited (code {code}).\n"
             "Send a message to the topic to restart the session."
         ),
-        "session_died_tail": "Log tail:\n{tail}",
+        "session_died_tail": "Log tail:\n```\n{tail}\n```",
         "idle_closed": "😴 Session stopped after being idle (> {hours} h). Send a message to resume.",
         "startup": (
             "🟢 Bot online. Restored sessions: {n} (resume on message).\n"
