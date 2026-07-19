@@ -548,11 +548,20 @@ class WebAdapter:
                 fname = Path(part.filename).name or f"file_{int(time.time())}"
                 await asyncio.to_thread(incoming.mkdir, parents=True, exist_ok=True)
                 dest = incoming / fname
+                tmp = incoming / f".{fname}.{int(time.time())}.part"
                 # Запись — в поток: синхронный f.write per-chunk на event loop
-                # заморозил бы все сессии на время большой загрузки.
-                with dest.open("wb") as f:
-                    while chunk := await part.read_chunk(65536):
-                        await asyncio.to_thread(f.write, chunk)
+                # заморозил бы все сессии на время большой загрузки. Пишем во
+                # временный файл и атомарно переименовываем — при обрыве
+                # (закрыл вкладку) в incoming не осядет обрезок, который модель
+                # приняла бы за целый файл.
+                try:
+                    with tmp.open("wb") as f:
+                        while chunk := await part.read_chunk(65536):
+                            await asyncio.to_thread(f.write, chunk)
+                    await asyncio.to_thread(tmp.replace, dest)
+                except BaseException:
+                    tmp.unlink(missing_ok=True)
+                    raise
         if dest is None:
             return self._err("file field required")
         text = self.t("file_received", path=dest)

@@ -994,8 +994,13 @@ class SessionManager:
             raise SessionError("Сессия не запущена.")
         # Только печатные символы одной строки — никаких управляющих кодов.
         clean = "".join(ch for ch in text if ch.isprintable())
+        # PTY может принять не весь буфер за раз — дописываем хвост, иначе
+        # длинная слэш-команда обрежется.
+        data = clean.encode() + b"\r"
         try:
-            os.write(session.pty_master, clean.encode() + b"\r")
+            while data:
+                n = os.write(session.pty_master, data)
+                data = data[n:]
         except OSError as e:
             raise SessionError(f"Терминал сессии недоступен: {e}") from e
 

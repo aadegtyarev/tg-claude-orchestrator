@@ -340,9 +340,22 @@ class ChannelServer:
             },
         })
 
-        notif = await self._read_message(reader)
-        if notif is None or notif.get("method") != "notifications/initialized":
-            logger.warning("Ожидался 'notifications/initialized', получено: %s", notif)
+        # Клиент может прислать запрос (с id) ещё до notifications/initialized —
+        # обслуживаем его и продолжаем ждать нотификацию, иначе он повиснет на
+        # этом id (раньше сообщение молча глоталось).
+        while True:
+            notif = await self._read_message(reader)
+            if notif is None:
+                logger.warning("Соединение закрыто до notifications/initialized")
+                return
+            if notif.get("method") == "notifications/initialized":
+                break
+            if notif.get("id") is not None:
+                await self._handle_request(
+                    notif["id"], notif.get("method"), notif.get("params") or {}
+                )
+            else:
+                logger.debug("До initialized пришло уведомление: %s", notif.get("method"))
         self._initialized.set()
         logger.info("Handshake завершён, канал '%s' активен", SESSION_NAME)
 

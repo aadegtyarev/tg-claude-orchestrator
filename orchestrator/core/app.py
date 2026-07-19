@@ -90,6 +90,9 @@ class OrchestratorCore:
         )
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
+        # Мелкие фоновые задачи ядра без иного владельца — держим ссылку
+        # (asyncio хранит только слабую), иначе GC мог бы собрать на лету.
+        self._bg_tasks: set[asyncio.Task] = set()
         # Журнал событий per-сессия: показать историю в веб-интерфейсе после
         # перезагрузки страницы. Персистится через graceful-рестарт (иначе
         # пропадала при каждом рестарте — «история потерялась»); полная — в
@@ -923,7 +926,7 @@ class OrchestratorCore:
             out["week_pct"] = m.group(1)
         for mm in re.finditer(r"Current week \((?!all models)([^)]+)\).*?(\d+)%\s*used", t):
             out.setdefault("models", []).append((mm.group(1).strip(), mm.group(2)))
-        resets = re.findall(r"Res[et]+s ([A-Za-z0-9:, ]+?\([^)]+\))", t)
+        resets = re.findall(r"Resets? ([A-Za-z0-9:, ]+?\([^)]+\))", t)
         if resets:
             out["session_reset"] = resets[0].strip()
             if len(resets) > 1:
@@ -1121,7 +1124,15 @@ class OrchestratorCore:
                 async def _release():
                     await asyncio.sleep(0.5)
                     shell.busy = False
-                asyncio.ensure_future(_release())
+                self._track(_release())
+
+    def _track(self, coro) -> asyncio.Task:
+        """Запустить фоновую задачу с удержанием ссылки — самоочищается по
+        завершении. Для мелких задач ядра без иного владельца (см. _bg_tasks)."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     def bash_busy(self, key: str) -> bool:
         """Занят ли терминал (идёт команда) — адаптер спрашивает ДО поста

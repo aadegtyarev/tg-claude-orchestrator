@@ -78,7 +78,15 @@ class BashSession:
             return bytes(self._buf)
 
     def write(self, text: str) -> None:
-        os.write(self.master, text.encode())
+        # os.write на PTY может записать не всё за раз (буфер строки заполнен) —
+        # длинная команда (>~4КБ) иначе обрежется и исказится. Дописываем хвост.
+        data = text.encode()
+        while data:
+            try:
+                n = os.write(self.master, data)
+            except OSError:
+                return
+            data = data[n:]
 
     def interrupt(self) -> None:
         """Послать Ctrl-C (SIGINT фоновому пайплайну bash) — прервать убежавшую

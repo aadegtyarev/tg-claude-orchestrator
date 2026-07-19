@@ -87,13 +87,19 @@ async def main() -> None:
         # Убрать баблы, осиротевшие при НЕ-graceful смерти прошлого процесса
         # (краш/SIGKILL — тогда close_all не отработал). Адаптеры уже подняты.
         await core.cleanup_stale_bubbles()
-        # Стартовое уведомление после короткой паузы (адаптеры должны подняться).
-        loop.call_later(
-            2, lambda: asyncio.ensure_future(core.notify_startup(restored))
-        )
+        # Стартовое уведомление после короткой паузы (адаптеры должны
+        # подняться). Держим ссылку на задачу — asyncio хранит только слабую,
+        # без ссылки её мог бы собрать GC; отменяем при shutdown, иначе
+        # уведомление выстрелило бы уже во время остановки.
+        async def _delayed_startup() -> None:
+            await asyncio.sleep(2)
+            await core.notify_startup(restored)
+
+        startup_task = asyncio.ensure_future(_delayed_startup())
         await stop_event.wait()
     finally:
         logger.info("Останавливаю сессии (записи сохраняются)…")
+        startup_task.cancel()
         sweeper.cancel()
         core.save_history()  # веб-история переживёт рестарт
         # Убрать активные баблы, ПОКА адаптеры живы: иначе при рестарте refs
