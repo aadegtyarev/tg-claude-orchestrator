@@ -39,16 +39,19 @@ class StubBot:
 def main():
     b = StubBot()
 
-    # ── _bash_head: показываем basename cd + голову команды в одну строку ──
-    assert _bash_head('cd /a/b && grep -n "x" file.py') == "b · grep"
-    assert _bash_head('cd /a/b/c && grep foo') == "c · grep foo"   # foo — словесный аргумент
-    assert _bash_head('find /long/path -name "*.md" 2>/dev/null && echo ---- && ls') == "find"
+    # ── _bash_head: basename cd + голова + меняющийся хвост (первый значимый
+    #    аргумент/паттерн) — чтобы серия схлопнутых grep не выглядела застывшей ──
+    assert _bash_head('cd /a/b && grep -n "x" file.py') == "b · grep x"  # паттерн виден
+    assert _bash_head('cd /a/b/c && grep foo') == "c · grep foo"
+    assert _bash_head('find /long/path -name "*.md" 2>/dev/null && echo ---- && ls') == "find /long/path"
     assert _bash_head('git log --oneline -5') == "git log"
     assert _bash_head('npm test') == "npm test"
     assert _bash_head('ls -la') == "ls"
     assert _bash_head('cd /some/where') == "where"       # вся команда — cd → basename
-    assert _bash_head('cd worktrees/b5 && grep -rn "x" .') == "b5 · grep"
-    print("OK _bash_head shows cd dir + command head")
+    assert _bash_head('cd worktrees/b5 && grep -rn "x" .') == "b5 · grep x"
+    # разные паттерны → разный хвост (не застывает при схлопывании)
+    assert _bash_head('grep alpha') != _bash_head('grep beta')
+    print("OK _bash_head: cd dir + голова + меняющийся хвост (паттерн)")
 
     # ── _file_suffix: контекст строк для Read/Edit ──
     assert _file_suffix("Read", {"offset": 10, "limit": 24}) == " L10–34"
@@ -70,9 +73,10 @@ def main():
     long_cmd = ('cd /home/adegtyarev/Develop/Hobby/noos/.ai-dev/worktrees/b5 && '
                 'grep -n "_secret_gate\\|_scrub_str_list\\|render_placeholders"')
     line = b._tool_line("Bash", {"command": long_cmd})
-    assert line == "⚡ <b>Bash</b> <code>b5 · grep</code>", line
+    # cd-basename + grep + фрагмент паттерна (хвост меняется при разных grep)
+    assert line.startswith("⚡ <b>Bash</b> <code>b5 · grep _secret_gate"), line
     assert "&&" not in line   # в одну строку, без хвостов
-    print("OK Bash → cd dir + head, no full command")
+    print("OK Bash → cd dir + head + меняющийся паттерн")
 
     tc = b._tool_line("TaskCreate", {
         "subject": "Fix B-5 blocker 1: distill_study_skill scrub",
