@@ -275,6 +275,8 @@ html, body {
   font-size: 13px;
 }
 .btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn:disabled:hover { border-color: var(--border); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.primary:hover { filter: brightness(1.1); }
 .btn.warn { color: var(--warn); }

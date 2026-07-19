@@ -37,6 +37,7 @@ def make_core():
     core.manager = FakeMgr()
     core._texts = {}
     core._history = {}
+    core._last_tool = {}
     core.adapters = {}
     # Реальный TurnSupervisor: проверяем настоящий Stop-гейт (note_tool/
     # pop_reply_flag), доставка — заглушки.

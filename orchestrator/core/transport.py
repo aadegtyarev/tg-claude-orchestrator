@@ -123,13 +123,16 @@ class Transport(Protocol):
     # идентификатор сообщения в адаптере.
 
     async def bubble_post(
-        self, session: "Session", html: str, *, stop_button: bool
+        self, session: "Session", html: str, *, stop_button: bool, unblock_active: bool = False
     ) -> str | None:
-        """Создать сообщение бабла; вернуть ref (None — не доставлено)."""
+        """Создать сообщение бабла; вернуть ref (None — не доставлено).
+        unblock_active — можно ли сейчас свернуть задачу в фон (Ctrl+B): у веба
+        управляет активностью кнопки ⏬, у Telegram может игнорироваться."""
         ...
 
     async def bubble_edit(
-        self, session: "Session", ref: str, html: str, *, stop_button: bool
+        self, session: "Session", ref: str, html: str, *, stop_button: bool,
+        unblock_active: bool = False,
     ) -> None:
         ...
 
