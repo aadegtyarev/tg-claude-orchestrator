@@ -353,7 +353,36 @@ class SessionManager:
         if real_path.is_file():
             raise SessionError(f"Это файл, а не директория: {project_path}")
         real_path.mkdir(parents=True, exist_ok=True)
+        SessionManager._warn_project_trust(real_path)
         return str(real_path)
+
+    @staticmethod
+    def _warn_project_trust(project_dir: Path) -> None:
+        """Ругнуться в лог, если linked-папка несёт доверяемые при запуске
+        настройки. При linked-сессии claude стартует прямо в этой папке и
+        АВТО-ДОВЕРЯЕТ ей (стартовый диалог «trust this folder» отвечается Yes,
+        см. _DIALOGS) → исполнятся её project-хуки (.claude/settings[.local].json).
+        MCP-авто-старт для linked уже снят (см. _write_claude_settings), но хуки
+        грузятся через доверие. Не hard-block: модель угроз — страховки от
+        случайных глупостей, а папку оператор выбрал сам; но это должно быть видно.
+        """
+        concerns = []
+        for rel in (".claude/settings.json", ".claude/settings.local.json"):
+            p = project_dir / rel
+            try:
+                if p.is_file() and '"hooks"' in p.read_text(errors="replace"):
+                    concerns.append(f"{rel} (хуки)")
+            except OSError:
+                pass
+        if (project_dir / ".mcp.json").is_file():
+            concerns.append(".mcp.json (MCP; авто-старт снят, но папке доверяем)")
+        if concerns:
+            logger.warning(
+                "Проект %s несёт доверяемые при запуске настройки: %s. "
+                "Linked-сессия авто-доверяет папке и исполнит её project-хуки — "
+                "линкуй только репозитории, которым доверяешь.",
+                project_dir, ", ".join(concerns),
+            )
 
     def _write_mcp_json(self, session: Session) -> None:
         """Конфиг, по которому Claude Code сам запустит channel_server.py.
