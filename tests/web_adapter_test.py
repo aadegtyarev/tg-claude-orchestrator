@@ -202,5 +202,8 @@ async def main():
     print("ALL WEB OK")
 
 
+async def test_web_adapter():
+    await main()
+
 if __name__ == "__main__":
     asyncio.run(main())

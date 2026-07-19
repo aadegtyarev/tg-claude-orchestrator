@@ -109,8 +109,10 @@ journalctl --user -u claude-orchestrator -f
 Вручную: `.venv/bin/python -m orchestrator`. Старый юнит
 `tg-claude-orchestrator` install.sh снимает автоматически.
 
-Тесты офлайновые (без Telegram и Claude): `tests/run_all.sh`.
-Линт: `.venv/bin/ruff check .` CI (GitHub Actions) гоняет оба на 3.10/3.12.
+Тесты офлайновые (без Telegram и Claude): `.venv/bin/python -m pytest`
+(или `tests/run_all.sh` — те же файлы как отдельные скрипты; каждый тест
+запускается обоими способами). Линт: `.venv/bin/ruff check .` CI (GitHub
+Actions) гоняет pytest + ruff на 3.10/3.12.
 
 ## Конфигурация (.env)
 
@@ -305,7 +307,7 @@ Code (только Bash-тул), обёртка накрывает все инс
   адаптерах; тексты — парой ru/en в `core/texts.py` (паритет проверяет
   smoke-тест).
 
-После правок: `tests/run_all.sh` и `.venv/bin/ruff check .`.
+После правок: `.venv/bin/python -m pytest` и `.venv/bin/ruff check .`.
 
 ## Дизайн-документы (`docs/`)
 

@@ -86,5 +86,8 @@ def main():
     print("ALL POLLUTION OK")
 
 
+def test_pollution():
+    main()
+
 if __name__ == "__main__":
     main()

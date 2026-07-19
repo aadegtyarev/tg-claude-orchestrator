@@ -44,5 +44,8 @@ def main():
     print("ALL LOGDELTA OK")
 
 
+def test_logdelta():
+    main()
+
 if __name__ == "__main__":
     main()

@@ -243,7 +243,14 @@ class WebAdapter:
             candidates.append(auth[len("Bearer "):])
         if (q := request.query.get("token")) is not None:
             candidates.append(q)
-        return any(secrets.compare_digest(c, self._token) for c in candidates)
+        # Сравниваем на байтах: compare_digest на str бросает TypeError при
+        # не-ASCII вводе (кривой cookie/заголовок) → был бы 500 вместо чистого
+        # 401. errors="replace" делает вход всегда байтами (fail-closed).
+        expected = self._token.encode("utf-8")
+        return any(
+            secrets.compare_digest(c.encode("utf-8", "replace"), expected)
+            for c in candidates
+        )
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):

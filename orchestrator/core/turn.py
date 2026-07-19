@@ -110,9 +110,23 @@ class TurnSupervisor:
         Все гаснут финальным ответом (stop() в handle_reply).
         """
         self.stop(name)
-        self._typing[name] = asyncio.create_task(self._typing_loop(name))
-        self._watchdogs[name] = asyncio.create_task(self._watchdog_loop(name))
-        self._error_relays[name] = asyncio.create_task(self._error_relay_loop(name))
+        self._typing[name] = asyncio.create_task(self._guarded(self._typing_loop(name), "typing"))
+        self._watchdogs[name] = asyncio.create_task(self._guarded(self._watchdog_loop(name), "watchdog"))
+        self._error_relays[name] = asyncio.create_task(
+            self._guarded(self._error_relay_loop(name), "error_relay")
+        )
+
+    @staticmethod
+    async def _guarded(coro, label: str) -> None:
+        """Обёртка фоновой задачи хода: неожиданное исключение внутри цикла
+        иначе умирало бы молча («Task exception was never retrieved») — теперь
+        оно логируется, а не теряется. CancelledError пробрасываем (штатный стоп)."""
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Фоновая задача хода '%s' упала", label)
 
     def stop(self, name: str) -> None:
         for registry in (self._typing, self._watchdogs, self._error_relays):

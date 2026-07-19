@@ -11,6 +11,12 @@ dependencies = [
     "python-dotenv>=1,<2",
 ]
 
+[tool.pytest.ini_options]
+# Тесты офлайновые; conftest.py гоняет async-тесты без pytest-asyncio.
+testpaths = ["tests"]
+python_files = ["*_test.py"]
+addopts = "-q"
+
 [tool.ruff]
 line-length = 110
 target-version = "py310"

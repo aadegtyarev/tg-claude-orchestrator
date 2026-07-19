@@ -1,5 +1,7 @@
-# CI: линт + все тесты. Тесты оффлайновые (без Telegram/Claude);
+# CI: линт + pytest. Тесты оффлайновые (без Telegram/Claude);
 # sandbox_test сам скипает реальную изоляцию, если bwrap недоступен.
+# Каждый тест-файл гоняется и как pytest, и как `python tests/x_test.py`
+# (run_all.sh) — pytest выбран для CI как единый раннер с отчётом.
 name: ci
 
 on:
@@ -20,4 +22,4 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: ruff check .
-      - run: PY=python tests/run_all.sh
+      - run: python -m pytest
