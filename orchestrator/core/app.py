@@ -312,6 +312,7 @@ class OrchestratorCore:
                 await hook(session)
             except Exception:
                 logger.exception("session_hook для %s", session.name)
+        await self._notify_state_changed(session)
         return session
 
     async def _rollback_session(self, session: Session) -> None:
@@ -327,19 +328,54 @@ class OrchestratorCore:
                 except Exception:
                     logger.exception("Адаптер %s: unbind при откате(%s)", tr.name, session.name)
 
-    async def close_session(self, session: Session) -> None:
-        self.turns.stop(session.name)
+    async def _teardown_runtime(
+        self, session: Session, *, close_bash: bool = True, forget_turn: bool = False
+    ) -> None:
+        """Единый разбор рантайма сессии перед сменой/остановкой процесса Claude.
+
+        Гасит ровно то, что переживает смерть процесса и ударило бы по
+        следующему ходу/сессии: сторожа хода (typing/watchdog/error-relay),
+        висящие permission-кнопки во всех адаптерах, bg-состояние кнопки ⏭,
+        статус-бабл и (для терминальных остановок) bash-оболочки.
+
+        Раньше эта последовательность дублировалась в 5+ местах (close/delete/
+        clear/switch_model/dead/idle) и УЖЕ разъехалась — idle гасил
+        `_last_tool`, остальные нет; drop не всегда гасил кнопки. Один метод
+        держит их согласованными.
+
+        close_bash=False — сессия продолжится (clear/switch_model перезапускают
+        Claude в той же папке), терминалы /bash не трогаем. forget_turn=True —
+        сессия удаляется совсем (turns.forget вместо stop)."""
+        if forget_turn:
+            self.turns.forget(session.name)
+        else:
+            self.turns.stop(session.name)
         await self._drop_pending_perms(session)
-        await asyncio.to_thread(self.bash.close_for_session, session.name)
+        self._last_tool.pop(session.name, None)
+        if close_bash:
+            await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
+
+    async def _notify_state_changed(self, session: Session | None = None) -> None:
+        """Сообщить адаптерам, что состав/статус сессий изменился — те, что
+        показывают список (веб), обновятся. Best-effort: сбой одного адаптера
+        не ломает операцию. Источник — ядро, поэтому изменение из любого
+        адаптера / idle / смерти доходит до всех (раньше веб обновлял список
+        только после СВОИХ REST и залипал на чужих переходах)."""
+        for tr in self._transports():
+            try:
+                await tr.session_state_changed(session)
+            except Exception:
+                logger.exception("Адаптер %s: session_state_changed", tr.name)
+
+    async def close_session(self, session: Session) -> None:
+        await self._teardown_runtime(session)
         await self.manager.close(session)
         self._record(session, "status", status="stopped")
+        await self._notify_state_changed(session)
 
     async def delete_session(self, session: Session) -> None:
-        self.turns.forget(session.name)
-        await self._drop_pending_perms(session)
-        await asyncio.to_thread(self.bash.close_for_session, session.name)
-        await self.bubbles.close(session.name)
+        await self._teardown_runtime(session, forget_turn=True)
         bindings = dict(session.bindings)
         await self.manager.delete(session)
         self._history.pop(session.name, None)
@@ -351,32 +387,35 @@ class OrchestratorCore:
                 await tr.unbind_session(session, address)
             except Exception:
                 logger.exception("Адаптер %s: unbind_session(%s)", tr.name, session.name)
+        await self._notify_state_changed(session)
 
     async def clear_session(self, session: Session) -> None:
         """Чистый контекст: перезапуск Claude с новым UUID, привязки остаются."""
         # Гасим фоновые задачи прошлого хода (typing/watchdog/error-relay) —
         # иначе после /clear «печатает…» крутится вечно на уже пустой сессии,
-        # а error-relay тайлит лог нового процесса (как close/switch_model).
-        self.turns.stop(session.name)
-        await self._drop_pending_perms(session)
-        await self.bubbles.close(session.name)
+        # а error-relay тайлит лог нового процесса. Сессия продолжится (тот же
+        # cwd, новый UUID) — bash-терминалы не трогаем (close_bash=False).
+        await self._teardown_runtime(session, close_bash=False)
         try:
             await self.manager.clear(session)
         except Exception as e:
             logger.exception("Сессия %s: ошибка /clear", session.name)
             await self.manager.close(session)
+            await self._notify_state_changed(session)
             raise UserError(self.t("clear_fail", error=e)) from e
+        await self._notify_state_changed(session)
 
     async def switch_model(self, session: Session, model: str) -> bool:
         """Сменить модель; вернуть resumed (контекст продолжен?)."""
-        self.turns.stop(session.name)
-        await self._drop_pending_perms(session)
-        await self.bubbles.close(session.name)
+        # Сессия продолжится (перезапуск Claude в той же папке) — bash не трогаем.
+        await self._teardown_runtime(session, close_bash=False)
         try:
-            return await self.manager.set_model(session, model)
+            resumed = await self.manager.set_model(session, model)
         except Exception as e:
             logger.exception("Сессия %s: ошибка смены модели", session.name)
             raise UserError(self.t("model_fail", model=model, error=e)) from e
+        await self._notify_state_changed(session)
+        return resumed
 
     async def ensure_running(self, session: Session) -> str:
         """Возобновить остановленную сессию. Возвращает running|resumed|fresh."""
@@ -386,6 +425,7 @@ class OrchestratorCore:
             resumed = await self.manager.resume(session)
         except SessionError as e:
             raise UserError(self.t("resume_fail", error=e)) from e
+        await self._notify_state_changed(session)
         return "resumed" if resumed else "fresh"
 
     # ── сообщения пользователя ──────────────────────────────────
@@ -1170,10 +1210,8 @@ class OrchestratorCore:
 
     async def notify_session_dead(self, session: Session, code: int | str) -> None:
         """Колбэк SessionManager: Claude умер сам по себе."""
-        self.turns.stop(session.name)
-        await self._drop_pending_perms(session)
-        await asyncio.to_thread(self.bash.close_for_session, session.name)
-        await self.bubbles.close(session.name)
+        await self._teardown_runtime(session)
+        await self._notify_state_changed(session)
         text = self.t("session_died", name=session.title, code=code)
         tail = await asyncio.to_thread(self.manager.tail_log, session)
         if tail:
@@ -1183,11 +1221,8 @@ class OrchestratorCore:
     async def notify_idle_closed(self, sessions: list[Session]) -> None:
         """Колбэк sweeper: сессии остановлены по простою."""
         for session in sessions:
-            self.turns.stop(session.name)
-            await self._drop_pending_perms(session)  # как в close/clear/dead — иначе
-            self._last_tool.pop(session.name, None)  # висящая ✅/❌ ударит по resume
-            await asyncio.to_thread(self.bash.close_for_session, session.name)
-            await self.bubbles.close(session.name)
+            await self._teardown_runtime(session)
+            await self._notify_state_changed(session)
             await self.notice(
                 session, self.t("idle_closed", hours=f"{self.config.idle_timeout_h:g}")
             )

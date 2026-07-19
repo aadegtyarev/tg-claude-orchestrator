@@ -366,6 +366,11 @@ class TelegramAdapter:
         except Exception as e:
             logger.debug("permission_resolved: %s", e)
 
+    async def session_state_changed(self, session: Session | None) -> None:
+        # Transport-хук: у Telegram нет живого списка сессий (каждая — свой
+        # топик), обновлять нечего — no-op.
+        return
+
     # ── регистрация и доступ ────────────────────────────────────
 
     def _register_handlers(self) -> None:

@@ -231,6 +231,65 @@ async def test_bubble_sent_text_only_on_delivery():
     print("OK bubble sent_text фиксируется только при реальной доставке")
 
 
+async def test_teardown_runtime_unified():
+    core = make_core()
+    events = []
+    core.turns = SimpleNamespace(
+        stop=lambda n: events.append(("stop", n)),
+        forget=lambda n: events.append(("forget", n)),
+    )
+
+    async def fake_drop(s):
+        events.append(("drop", s.name))
+    core._drop_pending_perms = fake_drop
+    core.bash = SimpleNamespace(
+        close_for_session=lambda n: events.append(("bash", n))
+    )
+
+    async def fake_bclose(n):
+        events.append(("bubble", n))
+    core.bubbles = SimpleNamespace(close=fake_bclose)
+
+    # Терминальная остановка: stop + drop + очистка _last_tool + bash + бабл.
+    core._last_tool["noos"] = "Bash"
+    await core._teardown_runtime(SESSION)
+    assert ("stop", "noos") in events and ("drop", "noos") in events
+    assert "noos" not in core._last_tool
+    assert ("bash", "noos") in events and ("bubble", "noos") in events
+
+    # Продолжение (clear/switch): forget_turn + НЕ трогаем bash.
+    events.clear()
+    core._last_tool["noos"] = "Read"
+    await core._teardown_runtime(SESSION, close_bash=False, forget_turn=True)
+    assert ("forget", "noos") in events
+    assert not any(e[0] == "bash" for e in events), events
+    assert "noos" not in core._last_tool
+    print("OK _teardown_runtime: единый разбор; close_bash/forget_turn ветвятся")
+
+
+async def test_notify_state_changed_broadcasts():
+    core = make_core()
+    seen = []
+
+    class Tr:
+        name = "web"
+
+        async def session_state_changed(self, s):
+            seen.append(s.name if s else None)
+
+    class Bad:
+        name = "boom"
+
+        async def session_state_changed(self, s):
+            raise RuntimeError("adapter down")
+
+    core.adapters = {"web": Tr(), "boom": Bad()}
+    # Сбой одного адаптера не ломает операцию, остальные получают событие.
+    await core._notify_state_changed(SESSION)
+    assert seen == ["noos"], seen
+    print("OK _notify_state_changed: бродкаст всем, сбой адаптера не ломает")
+
+
 def test_parse_cost_resets_regex():
     # Regex сужен Res[et]+s → Resets? (перестал матчить мусор вроде «Retess»),
     # но должен продолжать тянуть настоящий блок /cost.
@@ -252,6 +311,8 @@ def test_parse_cost_resets_regex():
 
 async def main():
     test_parse_cost_resets_regex()
+    await test_teardown_runtime_unified()
+    await test_notify_state_changed_broadcasts()
     await test_exact_tool_name()
     await test_taskoutput_and_bg_available()
     await test_pending_perms_cleanup()

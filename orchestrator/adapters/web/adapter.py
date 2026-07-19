@@ -312,6 +312,12 @@ class WebAdapter:
         # Клиенту достаточно сигнала — список он перезапрашивает сам.
         await self._broadcast({"type": "sessions_changed"})
 
+    async def session_state_changed(self, session: "Session | None") -> None:
+        """Transport-хук: ядро сообщило о переходе состояния сессий (в т.ч.
+        инициированном не вебом — Telegram/idle/смерть). Шлём клиентам сигнал
+        обновить список — без этого веб залипал на чужих изменениях до F5."""
+        await self._sessions_changed()
+
     def _origin(self) -> Origin:
         # У веба нет reply-цитирования — токен произвольный, ядро его не трактует.
         return Origin(self.name, "0")

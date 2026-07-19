@@ -128,6 +128,13 @@ async def main():
                 assert "<b>готово</b>" in ev["html"], ev
                 print("OK WS: hello + reply-событие с html")
 
+                # session_state_changed (переход из ЛЮБОГО источника: TG/idle/
+                # смерть) → сигнал обновить список даже без REST от веба.
+                await adapter.session_state_changed(session)
+                ev = await asyncio.wait_for(ws.receive_json(), 5)
+                assert ev["type"] == "sessions_changed", ev
+                print("OK WS: session_state_changed → sessions_changed")
+
                 # бабл: post → ref, edit тем же ref
                 ref = await adapter.bubble_post(session, "<b>x</b>", stop_button=True)
                 ev = await asyncio.wait_for(ws.receive_json(), 5)
