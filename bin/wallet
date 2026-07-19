@@ -67,15 +67,18 @@ def call(cfg: dict, method: str, path: str, payload: dict | None = None) -> dict
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         try:
-            detail = json.loads(e.read().decode()).get("error", "")
+            body = json.loads(e.read().decode())
+            reason, err = body.get("reason", ""), body.get("error", "")
         except Exception:
-            detail = ""
+            reason, err = "", ""
         if e.code == 401:
             die("токен не принят — сессия пересоздана? перезапусти оркестратор")
         if e.code == 403:
-            die(f"отказано: {detail or 'policy/подтверждение'} "
-                "(секрет не разрешён этой сессии/команде или отклонён кнопкой)", 3)
-        die(f"демон ответил {e.code}: {detail}")
+            # reason (когда есть) прозрачно объясняет ЧТО не так и КАК правильно;
+            # иначе — общий отказ policy/подтверждения.
+            die(reason or "отказано: секрет не разрешён этой сессии/команде "
+                "или отклонён кнопкой", 3)
+        die(f"демон ответил {e.code}: {err}")
     except urllib.error.URLError as e:
         die(f"демон кошелька недоступен ({e.reason}) — оркестратор запущен с MODULES=wallet?")
 

@@ -11,11 +11,11 @@
 
 ```toml
 [secrets.deploy]
-value = "ghp_xxx"                # сам секрет
-env = "GITHUB_TOKEN"             # env-переменная для команды
+value = "ghp_xxx"                # сам секрет (inject); нет value/env = host-passthrough
+env = "GITHUB_TOKEN"             # env-переменная, куда класть value
 description = "GitHub deploy token"
 sessions = ["*"]                 # fnmatch по имени сессии; нет поля = никому
-commands = ["gh *", "git push*"] # fnmatch по команде; нет поля = ничего
+commands = ["gh", "git push*"]   # голое имя = любой вызов; шаблон = fnmatch
 confirm = true                   # кнопки подтверждения перед запуском
 ```
 
@@ -97,28 +97,80 @@ wallet run api -- sh -c 'curl -H "Authorization: Bearer $API_TOKEN" https://api.
 достаёт, токен в песочницу не попадает.
 
 
-### host-passthrough: инструменты, авторизованные на хосте (gh, git)
+### Настройка policy — справочник
 
-Отдельный вид записи — **без `value`/`env`**. Команда просто исполняется на
-хосте с хостовым окружением (keyring, gh/git auth), ничего в env не
-инжектится. Для инструментов вроде `gh`/`git`, чей токен лежит в keyring или
-`~/.config/gh` **вне песочницы** (под bwrap `$HOME` изолирован, поэтому в
-сессии `gh` разлогинен) — так команда работает, а токен модель не видит:
+**Принцип.** Кошелёк не должен душить модель (иначе проще прогать самому),
+поэтому по умолчанию удобно: голое имя инструмента = любой его вызов. Но есть
+пол, который держится всегда, — он не «ограничение», а само условие смысла
+кошелька: модель должна **использовать** креды, не **читая** их. Три слоя,
+в порядке применения:
+
+1. **allow — `commands`** (где кошелёк доступен). Голое имя (`gh`, `git`,
+   `ssh`) — любой вызов инструмента; строка с пробелом/глобом
+   (`gh api repos/*`, `git push*`) — fnmatch по всей команде для тонкой
+   настройки. Пусто у host-passthrough → дефолт `["gh","git","ssh","scp"]`;
+   пусто у inject → ничего (сырой токен не открываем без явного списка).
+2. **guard — встроенный всегда-запрет** (поверх allow). Рубит опасное
+   независимо от `commands`, с **прозрачным объяснением модели** (что не так и
+   как правильно — доходит до её терминала): команды, печатающие сам токен
+   (`gh auth token`, `gh auth status --show-token`), и git-RCE через
+   флаги/транспорт (`git -c …`, `ext::…`, `--receive-pack/--upload-pack/--exec`).
+   Отключается глобально `WALLET_GUARD=0` в `.env` или точечно на секрет
+   `allow_unsafe = true`.
+3. **deny — точечный запрет секрета** (поверх allow, deny побеждает).
+   Голый токен (`--force`, `--hard`) блокирует этот флаг/аргумент где угодно;
+   строка с пробелом/глобом — fnmatch по всей команде. Для «разрешаю
+   инструмент, но не эти опасные опции».
+
+**Поля записи `[secrets.<имя>]`:**
+
+| поле | смысл | дефолт |
+|---|---|---|
+| `value` + `env` | inject: значение и env-переменная для него | нет = host-passthrough |
+| `sessions` | fnmatch имён сессий, кому доступен | нет = никому |
+| `commands` | allow-лист (голые имена/шаблоны) | host: `gh git ssh scp`; inject: ничего |
+| `deny` | точечный запрет поверх allow | нет |
+| `allow_unsafe` | снять встроенный guard на этом секрете | `false` |
+| `confirm` | кнопки ✅/❌ перед запуском | `true` |
+
+**Что по умолчанию** (просто `MODULES=wallet` + запись без лишних полей):
+host-passthrough с `gh/git/ssh/scp`, guard включён, `confirm=true`. Этого
+хватает для «дай сессии работать с git/gh хоста, не пуская токен в модель».
+
+**Примеры.**
 
 ```toml
-[secrets.gh]
-description = "gh/git на хосте (keyring)"
+# Хостовые креды (keyring/gh/git/ssh) — удобно и безопасно по умолчанию:
+[secrets.host]
 sessions = ["noos"]
-# НЕ включай "gh auth *"/"gh secret *" — они распечатают токен, а вывод
-# host-passthrough НЕ редактируется (value нет). Только конкретные операции:
-commands = ["gh pr *", "gh release *", "gh api *", "gh repo view*", "git push*", "git pull*"]
+commands = ["gh", "git", "ssh", "scp"]   # любой вызов; guard рубит опасное
+
+# Разрешить инструмент, но запретить разрушительные флаги:
+[secrets.careful-git]
+sessions = ["ci-*"]
+commands = ["git"]
+deny = ["--force", "--force-with-lease", "git push --delete*"]
+
+# Тонко: только чтение через gh api, ничего лишнего:
+[secrets.readonly]
+sessions = ["report"]
+commands = ["gh api user", "gh api repos/*"]
+
+# Специфичный доверенный случай, где нужен как раз git -c (guard мешает):
+[secrets.special]
+sessions = ["build"]
+commands = ["git"]
+allow_unsafe = true    # ОСОЗНАННО снимаем guard на этом секрете
 confirm = true
 ```
 
-В сессии: `wallet run gh -- gh pr create …`, `wallet run gh -- git push`.
-Барьер тот же — policy (`sessions`/`commands`/`confirm`); вывод НЕ
-редактируется (секрета-значения нет), поэтому шаблоны команд должны исключать
-всё, что печатает токен.
+**Остаточные дыры (закрываются доверием, не policy).** Команда бежит в cwd
+проекта, куда модель пишет: подложенный `./.git/config`
+(`core.sshCommand`/hooks) даёт исполнение на хосте при `git push` — аргументами
+не закрыть. Редакция вывода literal-only (base64/запись в файл её обходят).
+Барьеры-по-настоящему: `sessions` (доверенные), `confirm` (человек видит
+команду), host-passthrough вместо inject (нет значения, которое можно
+`echo|base64`). См. «Модель угроз» и «Известные дыры» ниже.
 
 Этапы 2–3 (MCP-обёртка, плейсхолдер-прокси agent-vm) — не начаты.
 

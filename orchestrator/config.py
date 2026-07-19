@@ -72,6 +72,10 @@ class Config:
     # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
     # allowlist песочницы).
     wallet_secrets_file: Path
+    # Guard кошелька: всегда-запрет опасных вызовов (печать токена, git-RCE через
+    # флаги) поверх policy, с прозрачным объяснением модели. WALLET_GUARD=0 —
+    # отключить (модель сможет что угодно в рамках commands; менее безопасно).
+    wallet_guard: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -158,6 +162,8 @@ class Config:
                     "~/.config/claude-orchestrator/secrets.toml",
                 )
             ).expanduser(),
+            wallet_guard=os.getenv("WALLET_GUARD", "1").strip().lower()
+            not in ("0", "false", "no", "off"),
         )
 
     @staticmethod

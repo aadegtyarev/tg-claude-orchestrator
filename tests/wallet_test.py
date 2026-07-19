@@ -91,7 +91,8 @@ def make_env(tmp: Path):
         request_confirmation=request_confirmation,
     )
     config = SimpleNamespace(
-        wallet_secrets_file=secrets_file, sandbox="bwrap", sessions_dir=tmp
+        wallet_secrets_file=secrets_file, sandbox="bwrap", sessions_dir=tmp,
+        wallet_guard=True,
     )
     return core, config, home, secrets_file, confirm_answer
 
@@ -196,10 +197,61 @@ async def main():
             assert data["code"] == 0 and "hg=[][]" in data["stdout"], data
             print("OK host-passthrough: команда на хосте без инъекции секрета в env")
 
+            # guard прозрачен: gh auth token разрешён commands (gh *), но guard
+            # рубит его 403 с ОБЪЯСНЯЮЩИМ reason (доходит до терминала модели)
+            async with http.post(f"{url}/run", headers=good,
+                                 json={"secret": "deploy",
+                                       "cmd": ["gh", "auth", "token"]}) as r:
+                assert r.status == 403
+                body = await r.json()
+            assert "reason" in body and "токен" in body["reason"], body
+            print("OK guard: gh auth token → 403 с прозрачным объяснением")
+
         # редакция: вложенные значения, длинные первыми
         out = _redact(b"a=S3CR3T-DEPLOY b=S3CR3T-OTHER", ["S3CR3T-DEPLOY", "S3CR3T-OTHER"])
         assert out == "a=••• b=•••", out
         print("OK _redact: все известные значения вымараны")
+
+        # ── policy команд: голые имена, дефолт host, guard, deny ──
+        from orchestrator.modules.wallet.module import (
+            Secret, DEFAULT_HOST_COMMANDS, _always_denied,
+        )
+
+        def mk(name, value, env, sessions, commands, deny=(), allow_unsafe=False):
+            return Secret(name, value, env, "", sessions, commands, deny, allow_unsafe, False)
+
+        # commands (allow): голое имя = любой вызов; шаблон с пробелом = fnmatch
+        s_bare = mk("x", "", "", ("*",), ("gh", "curl https://api/*"))
+        assert s_bare.command_allowed(["gh", "pr", "create"])          # gh → любой
+        assert s_bare.command_allowed(["curl", "https://api/v1/x"])    # шаблон
+        assert not s_bare.command_allowed(["curl", "https://evil/x"])  # вне шаблона
+        assert not s_bare.command_allowed(["wget", "x"])               # не в списке
+        # голое имя в commands — только имя инструмента, не «аргумент где-то»
+        assert not s_bare.command_allowed(["git", "remote", "add", "x", "gh"])
+        # host-passthrough без commands → дефолтный набор gh/git/ssh/scp
+        s_def = mk("h", "", "", ("*",), ())
+        assert s_def.effective_commands == DEFAULT_HOST_COMMANDS
+        assert s_def.command_allowed(["git", "push"]) and s_def.command_allowed(["ssh", "host"])
+        assert not s_def.command_allowed(["cat", "/etc/passwd"])       # не инструмент
+        # inject без commands → ничего (сырой токен не открываем по умолчанию)
+        assert mk("i", "V", "TOK", ("*",), ()).effective_commands == ()
+
+        # guard (_always_denied): печать токена и git-RCE — независимо от commands
+        assert _always_denied(["gh", "auth", "token"]) is not None
+        assert _always_denied(["gh", "auth", "status", "--show-token"]) is not None
+        assert _always_denied(["gh", "auth", "status"]) is None        # без --show-token ок
+        assert _always_denied(["git", "-c", "core.sshCommand=evil", "push"]) is not None
+        assert _always_denied(["git", "push", "ext::sh -c evil"]) is not None
+        assert _always_denied(["git", "push", "--receive-pack=evil"]) is not None
+        assert _always_denied(["git", "push", "origin", "main"]) is None  # обычный push ок
+
+        # deny (per-secret, поверх commands): инструмент разрешён, флаг заблокирован
+        s_deny = mk("d", "", "", ("*",), ("git",), deny=("--force", "git push --hard*"))
+        assert s_deny.command_allowed(["git", "push"])                     # allow есть
+        assert s_deny.denied_by(["git", "push", "--force"]) == "--force"   # флаг где угодно
+        assert s_deny.denied_by(["git", "push", "--hard", "x"]) is not None  # шаблон
+        assert s_deny.denied_by(["git", "push"]) is None                   # обычный — можно
+        print("OK policy: allow(голые/шаблон) + guard(gh-token/git-RCE) + deny(флаги)")
 
         # CLI end-to-end через живого демона (stdlib-скрипт, как в песочнице)
         # CLI — в потоке: subprocess.run в самом event loop заблокировал бы

@@ -44,6 +44,49 @@ RUN_TIMEOUT = 300.0
 STREAM_LIMIT = 200_000
 # Чем заменяем значения секретов в выводе.
 REDACTED = "•••"
+# Дефолтный набор для host-passthrough, когда `commands` не задан: инструменты,
+# которые обычно уже авторизованы на хосте и не отдают сам секрет наружу. Смысл
+# кошелька — «используй, но не читай»: gh/git/ssh/scp применяют креды сами,
+# echo/cat/sh их бы просто распечатали, поэтому в дефолт НЕ входят. Хочешь
+# curl/kubectl/своё — допиши commands явно.
+DEFAULT_HOST_COMMANDS = ("gh", "git", "ssh", "scp")
+
+
+def _always_denied(cmd: list[str]) -> str | None:
+    """Опасные вызовы, запрещённые guard'ом — при любой policy, даже `commands=["gh"]`.
+
+    Смысл: голое имя инструмента должно оставаться удобным, не превращаясь в
+    утечку токена или запуск произвольного кода на хосте. Возвращает ПРОЗРАЧНОЕ
+    сообщение модели (что не так + как правильно) либо None. Guard включается
+    флагом WALLET_GUARD (по умолчанию on); применяется в _handle_run.
+
+    Это НЕ полная защита — безфлаговый вектор (подложить `./.git/config` в
+    проекте, который `git push` всё равно прочитает) закрыть аргументами нельзя,
+    только доверием к сессии (см. docs «Известные дыры»).
+    """
+    binary = os.path.basename(cmd[0]) if cmd else ""
+    # 1. Печатают сам секрет — редакция literal-only их не всегда ловит.
+    if cmd[:2] == ["gh", "auth"] and ("token" in cmd[2:3] or "--show-token" in cmd):
+        return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
+                "секретов. Используй gh для операций (gh pr …, gh api …, gh release …), "
+                "а не для печати токена.")
+    # 2. git → произвольное исполнение на хосте через конфиг/транспорт/флаги.
+    if binary == "git":
+        toks = cmd[1:]
+        if "-c" in toks:  # -c core.sshCommand=… / protocol.ext.allow=… / core.fsmonitor=…
+            return ("Флаг `git -c` переопределяет конфиг и может запустить произвольный "
+                    "код на хосте — поэтому запрещён. Запусти git push/pull/fetch БЕЗ "
+                    "`-c`; если нужен особый git-конфиг, попроси оператора настроить "
+                    "его на хосте.")
+        for t in toks:
+            if t.startswith("ext::"):
+                return ("git-транспорт `ext::` запускает произвольную команду — запрещён. "
+                        "Используй обычный remote (https или ssh) для push/pull/fetch.")
+            if t.startswith(("--receive-pack", "--upload-pack", "--exec")):
+                return ("Флаги --receive-pack/--upload-pack/--exec запускают произвольную "
+                        "команду на той стороне — запрещены. Запусти git push/pull/fetch "
+                        "без них.")
+    return None
 
 
 @dataclass(frozen=True)
@@ -65,18 +108,70 @@ class Secret:
     env: str    # "" для host-passthrough
     description: str
     sessions: tuple[str, ...]  # fnmatch-шаблоны имён сессий; пусто = никому
-    commands: tuple[str, ...]  # fnmatch-шаблоны строки команды; пусто = ничего
+    # commands: где кошелёк доступен (allow-лист). Голое имя инструмента («gh»,
+    # «ssh») = любой его вызов; строка с пробелом/глобом («curl https://api/*») =
+    # fnmatch по всей команде (тонкая настройка). Для host-passthrough пустое
+    # поле = DEFAULT_HOST_COMMANDS; для inject пустое = ничего (сырой токен не
+    # открываем без явного списка).
+    commands: tuple[str, ...]
+    # deny: точечный запрет ПОВЕРХ commands (deny побеждает allow). Голый токен
+    # («--force», «--hard») = блок этого флага/аргумента где угодно; строка с
+    # пробелом/глобом = fnmatch по всей команде. Для «разрешаю инструмент, но
+    # не эти опасные флаги».
+    deny: tuple[str, ...]
+    # allow_unsafe: точечно отключить встроенный guard (печать токена, git-RCE)
+    # для ЭТОГО секрета — для доверенных специфичных случаев. Глобально guard
+    # рубится WALLET_GUARD=0; это — гранулярно, на один секрет.
+    allow_unsafe: bool
     confirm: bool  # спрашивать ли подтверждение кнопками перед запуском
 
     @property
     def host_passthrough(self) -> bool:
         return not (self.value and self.env)
 
+    @property
+    def effective_commands(self) -> tuple[str, ...]:
+        if self.commands:
+            return self.commands
+        return DEFAULT_HOST_COMMANDS if self.host_passthrough else ()
+
     def session_allowed(self, session_name: str) -> bool:
         return any(fnmatch.fnmatch(session_name, pat) for pat in self.sessions)
 
-    def command_allowed(self, cmd_str: str) -> bool:
-        return any(fnmatch.fnmatch(cmd_str, pat) for pat in self.commands)
+    @staticmethod
+    def _matches(pat: str, binary: str, cmd: list[str], cmd_str: str) -> bool:
+        """Один шаблон против команды: голый токен = имя инструмента или любой
+        аргумент; строка с пробелом/глобом = fnmatch по всей строке команды."""
+        if " " not in pat and not any(c in pat for c in "*?["):
+            return binary == pat or pat in cmd[1:]
+        return fnmatch.fnmatch(cmd_str, pat)
+
+    def denied_by(self, cmd: list[str]) -> str | None:
+        """Точечный запрет секрета (deny). Возвращает сматчивший шаблон или None."""
+        if not cmd:
+            return None
+        binary = os.path.basename(cmd[0])
+        cmd_str = " ".join(cmd)
+        for pat in self.deny:
+            if self._matches(pat, binary, cmd, cmd_str):
+                return pat
+        return None
+
+    def command_allowed(self, cmd: list[str]) -> bool:
+        """Allow-проверка по commands (guard и deny — отдельно, в _handle_run)."""
+        if not cmd:
+            return False
+        binary = os.path.basename(cmd[0])
+        cmd_str = " ".join(cmd)
+        for pat in self.effective_commands:
+            # allow голым именем — только имя инструмента (не «аргумент где-то»),
+            # иначе commands=["gh"] разрешил бы «git … gh …». Потому не _matches.
+            if " " not in pat and not any(c in pat for c in "*?["):
+                if binary == pat:
+                    return True
+            elif fnmatch.fnmatch(cmd_str, pat):
+                return True
+        return False
 
 
 class SecretStore:
@@ -134,6 +229,8 @@ class SecretStore:
                 description=str(raw.get("description", "")),
                 sessions=tuple(str(p) for p in raw.get("sessions", ())),
                 commands=tuple(str(p) for p in raw.get("commands", ())),
+                deny=tuple(str(p) for p in raw.get("deny", ())),
+                allow_unsafe=bool(raw.get("allow_unsafe", False)),
                 confirm=bool(raw.get("confirm", True)),
             )
         return self._secrets
@@ -301,7 +398,7 @@ class WalletModule:
             {
                 "name": s.name,
                 "description": s.description,
-                "commands": list(s.commands),
+                "commands": list(s.effective_commands),
                 "confirm": s.confirm,
                 # host — команда идёт на хосте с его окружением (keyring/gh/git),
                 # инъекции нет; inject — значение секрета кладётся в env-переменную
@@ -330,10 +427,21 @@ class WalletModule:
 
         all_secrets = self.store.load()
         secret = all_secrets.get(name)
+        # Причина отказа для прозрачности (что не так + как правильно). Порядок:
+        #   1. встроенный guard (печать токена, git-RCE) — если включён глобально
+        #      (WALLET_GUARD) и не снят на секрете (allow_unsafe);
+        #   2. точечный deny секрета — поверх commands (deny побеждает allow).
+        reason: str | None = None
+        if secret is not None:
+            if self.config.wallet_guard and not secret.allow_unsafe:
+                reason = _always_denied(cmd)
+            if reason is None and (pat := secret.denied_by(cmd)) is not None:
+                reason = f"заблокировано policy этого секрета (deny: {pat})"
         allowed = (
             secret is not None
             and secret.session_allowed(session.name)
-            and secret.command_allowed(cmd_str)
+            and secret.command_allowed(cmd)
+            and reason is None
         )
         if allowed and secret.confirm:
             # Вердикт остаётся в ядре (кнопки ✅/❌ во всех адаптерах),
@@ -357,7 +465,13 @@ class WalletModule:
         await self.core.notice(session, self.core.t("wallet_use", line=line) + verdict)
         self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
-            return web.json_response({"error": "denied"}, status=403)
+            # Прозрачность: reason объясняет модели ЧТО не так и КАК правильно —
+            # это доходит до её терминала (bin/wallet печатает reason), а не
+            # глухое «denied».
+            return web.json_response(
+                {"error": "denied", "reason": reason} if reason else {"error": "denied"},
+                status=403,
+            )
 
         code, out, err = await self._execute(session, secret, cmd)
         values = [s.value for s in all_secrets.values()]
