@@ -25,10 +25,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from html import escape as html_escape
+from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -96,11 +99,17 @@ class BubbleManager:
         t: Callable[..., str],
         delete_after: bool,
         unblock_available: Callable[[str], bool] | None = None,
+        persist_path: "Path | None" = None,
     ):
         self._transports = transports
         self._get_session = get_session
         self._t = t
         self._delete_after = delete_after
+        # Куда персистить refs живых баблов: при НЕ-graceful смерти (краш/SIGKILL)
+        # close_all не отработает, и сообщение-бабл повиснет сиротой. Новый
+        # процесс на старте прочитает этот файл и уберёт осиротевшие (см.
+        # cleanup_stale_bubbles в ядре).
+        self._persist_path = persist_path
         # Можно ли сейчас свернуть задачу сессии в фон (Ctrl+B) — для активности
         # кнопки ⏬. None = всегда False (адаптер без поддержки).
         self._unblock_available = unblock_available or (lambda name: False)
@@ -117,6 +126,25 @@ class BubbleManager:
     def has(self, name: str) -> bool:
         """Есть ли активный бабл (используется как признак «работает»)."""
         return name in self._bubbles
+
+    def _save_live(self) -> None:
+        """Записать refs всех живых (активных + замороженных) баблов на диск.
+        Читается новым процессом на старте (cleanup_stale_bubbles), чтобы убрать
+        сообщения, осиротевшие при НЕ-graceful смерти (краш/SIGKILL)."""
+        if self._persist_path is None:
+            return
+        entries: list[dict] = []
+        for name, b in self._bubbles.items():
+            entries += [{"session": name, "adapter": a, "ref": r} for a, r in b.refs.items()]
+        for name, frozen in self._frozen.items():
+            for b in frozen:
+                entries += [{"session": name, "adapter": a, "ref": r} for a, r in b.refs.items()]
+        try:
+            tmp = self._persist_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(entries))
+            os.replace(tmp, self._persist_path)
+        except OSError as e:
+            logger.debug("persist live bubbles: %s", e)
 
     def open(self, name: str) -> None:
         """Начало хода: с этого момента append создаёт/наполняет бабл. Если был
@@ -298,6 +326,7 @@ class BubbleManager:
         # новых событий — вообще без бабла).
         if delivered:
             bubble.sent_text = text
+            self._save_live()  # ref появился/обновился — зафиксировать для очистки сирот
 
     async def _await_flush(self, bubble: Bubble) -> None:
         """Дождаться отложенной правки (или отправки), если она в очереди —
@@ -350,6 +379,7 @@ class BubbleManager:
             await self._finish_message(old, session)
         if bubble is not None:
             await self._finish_message(bubble, session)
+        self._save_live()  # баблы убраны — обновить персист (сирот не осталось)
 
     async def close_all(self) -> None:
         """Закрыть ВСЕ активные и замороженные баблы — для graceful shutdown.
@@ -364,6 +394,7 @@ class BubbleManager:
                 await self.close(name)
             except Exception as e:
                 logger.debug("close_all(%s): %s", name, e)
+        self._save_live()  # всё закрыто — персист пуст, старту нечего чистить
 
     async def freeze_and_open(self, name: str) -> None:
         """Пользователь шлёт новое сообщение, пока сессия ещё работает над
@@ -383,3 +414,4 @@ class BubbleManager:
             session = self._get_session(name)
             if session is not None:
                 await self._freeze_message(old, session)
+            self._save_live()  # замороженный бабл ещё «живой» на экране — учесть

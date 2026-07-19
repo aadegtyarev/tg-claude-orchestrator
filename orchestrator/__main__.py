@@ -84,6 +84,9 @@ async def main() -> None:
 
     try:
         await core.start()
+        # Убрать баблы, осиротевшие при НЕ-graceful смерти прошлого процесса
+        # (краш/SIGKILL — тогда close_all не отработал). Адаптеры уже подняты.
+        await core.cleanup_stale_bubbles()
         # Стартовое уведомление после короткой паузы (адаптеры должны подняться).
         loop.call_later(
             2, lambda: asyncio.ensure_future(core.notify_startup(restored))

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import re
 import time
@@ -75,6 +76,7 @@ class OrchestratorCore:
         self.bubbles = BubbleManager(
             self._transports, manager.get, self.t, config.delete_bubble,
             unblock_available=self._unblock_available,
+            persist_path=config.sessions_dir / ".live_bubbles.json",
         )
         # Последний значимый тул на сессию — для детекта состояния «ждёт
         # фоновую задачу» (TaskOutput) и активности кнопки ⏬.
@@ -115,6 +117,36 @@ class OrchestratorCore:
             await tr.start()
         for mod in self.modules:
             await mod.start(self)
+
+    async def cleanup_stale_bubbles(self) -> None:
+        """Убрать сообщения-баблы, осиротевшие при НЕ-graceful смерти прошлого
+        процесса (краш/SIGKILL — close_all не отработал). refs персистятся в
+        .live_bubbles.json; читаем, удаляем через адаптеры, чистим файл.
+        Вызывать на старте ПОСЛЕ подъёма адаптеров и load_state сессий."""
+        path = self.config.sessions_dir / ".live_bubbles.json"
+        try:
+            entries = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        adapters = {tr.name: tr for tr in self._transports()}
+        removed = 0
+        for e in entries:
+            session = self.manager.get(str(e.get("session", "")))
+            tr = adapters.get(str(e.get("adapter", "")))
+            ref = e.get("ref")
+            if session is None or tr is None or ref is None:
+                continue
+            try:
+                await tr.bubble_finish(session, str(ref), delete=True)
+                removed += 1
+            except Exception as ex:
+                logger.debug("cleanup сироты бабла %s: %s", e.get("session"), ex)
+        if removed:
+            logger.info("Убрал осиротевших баблов с прошлого запуска: %d", removed)
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
     async def close(self) -> None:
         for mod in self.modules:

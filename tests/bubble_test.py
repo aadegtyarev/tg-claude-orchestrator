@@ -263,6 +263,23 @@ async def main():
     assert id12 in tr.deleted and id13 in tr.deleted  # сообщения-баблы убраны
     print("OK close_all: все баблы закрыты (рестарт не оставит сироту)")
 
+    # ── персист refs: сирот убирают на старте (после краша/SIGKILL) ──
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+    pfile = _Path(tempfile.mkdtemp(prefix="bub_")) / "live.json"
+    bm2 = BubbleManager(lambda: [tr], SESSIONS.get, lambda k, **kw: _TEXTS[k],
+                        delete_after=True, persist_path=pfile)
+    bm2.open("s7")
+    await bm2.append("s7", "⚡ <b>Bash</b> <code>x</code>", tool="Bash")
+    await _settle(bm2, "s7")
+    saved = _json.loads(pfile.read_text())
+    assert any(e["session"] == "s7" and e["adapter"] == "fake" for e in saved), saved
+    print("OK персист: ref живого бабла записан (для очистки сирот при краше)")
+    await bm2.close("s7")
+    assert _json.loads(pfile.read_text()) == []  # закрыт штатно — сирот нет
+    print("OK персист: после close персист пуст")
+
     print("ALL BUBBLE OK")
 
 
