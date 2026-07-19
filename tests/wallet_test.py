@@ -207,5 +207,8 @@ async def main():
     print("ALL WALLET OK")
 
 
+async def test_wallet():
+    await main()
+
 if __name__ == "__main__":
     asyncio.run(main())

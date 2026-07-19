@@ -148,6 +148,9 @@ class SessionManager:
         self.config = config
         self._lock = asyncio.Lock()  # защищает _by_name и выдачу портов
         self._by_name: dict[str, Session] = {}
+        # Порты, выданные стартующим сессиям, но ещё не занятые их channel-
+        # сервером (окно гонки при фиксированном пуле) — см. _find_free_port.
+        self._inflight_ports: set[int] = set()
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
         # Общий HTTP-пул к channel-серверам (keep-alive, без сессии на запрос —
@@ -282,6 +285,7 @@ class SessionManager:
                 await self._wait_ready(session)
             except Exception:
                 await self._terminate(session)
+                self._inflight_ports.discard(session.port)
                 async with self._lock:
                     self._by_name.pop(slug, None)
                 self.save_state()
@@ -316,10 +320,17 @@ class SessionManager:
         if lo <= 0 or hi <= 0:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
-                return s.getsockname()[1]
+                port = s.getsockname()[1]
+            self._inflight_ports.add(port)
+            return port
         # Фиксированный пул: порт остановленной сессии уже свободен (процесс
         # убит) — учитываем только работающие, иначе resume ложно упадёт.
+        # Плюс _inflight_ports: порты сессий, которые СЕЙЧАС стартуют, но ещё
+        # не подняли channel-сервер (в этом окне они не running и порт не занят
+        # реально) — иначе конкурентный /new выдал бы тот же порт, и сообщения
+        # одной сессии ушли бы в channel-сервер другой.
         used = {sess.port for sess in self._by_name.values() if sess.running}
+        used |= self._inflight_ports
         for port in range(lo, hi + 1):
             if port in used:
                 continue
@@ -328,6 +339,7 @@ class SessionManager:
                     s.bind(("127.0.0.1", port))
                 except OSError:
                     continue
+            self._inflight_ports.add(port)  # снимется в _start_watcher/_stop_process
             return port
         return None
 
@@ -691,6 +703,9 @@ class SessionManager:
     # ── внутренняя механика процессов ───────────────────────────
 
     def _start_watcher(self, session: Session) -> None:
+        # Сессия поднялась и стабильна: её порт теперь реально держит живой
+        # channel-сервер (учитывается через running), резерв «в полёте» снят.
+        self._inflight_ports.discard(session.port)
         session.watcher = asyncio.create_task(
             self._watch(session), name=f"watch-{session.name}"
         )
@@ -724,6 +739,9 @@ class SessionManager:
             session.watcher = None
         await self._terminate(session)
         session.process = None
+        # Старт мог упасть до _start_watcher — снимаем резерв порта и здесь,
+        # иначе он утёк бы из _inflight_ports навсегда.
+        self._inflight_ports.discard(session.port)
         if save:
             self.save_state()
 

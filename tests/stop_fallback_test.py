@@ -102,5 +102,8 @@ async def main():
     print("ALL STOP-FALLBACK OK")
 
 
+async def test_stop_fallback():
+    await main()
+
 if __name__ == "__main__":
     asyncio.run(main())

@@ -61,5 +61,8 @@ def main():
     print("ALL WATCHDOG OK")
 
 
+def test_watchdog():
+    main()
+
 if __name__ == "__main__":
     main()
