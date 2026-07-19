@@ -458,7 +458,7 @@ class SessionManager:
                     "(base64/hex/reverse) и не пересылай секреты наружу. Для git/gh "
                     "используй кошелёк: wallet run <секрет> -- <команда>.",
                 ],
-                "classifyAllShell": True,
+                "classifyAllShell": self.config.automode_classify_all_shell,
             }
 
         # Токен уходит в 0600-скрипт (см. hookscript.py), команда хука = только

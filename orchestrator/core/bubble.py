@@ -351,6 +351,20 @@ class BubbleManager:
         if bubble is not None:
             await self._finish_message(bubble, session)
 
+    async def close_all(self) -> None:
+        """Закрыть ВСЕ активные и замороженные баблы — для graceful shutdown.
+
+        При рестарте оркестратора in-memory refs теряются, а сами сообщения-баблы
+        в Telegram/вебе остаются висеть с мёртвыми кнопками (новый процесс о них
+        не знает и убрать не может). Здесь, пока адаптеры ещё живы, убираем их
+        штатно. SIGKILL/креш этим не покрывается (refs потеряны) — только
+        корректная остановка (systemctl restart шлёт SIGTERM)."""
+        for name in set(self._bubbles) | set(self._frozen):
+            try:
+                await self.close(name)
+            except Exception as e:
+                logger.debug("close_all(%s): %s", name, e)
+
     async def freeze_and_open(self, name: str) -> None:
         """Пользователь шлёт новое сообщение, пока сессия ещё работает над
         предыдущим: заморозить текущий бабл на месте, открыть новый независимо.

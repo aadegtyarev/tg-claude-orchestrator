@@ -513,6 +513,15 @@ class WalletModule:
         исполнение на хосте. Барьер — policy (sessions/commands/confirm).
         """
         env = dict(os.environ)
+        # Строго НЕинтерактивно: команда бежит без TTY (демон). Любой интерактив
+        # (ssh host-verify/пароль, git credential-промпт) иначе всплывает
+        # GUI-диалогом askpass (Ksshaskpass) на десктопе хоста — висит невидимо
+        # для модели. Глушим GUI: пусть команда падает с понятной ошибкой в
+        # stderr (модель увидит и починит/скажет оператору), а не подвешивает.
+        env["SSH_ASKPASS_REQUIRE"] = "never"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env.pop("DISPLAY", None)
+        env.pop("SSH_ASKPASS", None)
         if not secret.host_passthrough:
             env[secret.env] = secret.value
             # Частичная защита git от подложенного локального конфига (только

@@ -92,6 +92,12 @@ async def main() -> None:
     finally:
         logger.info("Останавливаю сессии (записи сохраняются)…")
         sweeper.cancel()
+        # Убрать активные баблы, ПОКА адаптеры живы: иначе при рестарте refs
+        # теряются и бабл висит сиротой с мёртвыми кнопками.
+        try:
+            await asyncio.wait_for(core.bubbles.close_all(), timeout=8)
+        except Exception as e:
+            logger.debug("close_all при остановке: %s", e)
         await manager.shutdown()
         await reply_runner.cleanup()
         await core.close()

@@ -47,7 +47,8 @@ class FakeTransport:
         self.markup_cleared.append(int(ref))
 
 
-SESSIONS = {n: SimpleNamespace(name=n) for n in ("s7", "s8", "s9")}
+SESSIONS = {n: SimpleNamespace(name=n)
+            for n in ("s7", "s8", "s9", "s10", "s11", "s12", "s13")}
 
 
 def _ref(bm: BubbleManager, name: str) -> int | None:
@@ -247,6 +248,20 @@ async def main():
     await asyncio.wait_for(bm._bg_task["s11"], timeout=5)  # дождаться сторожа
     assert not bm.has("s11"), "фоновый бабл должен авто-закрыться по простою"
     print("OK фоновый бабл: авто-закрытие по простою")
+
+    # ── close_all: graceful shutdown убирает ВСЕ баблы (не осиротить при рестарте) ──
+    bm.open("s12")
+    await bm.append("s12", "⚡ <b>Bash</b> <code>ls</code>")
+    await _settle(bm, "s12")
+    bm.open("s13")
+    await bm.append("s13", "🔧 <b>Edit</b> <code>x</code>")
+    await _settle(bm, "s13")
+    id12, id13 = _ref(bm, "s12"), _ref(bm, "s13")
+    assert bm.has("s12") and bm.has("s13")
+    await bm.close_all()
+    assert not bm.has("s12") and not bm.has("s13")
+    assert id12 in tr.deleted and id13 in tr.deleted  # сообщения-баблы убраны
+    print("OK close_all: все баблы закрыты (рестарт не оставит сироту)")
 
     print("ALL BUBBLE OK")
 

@@ -76,6 +76,11 @@ class Config:
     # флаги) поверх policy, с прозрачным объяснением модели. WALLET_GUARD=0 —
     # отключить (модель сможет что угодно в рамках commands; менее безопасно).
     wallet_guard: bool
+    # Судья auto-режима проверяет ВСЕ bash-команды (classifyAllShell), а не только
+    # «на вид рискованные» — чтобы хитрый secret-exfil не проскочил. Побочка:
+    # больше подтверждений на легит-но-рискованное (force-push и т.п.).
+    # AUTOMODE_CLASSIFY_ALL_SHELL=0 — выключить (меньше вопросов, слабее защита).
+    automode_classify_all_shell: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -164,6 +169,9 @@ class Config:
             ).expanduser(),
             wallet_guard=os.getenv("WALLET_GUARD", "1").strip().lower()
             not in ("0", "false", "no", "off"),
+            automode_classify_all_shell=os.getenv(
+                "AUTOMODE_CLASSIFY_ALL_SHELL", "1"
+            ).strip().lower() not in ("0", "false", "no", "off"),
         )
 
     @staticmethod
