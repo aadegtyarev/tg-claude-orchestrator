@@ -176,6 +176,26 @@ async def main():
                                  json={"text": "x"}) as r:
                 assert r.status == 404
             print("OK неизвестная сессия → 404")
+
+            # снапшот бабла: null пока нет, объект после bubble_post
+            async with http.get(f"{base}/api/sessions/dev/bubble", headers=auth) as r:
+                assert await r.json() is None
+            ref = await adapter.bubble_post(session, "<b>работаю</b>", stop_button=True)
+            async with http.get(f"{base}/api/sessions/dev/bubble", headers=auth) as r:
+                snap = await r.json()
+            assert snap and snap["ref"] == ref and snap["stop_button"] is True
+            await adapter.bubble_finish(session, ref, delete=True)
+            async with http.get(f"{base}/api/sessions/dev/bubble", headers=auth) as r:
+                assert await r.json() is None
+            print("OK /bubble: снапшот появляется/исчезает с баблом")
+
+            # многострочный текст с '/' в первой строке — НЕ слэш-команда
+            calls.clear()
+            async with http.post(f"{base}/api/sessions/dev/message", headers=auth,
+                                 json={"text": "/var/log/x\nвот лог"}) as r:
+                assert (await r.json())["slash"] is False
+            assert any(c[0] == "user_message" for c in calls)
+            print("OK многострочный '/...' → обычное сообщение, не команда")
     finally:
         await adapter.stop()
 

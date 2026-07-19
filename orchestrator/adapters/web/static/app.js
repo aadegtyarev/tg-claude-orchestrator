@@ -60,6 +60,7 @@ let current = null;         // имя выбранной сессии
 let bubbleRef = null;       // ref активного статус-бабла текущей сессии
 let bubbleHtml = "";        // его html — чтобы «заморозить» копию в чат
 let typingTimer = null;
+let loadSeq = 0;            // токен загрузки: гасит гонку историй при быстром переключении
 
 const STATUS_ICON = { working: "🔄", waiting: "🟢", stopped: "⏸" };
 
@@ -115,9 +116,24 @@ async function selectSession(name) {
   els.typing.hidden = true;
   els.emptyHint.hidden = true;
   els.chatArea.hidden = false;
+  // Сброс bash-панели: она привязана к shell выбранной сессии — иначе
+  // «Досыл» ушёл бы в терминал другой сессии, а на экране висел бы чужой вывод.
+  els.bashPanel.hidden = true;
+  els.bashOut.textContent = "";
   renderSessions();
-  await loadHistory(name);
-  els.input.focus();
+  const seq = ++loadSeq;
+  await loadHistory(name, seq);
+  if (seq === loadSeq) await restoreBubble(name, seq);
+  if (seq === loadSeq) els.input.focus();
+}
+
+async function restoreBubble(name, seq) {
+  // Подтягиваем активный бабл работающей сессии (снапшот на сервере), чтобы
+  // после переключения были видны индикатор и кнопки ⏹/⛔.
+  try {
+    const b = await apiJson("/api/sessions/" + encodeURIComponent(name) + "/bubble");
+    if (seq === loadSeq && b && b.html) showBubble(b.ref, b.html, b.stop_button);
+  } catch (e) { /* нет бабла — не критично */ }
 }
 
 /* ── чат: рендер сообщений ─────────────────────────────────── */
@@ -132,9 +148,10 @@ function addMsg(cls, html) {
 }
 
 function fileLink(session, path, name, caption) {
-  let url = "/api/sessions/" + encodeURIComponent(session) +
+  // Токен в href НЕ вставляем: скачивание авторизуется HttpOnly-cookie,
+  // а токен в ссылке утёк бы при «копировать адрес ссылки» и в логи прокси.
+  const url = "/api/sessions/" + encodeURIComponent(session) +
     "/file?path=" + encodeURIComponent(path);
-  if (TOKEN) url += "&token=" + encodeURIComponent(TOKEN);
   return "📄 <a href=\"" + esc(url) + "\" download>" + esc(name || path) + "</a>" +
     (caption ? "<br>" + esc(caption) : "");
 }
@@ -207,15 +224,20 @@ function renderHistoryEvent(session, ev) {
   }
 }
 
-async function loadHistory(name) {
+async function loadHistory(name, seq) {
   els.chat.innerHTML = "";
   let events = [];
   try {
     events = await apiJson("/api/sessions/" + encodeURIComponent(name) + "/history");
   } catch (e) {
-    addMsg("notice", "⚠ история недоступна: " + esc(e.message));
+    if (seq === undefined || seq === loadSeq) {
+      addMsg("notice", "⚠ история недоступна: " + esc(e.message));
+    }
     return;
   }
+  // Пока грузилась история, пользователь мог переключиться на другую сессию —
+  // не подмешиваем ответ старого запроса в чужой чат (гонка loadHistory).
+  if (seq !== undefined && seq !== loadSeq) return;
   for (const ev of events) renderHistoryEvent(name, ev);
   scrollDown(true);
 }
@@ -273,8 +295,13 @@ function handleEvent(ev) {
     case "hello":
       sessions = ev.sessions || [];
       renderSessions();
-      // После реконнекта часть событий потеряна — история переигрывается.
-      if (current) loadHistory(current);
+      // После реконнекта часть событий потеряна — история и бабл переигрываются.
+      if (current) {
+        const seq = ++loadSeq;
+        loadHistory(current, seq).then(() => {
+          if (seq === loadSeq) restoreBubble(current, seq);
+        });
+      }
       return;
     case "sessions_changed":
       fetchSessions();
