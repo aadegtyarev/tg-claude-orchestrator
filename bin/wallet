@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""wallet — CLI кошелька секретов внутри сессии Claude Code.
+
+Секретов здесь нет и не будет: CLI только шлёт команду демону оркестратора
+(TCP-localhost, сеть у песочницы общая с хостом), тот исполняет её НА ХОСТЕ
+с секретом в env и возвращает уже отредактированный вывод (значения секретов
+заменены на •••). См. docs/secrets-wallet.md.
+
+Использование:
+    wallet ls                       — какие секреты доступны этой сессии
+    wallet run <имя> -- <cmd ...>   — выполнить команду с секретом
+
+Конфиг ищется в $WALLET_FILE, затем ~/.wallet.json (внутри песочницы
+персистентный дом сессии смонтирован как $HOME — файл кладёт туда демон).
+Только stdlib: работает в песочнице, где .venv недоступен.
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+# Демон может ждать подтверждение (до 300с) И потом исполнять команду (до
+# 300с) — суммарно до ~600с. Ставим потолок выше, чтобы CLI не отвалился по
+# таймауту, пока команда с секретом ещё выполняется на хосте (иначе модель
+# увидит «сбой» и повторит побочно-эффектную команду — двойной запуск).
+HTTP_TIMEOUT = 660
+
+
+def die(msg: str, code: int = 2) -> "NoReturn":  # noqa: F821 — py3.10 без импорта
+    print(f"wallet: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config() -> dict:
+    candidates = []
+    if os.environ.get("WALLET_FILE"):
+        candidates.append(os.environ["WALLET_FILE"])
+    candidates.append(os.path.expanduser("~/.wallet.json"))
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("url") and cfg.get("token"):
+                return cfg
+        except (OSError, ValueError):
+            continue
+    die(
+        "конфиг не найден (~/.wallet.json). Кошелёк не включён? "
+        "На стороне оркестратора нужен MODULES=wallet в .env."
+    )
+
+
+def call(cfg: dict, method: str, path: str, payload: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        cfg["url"] + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={
+            "Authorization": "Bearer " + cfg["token"],
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("error", "")
+        except Exception:
+            detail = ""
+        if e.code == 401:
+            die("токен не принят — сессия пересоздана? перезапусти оркестратор")
+        if e.code == 403:
+            die(f"отказано: {detail or 'policy/подтверждение'} "
+                "(секрет не разрешён этой сессии/команде или отклонён кнопкой)", 3)
+        die(f"демон ответил {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        die(f"демон кошелька недоступен ({e.reason}) — оркестратор запущен с MODULES=wallet?")
+
+
+def cmd_ls(cfg: dict) -> int:
+    secrets = call(cfg, "GET", "/secrets")
+    if not secrets:
+        print("Секретов для этой сессии нет (policy в secrets.toml).")
+        return 0
+    for s in secrets:
+        desc = f" — {s['description']}" if s.get("description") else ""
+        confirm = " [confirm]" if s.get("confirm") else ""
+        print(f"{s['name']}{desc}{confirm}")
+        for pat in s.get("commands", []):
+            print(f"    разрешено: {pat}")
+    return 0
+
+
+def cmd_run(cfg: dict, argv: list) -> int:
+    if not argv or "--" not in argv:
+        die("использование: wallet run <имя> -- <команда...>")
+    sep = argv.index("--")
+    names, cmd = argv[:sep], argv[sep + 1:]
+    if len(names) != 1 or not cmd:
+        die("использование: wallet run <имя> -- <команда...>")
+    result = call(cfg, "POST", "/run", {"secret": names[0], "cmd": cmd})
+    if result.get("stdout"):
+        sys.stdout.write(result["stdout"])
+        if not result["stdout"].endswith("\n"):
+            sys.stdout.write("\n")
+    if result.get("stderr"):
+        sys.stderr.write(result["stderr"])
+        if not result["stderr"].endswith("\n"):
+            sys.stderr.write("\n")
+    return int(result.get("code", 1))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cfg = load_config()
+    if args[0] == "ls":
+        return cmd_ls(cfg)
+    if args[0] == "run":
+        return cmd_run(cfg, args[1:])
+    die(f"неизвестная команда {args[0]!r} (ls | run)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

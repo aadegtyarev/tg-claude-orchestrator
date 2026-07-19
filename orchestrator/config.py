@@ -33,8 +33,14 @@ def _auto_orch_token() -> str:
 
 @dataclass(frozen=True)
 class Config:
+    # Активные транспорт-адаптеры (ADAPTERS=telegram,web) и модули (MODULES=…).
+    adapters: tuple[str, ...]
+    modules: tuple[str, ...]
     telegram_bot_token: str
     telegram_chat_id: int | None
+    web_host: str
+    web_port: int
+    web_token: str
     channel_port_start: int
     channel_port_end: int
     sessions_dir: Path
@@ -56,22 +62,40 @@ class Config:
     default_model: str | None  # --model по умолчанию (None = решение Claude/профиля/проекта)
     default_effort: str | None  # --effort по умолчанию (low/medium/high/xhigh/max)
     claude_env: dict[str, str]  # доп. env для процесса claude (CLAUDE_ENV_*)
-    sandbox: str  # "bwrap" (файловая песочница) | "off"
+    sandbox: str  # "bwrap" (файловая песочница) | "agent-vm" (microVM) | "off"
     sandbox_extra_rw: tuple[Path, ...]  # доп. пути, доступные из песочницы на запись
+    # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
+    agent_vm_memory_gib: float | None
+    agent_vm_cpus: int | None
+    agent_vm_image: str | None
+    # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
+    # allowlist песочницы).
+    wallet_secrets_file: Path
 
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv()
 
+        adapters = cls._parse_adapters(os.getenv("ADAPTERS", "telegram"))
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        if not token:
-            raise SystemExit("TELEGRAM_BOT_TOKEN не задан — заполни .env (см. .env.example)")
+        if "telegram" in adapters and not token:
+            raise SystemExit(
+                "TELEGRAM_BOT_TOKEN не задан — заполни .env (см. .env.example) "
+                "или убери telegram из ADAPTERS."
+            )
 
         chat_id_raw = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
         return cls(
+            adapters=adapters,
+            modules=cls._parse_modules(os.getenv("MODULES", "")),
             telegram_bot_token=token,
             telegram_chat_id=cls._parse_chat_id(chat_id_raw),
+            web_host=os.getenv("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            web_port=int(os.getenv("WEB_PORT", "8180")),
+            # Токен веб-интерфейса. Пустой = сгенерировать на запуск (URL с
+            # токеном печатается в лог, как у Jupyter).
+            web_token=os.getenv("WEB_TOKEN", "").strip(),
             # 0/не задано = авто: ОС выдаёт свободный localhost-порт на сессию.
             channel_port_start=int(os.getenv("CHANNEL_PORT_START", "0")),
             channel_port_end=int(os.getenv("CHANNEL_PORT_END", "0")),
@@ -116,7 +140,46 @@ class Config:
             # отключает (нужно на машинах без bwrap/без unprivileged userns).
             sandbox=cls._parse_sandbox(os.getenv("SANDBOX", "bwrap")),
             sandbox_extra_rw=cls._parse_paths(os.getenv("SANDBOX_EXTRA_RW", "")),
+            agent_vm_memory_gib=(
+                float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
+            ),
+            agent_vm_cpus=(
+                int(raw) if (raw := os.getenv("AGENT_VM_CPUS", "").strip()) else None
+            ),
+            agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),
+            wallet_secrets_file=Path(
+                os.getenv(
+                    "WALLET_SECRETS_FILE",
+                    "~/.config/claude-orchestrator/secrets.toml",
+                )
+            ).expanduser(),
         )
+
+    @staticmethod
+    def _parse_adapters(raw: str) -> tuple[str, ...]:
+        valid = {"telegram", "web"}
+        names = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        bad = [n for n in names if n not in valid]
+        if bad:
+            raise SystemExit(
+                f"ADAPTERS: неизвестные адаптеры {', '.join(bad)} — "
+                f"допустимо: {', '.join(sorted(valid))}"
+            )
+        if not names:
+            raise SystemExit("ADAPTERS пуст — нужен хотя бы один адаптер (telegram, web)")
+        return tuple(dict.fromkeys(names))  # без дублей, порядок сохранён
+
+    @staticmethod
+    def _parse_modules(raw: str) -> tuple[str, ...]:
+        valid = {"wallet"}
+        names = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        bad = [n for n in names if n not in valid]
+        if bad:
+            raise SystemExit(
+                f"MODULES: неизвестные модули {', '.join(bad)} — "
+                f"допустимо: {', '.join(sorted(valid))}"
+            )
+        return tuple(dict.fromkeys(names))
 
     @staticmethod
     def _parse_sandbox(raw: str) -> str:
@@ -124,9 +187,9 @@ class Config:
         # Синонимы «выключено».
         if mode in ("off", "none", "0", "false", "no"):
             return "off"
-        if mode == "bwrap":
-            return "bwrap"
-        raise SystemExit(f"SANDBOX={raw!r} — допустимо: bwrap | off")
+        if mode in ("bwrap", "agent-vm"):
+            return mode
+        raise SystemExit(f"SANDBOX={raw!r} — допустимо: bwrap | agent-vm | off")
 
     @staticmethod
     def _parse_paths(raw: str) -> tuple[Path, ...]:

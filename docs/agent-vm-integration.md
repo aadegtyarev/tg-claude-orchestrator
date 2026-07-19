@@ -1,6 +1,12 @@
 # Интеграция с agent-vm: сессии в microVM вместо bwrap
 
-Дизайн-документ (реализация не начата). Цель: из Telegram поднимать сессии
+Статус 2026-07: **каркас реализован** — `orchestrator/runners/agentvm.py`
+(`SANDBOX=agent-vm`): сборка argv (`--allow-host`, `--publish` порта канала,
+`--mount` путей сессии/репозитория, ресурсы/образ из `AGENT_VM_*`),
+`preflight()` (наличие agent-vm и /dev/kvm), гвард «одна сессия на cwd»
+(`unique_cwd`) в SessionManager; тесты `tests/runner_agentvm_test.py`.
+НЕ сделано: живой сквозной прогон (шаг 1 ниже) — до него режим считать
+экспериментальным. Цель: поднимать сессии
 Claude Code в изолированных виртуальных машинах через
 [wirenboard/agent-vm](https://github.com/wirenboard/agent-vm) и управлять ими
 так же, как обычными сессиями — топик на сессию, статус-бабл, /stats, /model.
@@ -93,8 +99,8 @@ class AgentVmRunner:
    `--publish`/`--allow-host`/`--mount`, проверить: старт под PTY, спавн
    channel_server, handshake, push→ход→ответ, PreToolUse-хук доносится.
    Результат зафиксировать здесь.
-2. **AgentVmRunner** + `SANDBOX=agent-vm` + гвард уникальности cwd +
-   конфиг-ключи. Тесты: сборка argv (как `sandbox_test`), без реальной VM.
+2. ✅ **AgentVmRunner** + `SANDBOX=agent-vm` + гвард уникальности cwd +
+   конфиг-ключи. Тесты: сборка argv (`tests/runner_agentvm_test.py`), без VM.
 3. **Наблюдаемость и статистика**: транскрипты/stats/usage внутри VM.
 4. **Кошелёк секретов** ([secrets-wallet.md](secrets-wallet.md)): прокси
    agent-vm уже решает подмену HTTP-токенов — объединить дизайны.

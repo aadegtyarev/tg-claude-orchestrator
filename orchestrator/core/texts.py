@@ -27,7 +27,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• другие <code>/команды</code> — уходят в терминал Claude Code\n\n"
             "Пока Claude работает, в топике живёт статус-бабл: вызовы\n"
             "инструментов, сабагенты и промежуточные ответы, кнопка ⏹ Стоп.\n"
-            "Файлы Claude присылает сам (тул send_file_to_telegram).\n"
+            "Файлы Claude присылает сам (тул send_file_to_user).\n"
             "Запросы разрешений приходят кнопками ✅/❌ (permission relay)."
         ),
         "only_main_chat": "Команда работает только в основном чате.",
@@ -46,6 +46,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "limit_reached": "Достигнут лимит сессий ({limit}).",
         "creating": "🔄 Создаю сессию…",
         "create_fail": "❌ {error}",
+        "bind_fail": "❌ Не удалось создать поверхность сессии в «{adapter}»: {error}. Сессия отменена.",
+        "bind_none": "❌ Адаптер «{adapter}» не смог привязать сессию (нет прав/поверхности). Сессия отменена.",
         "created": "✅ «{name}» готов. Пиши в топик «{name}».",
         "stalled": "⚠️ Claude долго молчит и ничего не делает — похоже, завис. Хвост лога ниже. Попробуй /clear или /close_session.",
         "list_empty": "📭 Нет активных сессий.",
@@ -117,6 +119,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "bubble_working": "⏳ Работаю…",
         "bubble_stop": "⏹ Стоп-отчёт",
+        "bubble_esc": "⛔ Прервать",
+        "esc_requested": "Прерываю ход (Esc)…",
+        "esc_done": "⛔ Ход прерван (Esc в терминал). Контекст сохранён — можно писать дальше.",
         "bubble_stop_requested": "⏹ Запрошена остановка",
         "bubble_stopping": "⏹ Останавливаю…",
         "stop_requested": "Попросил Claude остановиться…",
@@ -124,7 +129,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stop_fail": "Не удалось связаться с сессией.",
         "stop_message": (
             "[system] Пользователь нажал Стоп. Немедленно прекрати текущую работу, "
-            "не начинай новых действий и вызови reply_to_telegram с complete=true "
+            "не начинай новых действий и вызови reply_to_user с complete=true "
             "и коротким итогом: что успел сделать."
         ),
         "subagent": "🤖 Сабагент {agent}",
@@ -140,9 +145,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Anthropic URL: {url}"
         ),
         "url_default": "по умолчанию (api.anthropic.com)",
+        "wallet_use": "{line}",
+        "wallet_denied": "отказано (policy/подтверждение)",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
-        "sendfile_denied": "⛔ Не отправляю: файл вне рабочей папки сессии ({path}). send_file_to_telegram разрешён только для файлов проекта/сессии — защита от утечки секретов.",
+        "sendfile_denied": "⛔ Не отправляю: файл вне рабочей папки сессии ({path}). send_file_to_user разрешён только для файлов проекта/сессии — защита от утечки секретов.",
         "sendfile_fail": "❌ Не удалось отправить файл: {error}",
         "session_not_found": "Сессия не найдена.",
         "topic_delete_fail": "Сессия удалена, но топик удалить не удалось: {error}",
@@ -152,7 +159,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_generic": "⚠️ Ошибка API — ответ может задержаться.",
         "api_retrying": "🔄 Ретраю API-ошибку (попытка {attempt}/{total}) — Клод на ней застрял, но не сдаётся.",
         "session_restart_loop": "🔁 Claude перезапустился ({count} раз с начала хода) — похоже, краш-луп. Можно /close_session и стартануть заново.",
-        "stop_fallback_prefix": "💬 (не отправлено моделью явно — перехвачено на завершении хода)",
         "sess_closed": "«{name}» остановлена.",
         "perm_request": "🔐 <b>Запрос разрешения</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
         "perm_allow": "✅ Разрешить",
@@ -215,7 +221,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• other <code>/commands</code> — typed into the Claude Code terminal\n\n"
             "While Claude works, a status bubble lives in the topic: tool calls,\n"
             "subagents, intermediate replies, and a ⏹ Stop button.\n"
-            "Claude can send files back (send_file_to_telegram tool).\n"
+            "Claude can send files back (send_file_to_user tool).\n"
             "Permission prompts arrive as ✅/❌ buttons (permission relay)."
         ),
         "only_main_chat": "This command works only in the main chat.",
@@ -234,6 +240,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "limit_reached": "Session limit reached ({limit}).",
         "creating": "🔄 Creating session…",
         "create_fail": "❌ {error}",
+        "bind_fail": "❌ Could not create the session surface in “{adapter}”: {error}. Session cancelled.",
+        "bind_none": "❌ Adapter “{adapter}” could not bind the session (no rights/surface). Session cancelled.",
         "created": "✅ “{name}” is ready. Write in the “{name}” topic.",
         "stalled": "⚠️ Claude has been silent and idle for a while — looks stuck. Log tail below. Try /clear or /close_session.",
         "list_empty": "📭 No active sessions.",
@@ -305,6 +313,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "bubble_working": "⏳ Working…",
         "bubble_stop": "⏹ Stop report",
+        "bubble_esc": "⛔ Interrupt",
+        "esc_requested": "Interrupting the turn (Esc)…",
+        "esc_done": "⛔ Turn interrupted (Esc into the terminal). Context kept — you can keep chatting.",
         "bubble_stop_requested": "⏹ Stop requested",
         "bubble_stopping": "⏹ Stopping…",
         "stop_requested": "Asked Claude to stop…",
@@ -312,7 +323,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stop_fail": "Could not reach the session.",
         "stop_message": (
             "[system] The user pressed Stop. Immediately stop the current work, "
-            "start nothing new, and call reply_to_telegram with complete=true "
+            "start nothing new, and call reply_to_user with complete=true "
             "and a short summary of what you managed to do."
         ),
         "subagent": "🤖 Subagent {agent}",
@@ -328,9 +339,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Anthropic URL: {url}"
         ),
         "url_default": "default (api.anthropic.com)",
+        "wallet_use": "{line}",
+        "wallet_denied": "denied (policy/confirmation)",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
-        "sendfile_denied": "⛔ Refused: the file is outside the session workspace ({path}). send_file_to_telegram is allowed only for project/session files — this prevents secret exfiltration.",
+        "sendfile_denied": "⛔ Refused: the file is outside the session workspace ({path}). send_file_to_user is allowed only for project/session files — this prevents secret exfiltration.",
         "sendfile_fail": "❌ Failed to send the file: {error}",
         "session_not_found": "Session not found.",
         "topic_delete_fail": "Session deleted, but the topic could not be removed: {error}",
@@ -340,7 +353,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_generic": "⚠️ API error — the reply may be delayed.",
         "api_retrying": "🔄 Retrying an API error (attempt {attempt}/{total}) — Claude is stuck on it but keeps trying.",
         "session_restart_loop": "🔁 Claude restarted ({count} times this turn) — looks like a crash loop. Try /close_session and start fresh.",
-        "stop_fallback_prefix": "💬 (not sent explicitly by the model — recovered at turn end)",
         "sess_closed": "“{name}” stopped.",
         "perm_request": "🔐 <b>Permission request</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
         "perm_allow": "✅ Allow",

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Установка tg-claude-orchestrator: venv, зависимости, systemd user-сервис.
+# Установка claude-orchestrator: venv, зависимости, systemd user-сервис.
 # Повторный запуск безопасен (идемпотентен). Удаление: ./install.sh --uninstall
+# Миграция: старый юнит tg-claude-orchestrator снимается автоматически.
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR=$(pwd)
-SERVICE=tg-claude-orchestrator
+SERVICE=claude-orchestrator
+OLD_SERVICE=tg-claude-orchestrator
 UNIT_DIR=$HOME/.config/systemd/user
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Удаляю systemd-сервис (репозиторий, .venv и .env не трогаю)"
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "$UNIT_DIR/$SERVICE.service"
+    systemctl --user disable --now "$OLD_SERVICE" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$SERVICE.service" "$UNIT_DIR/$OLD_SERVICE.service"
     systemctl --user daemon-reload
     echo "Готово."
     exit 0
@@ -31,6 +34,14 @@ if [ ! -f .env ]; then
     echo "==> Создан .env — заполни TELEGRAM_BOT_TOKEN и ALLOWED_USER_IDS"
 fi
 
+# Миграция со старого имени сервиса: гасим и убираем юнит, чтобы два
+# оркестратора не подрались за порт/сессии.
+if [ -f "$UNIT_DIR/$OLD_SERVICE.service" ]; then
+    echo "==> Миграция: снимаю старый сервис $OLD_SERVICE"
+    systemctl --user disable --now "$OLD_SERVICE" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$OLD_SERVICE.service"
+fi
+
 echo "==> systemd user-сервис"
 # PATH юнита: каталог с бинарём claude определяем по факту (npm-global,
 # ~/.local/bin, nvm — у всех по-разному), не хардкодим раскладку.
@@ -41,7 +52,7 @@ fi
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/$SERVICE.service" <<EOF
 [Unit]
-Description=tg-claude-orchestrator — Telegram wrapper for Claude Code
+Description=claude-orchestrator — Claude Code session orchestrator (Telegram/Web)
 After=network.target
 # Защита от рестарт-штопора: 5 падений за 5 минут — стоп до ручного
 # systemctl --user reset-failed (иначе цикл crash-restart молотит вечно).
@@ -71,7 +82,8 @@ fi
 cat <<EOF
 
 Готово. Дальше:
-  1. Отредактируй $DIR/.env (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TELEGRAM_CHAT_ID)
+  1. Отредактируй $DIR/.env (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TELEGRAM_CHAT_ID;
+     веб-интерфейс — ADAPTERS=telegram,web)
   2. Запусти:            systemctl --user enable --now $SERVICE
   3. Логи:               journalctl --user -u $SERVICE -f
   4. Перезапуск:         systemctl --user restart $SERVICE

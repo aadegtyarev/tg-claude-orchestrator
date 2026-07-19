@@ -1,8 +1,8 @@
-"""Регрессия логики inline-кнопок: парсинг callback_data, гварды доступа,
-роутинг в нужный метод менеджера. Без сети и Telegram.
+"""Регрессия логики inline-кнопок Telegram-адаптера: парсинг callback_data,
+гварды доступа, роутинг в нужный метод ядра. Без сети и Telegram.
 
 Ловит класс багов вроде «message_thread_id передан в message.answer()» —
-хендлеры прогоняются на фейках, проверяется, что нужный метод вызван и
+хендлеры прогоняются на фейках, проверяется, что нужный метод ядра вызван и
 чужой пользователь отклонён.
 
 Запуск: .venv/bin/python tests/callbacks_test.py
@@ -16,11 +16,15 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
-from orchestrator import bot as botmod  # noqa: E402
-from orchestrator.bot import TelegramBot  # noqa: E402
-from orchestrator.texts import get_texts  # noqa: E402
+from orchestrator.adapters.telegram import adapter as tgmod  # noqa: E402
+from orchestrator.adapters.telegram.adapter import TelegramAdapter  # noqa: E402
+from orchestrator.core.texts import get_texts  # noqa: E402
 
 calls: list = []
+
+SESSION = SimpleNamespace(
+    name="t", title="T", model=None, running=True, bindings={"telegram": "7"}
+)
 
 
 class FakeMsg:
@@ -33,56 +37,53 @@ class FakeMsg:
     async def edit_text(self, text, **kw):
         pass
 
+    async def edit_reply_markup(self, **kw):
+        pass
+
     async def _edit(self, text, **kw):
         pass
 
 
 class FakeMgr:
-    def get(self, tid):
-        if tid == 7:
-            return SimpleNamespace(thread_id=7, title="T", name="t", model=None, running=True)
-        return None
+    def get_by_binding(self, adapter, address):
+        return SESSION if (adapter, address) == ("telegram", "7") else None
 
-    async def set_model(self, s, m):
+
+class FakeCore:
+    def t(self, k, **kw):
+        return get_texts("ru")[k].format(**kw)
+
+    async def switch_model(self, s, m):
         calls.append(("set_model", m))
         return True
 
-    async def close(self, s):
+    async def close_session(self, s):
         calls.append(("close",))
 
-    async def send_permission(self, s, rid, beh):
+    async def permission_verdict(self, s, rid, beh, via):
         calls.append(("perm", rid, beh))
+        return True
 
-    async def send_to_claude(self, s, t, c):
+    async def soft_stop(self, s, origin):
         calls.append(("stop_sent",))
 
-    def read_stats(self, s):
-        return None
+    async def hard_stop(self, s):
+        calls.append(("esc_sent",))
+
+    def stats_text(self, s):
+        return "stats"
 
 
-class FakeBubbles:
-    async def close(self, tid):
-        pass
-
-    async def append(self, tid, line, **kw):
-        pass
-
-
-def make_bot():
-    botmod.Message = FakeMsg  # isinstance-гвард: FakeMsg считаем Message
-    b = TelegramBot.__new__(TelegramBot)
-    b._texts = get_texts("ru")
-    b.manager = FakeMgr()
-    b.chat_id = -100
-    b.config = SimpleNamespace(allowed_user_ids={1})
-    b.bubbles = FakeBubbles()
-    # TurnSupervisor не поднимаем: хендлерам нужны только stop/forget/start.
-    b.turns = SimpleNamespace(
-        stop=lambda tid: None, start=lambda tid: None, forget=lambda tid: None
-    )
-    b._switch_model = TelegramBot._switch_model.__get__(b)
-    b._stats_text = lambda s: "stats"
-    return b
+def make_adapter():
+    tgmod.Message = FakeMsg  # isinstance-гвард: FakeMsg считаем Message
+    a = TelegramAdapter.__new__(TelegramAdapter)
+    a.core = FakeCore()
+    a.t = a.core.t
+    a.manager = FakeMgr()
+    a.chat_id = -100
+    a.config = SimpleNamespace(allowed_user_ids={1})
+    a._perm_msgs = {}
+    return a
 
 
 def cb(data, uid=1, msg=None):
@@ -93,46 +94,57 @@ def cb(data, uid=1, msg=None):
 
 
 async def main():
-    b = make_bot()
+    a = make_adapter()
 
     calls.clear()
-    await b.on_model_button(cb("model:7:opus"))
+    await a.on_model_button(cb("model:7:opus"))
     assert ("set_model", "opus") in calls
     print("OK on_model_button allow")
 
     calls.clear()
-    await b.on_model_button(cb("model:7:opus", uid=999))  # чужой
+    await a.on_model_button(cb("model:7:opus", uid=999))  # чужой
     assert not calls
     print("OK on_model_button denies stranger")
 
     calls.clear()
-    await b.on_model_button(cb("model:xx:opus"))  # битый thread_id
+    await a.on_model_button(cb("model:xx:opus"))  # битый thread_id
     assert not any(c[0] == "set_model" for c in calls)
     print("OK on_model_button bad thread_id")
 
     calls.clear()
-    await b.on_session_button(cb("sess:close:7"))
+    await a.on_session_button(cb("sess:close:7"))
     assert ("close",) in calls
     print("OK on_session_button close")
 
     calls.clear()
-    await b.on_perm_button(cb("perm:7:abcde:allow"))
+    await a.on_perm_button(cb("perm:7:abcde:allow"))
     assert ("perm", "abcde", "allow") in calls
     print("OK on_perm_button allow")
 
     calls.clear()
-    await b.on_perm_button(cb("perm:7:ab:cd:deny"))  # request_id с ':'
+    await a.on_perm_button(cb("perm:7:ab:cd:deny"))  # request_id с ':'
     assert ("perm", "ab:cd", "deny") in calls
     print("OK on_perm_button request_id with colon (rsplit)")
 
     calls.clear()
-    await b.on_stop_button(cb("stop:7"))
+    await a.on_stop_button(cb("stop:7"))
     assert ("stop_sent",) in calls
     print("OK on_stop_button")
 
+    calls.clear()
+    await a.on_esc_button(cb("esc:7"))
+    assert ("esc_sent",) in calls
+    print("OK on_esc_button (жёсткое прерывание)")
+
+    calls.clear()
+    await a.on_esc_button(cb("esc:7", uid=999))  # чужой
+    assert not calls
+    print("OK on_esc_button denies stranger")
+
     # несуществующая сессия — все хендлеры не должны падать
-    for data, h in [("model:5:o", b.on_model_button), ("sess:close:5", b.on_session_button),
-                    ("perm:5:abcde:allow", b.on_perm_button), ("stop:5", b.on_stop_button)]:
+    for data, h in [("model:5:o", a.on_model_button), ("sess:close:5", a.on_session_button),
+                    ("perm:5:abcde:allow", a.on_perm_button), ("stop:5", a.on_stop_button),
+                    ("esc:5", a.on_esc_button)]:
         await h(cb(data))
     print("OK missing session handled")
 

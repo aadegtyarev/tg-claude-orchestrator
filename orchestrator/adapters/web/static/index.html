@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Orchestrator</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <h1>Claude Orchestrator</h1>
+      <button id="btn-new" class="btn primary">+ Новая сессия</button>
+    </div>
+    <ul id="session-list"></ul>
+    <div id="conn-status" class="conn offline">нет связи</div>
+  </aside>
+
+  <main id="main">
+    <div id="empty-hint">Выбери сессию слева или создай новую</div>
+
+    <div id="chat-area" hidden>
+      <header id="toolbar">
+        <div id="session-title"></div>
+        <div class="tools">
+          <button id="btn-stats" class="btn" title="Контекст и статистика">Stats</button>
+          <button id="btn-usage" class="btn" title="Расходы и лимиты">Usage</button>
+          <select id="model-select" class="btn" title="Модель сессии">
+            <option value="" disabled selected>Model</option>
+            <option value="fable">fable</option>
+            <option value="opus">opus</option>
+            <option value="sonnet">sonnet</option>
+            <option value="haiku">haiku</option>
+            <option value="__custom__">своя…</option>
+          </select>
+          <button id="btn-compact" class="btn" title="Сжать контекст (/compact)">Compact</button>
+          <button id="btn-clear" class="btn" title="Чистый контекст">Clear</button>
+          <button id="btn-bash" class="btn" title="Bash-терминал">Bash</button>
+          <button id="btn-close" class="btn warn" title="Остановить сессию">Close</button>
+          <button id="btn-delete" class="btn danger" title="Удалить сессию">Delete</button>
+        </div>
+      </header>
+
+      <div id="chat"></div>
+
+      <div id="bash-panel" hidden>
+        <div class="bash-row">
+          <input id="bash-cmd" type="text" placeholder="команда bash…" spellcheck="false">
+          <button id="bash-run" class="btn">Выполнить</button>
+        </div>
+        <div id="bash-out" class="bash-out">— нет вывода —</div>
+        <div class="bash-row">
+          <input id="bash-stdin" type="text" placeholder="ввод в терминал (y/n…)" spellcheck="false">
+          <button id="bash-send" class="btn">Досыл</button>
+        </div>
+      </div>
+
+      <div id="typing" hidden>Claude печатает…</div>
+
+      <div id="bubble" hidden>
+        <div id="bubble-body"></div>
+        <div id="bubble-buttons">
+          <button id="btn-stop" class="btn warn">⏹ Стоп</button>
+          <button id="btn-interrupt" class="btn danger">⛔ Прервать</button>
+        </div>
+      </div>
+
+      <div id="composer">
+        <button id="btn-attach" class="btn icon" title="Отправить файл">📎</button>
+        <input id="file-input" type="file" multiple hidden>
+        <textarea id="input" rows="1"
+          placeholder="Сообщение для Claude… (Enter — отправить, Shift+Enter — перенос)"></textarea>
+        <button id="btn-send" class="btn primary">➤</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<dialog id="new-dialog">
+  <form method="dialog" id="new-form">
+    <h2>Новая сессия</h2>
+    <label>Имя
+      <input id="new-title" type="text" required autocomplete="off" placeholder="например, backend">
+    </label>
+    <label>Путь к проекту (необязательно)
+      <input id="new-path" type="text" autocomplete="off" placeholder="/home/user/project">
+    </label>
+    <div class="dialog-buttons">
+      <button value="cancel" class="btn" formnovalidate>Отмена</button>
+      <button value="ok" class="btn primary">Создать</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="drop-hint" hidden>Отпусти файл, чтобы отправить в сессию</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

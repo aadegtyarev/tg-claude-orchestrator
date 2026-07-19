@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.logsignals import (  # noqa: E402
+from orchestrator.core.logsignals import (  # noqa: E402
     API_ERR_BANNER_RE as _API_ERR_BANNER_RE,
     classify_api_error as _classify_api_error,
     detect_log_signals as _detect_log_signals,
