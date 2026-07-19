@@ -84,7 +84,9 @@ def make_env(tmp: Path):
             session_home=lambda s: home,
         ),
         session_hooks=[],
-        bubbles=SimpleNamespace(append=_async_noop),
+        # has()=False → бабла нет (как фоновый вызов) → notice всегда шлётся,
+        # чтобы тест проверял путь уведомления/редакции.
+        bubbles=SimpleNamespace(append=_async_noop, has=lambda name: False),
         notice=notice,
         t=lambda k, **kw: kw.get("line", k),
         _record=lambda *a, **kw: None,

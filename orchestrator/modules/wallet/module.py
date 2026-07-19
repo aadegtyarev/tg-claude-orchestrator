@@ -459,16 +459,22 @@ class WalletModule:
         # из фонового шелла между ходами — поэтому пишем И в бабл (когда есть),
         # И служебным уведомлением через notice (доходит всегда, во все
         # адаптеры), И в журнал.
-        # Два формата одного и того же: бабл рендерит HTML напрямую, а notice
-        # идёт через md_to_html (markdown). Раньше один HTML-line шёл в оба —
-        # notice экранировал теги и показывал сырой «<code>…</code>».
+        # Наблюдаемость без спама. Во время активного хода вызов уже виден
+        # строкой в статус-бабле — отдельным top-level сообщением НЕ дублируем.
+        # notice шлём только когда бабла нет (фоновый вызов между ходами) или это
+        # ОТКАЗ (нужно внимание). Форматы разные: бабл рендерит HTML напрямую, а
+        # notice идёт через md_to_html (markdown) — раньше один HTML-line шёл в
+        # оба, и notice показывал сырой «<code>…</code>».
         cmd_disp = f"{name} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
         await self.core.bubbles.append(session.name, bubble_line)
-        notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # code-спан md
-        verdict = "" if allowed else " — " + self.core.t("wallet_denied")
-        await self.core.notice(session, self.core.t("wallet_use", line=notice_md) + verdict)
         self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
+        if not allowed or not self.core.bubbles.has(session.name):
+            notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # code-спан md
+            verdict = "" if allowed else " — " + self.core.t("wallet_denied")
+            await self.core.notice(
+                session, self.core.t("wallet_use", line=notice_md) + verdict
+            )
         if not allowed:
             # Прозрачность: reason объясняет модели ЧТО не так и КАК правильно —
             # это доходит до её терминала (bin/wallet печатает reason), а не
