@@ -713,7 +713,14 @@ class TelegramAdapter:
         if not await self._ensure_running(session, message):
             return
         status = await message.reply(self.t("usage_collecting"))
-        text = await self.core.usage_text(session)
+        try:
+            text = await self.core.usage_text(session)
+        except UserError as e:
+            # usage_text бросает UserError (напр. PTY умер между ensure_running и
+            # /cost) — веб-адаптер её ловит, телеграмный раньше нет: «⏳ собираю…»
+            # висело вечно.
+            await status.edit_text(str(e))
+            return
         await status.edit_text(text if text else self.t("usage_failed"))
 
     async def cmd_model(self, message: Message, command: CommandObject) -> None:

@@ -326,7 +326,7 @@ class OrchestratorCore:
 
     async def close_session(self, session: Session) -> None:
         self.turns.stop(session.name)
-        self._drop_pending_perms(session)
+        await self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         await self.manager.close(session)
@@ -334,7 +334,7 @@ class OrchestratorCore:
 
     async def delete_session(self, session: Session) -> None:
         self.turns.forget(session.name)
-        self._drop_pending_perms(session)
+        await self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         bindings = dict(session.bindings)
@@ -355,7 +355,7 @@ class OrchestratorCore:
         # иначе после /clear «печатает…» крутится вечно на уже пустой сессии,
         # а error-relay тайлит лог нового процесса (как close/switch_model).
         self.turns.stop(session.name)
-        self._drop_pending_perms(session)
+        await self._drop_pending_perms(session)
         await self.bubbles.close(session.name)
         try:
             await self.manager.clear(session)
@@ -367,7 +367,7 @@ class OrchestratorCore:
     async def switch_model(self, session: Session, model: str) -> bool:
         """Сменить модель; вернуть resumed (контекст продолжен?)."""
         self.turns.stop(session.name)
-        self._drop_pending_perms(session)
+        await self._drop_pending_perms(session)
         await self.bubbles.close(session.name)
         try:
             return await self.manager.set_model(session, model)
@@ -445,7 +445,7 @@ class OrchestratorCore:
             return None
         if self._last_tool.get(name) == "TaskOutput":
             return "kick"
-        if self.manager.is_busy(session):
+        if self.manager.has_children(session):  # НЕ is_busy — не сбивать вотчдог
             return "background"
         return None
 
@@ -491,7 +491,11 @@ class OrchestratorCore:
         self.manager.touch(session)  # ответ/файл = активность (таймер простоя)
 
         if data.get("file_path"):
-            self.turns.stop(session.name)
+            # Файл — ПРОМЕЖУТОЧНОЕ действие (send_file_to_user), ход продолжается
+            # (см. handle_tool_event: файл не считается «текстовым» ответом).
+            # НЕ глушим сторожей хода (typing/watchdog/error-relay) — иначе модель
+            # шлёт файл в середине длинного хода и зависание после этого не
+            # заметят. Ход завершат reply(complete=true) или Stop-хук.
             await self._send_file(
                 session, str(data["file_path"]), str(data.get("caption", "")), origin
             )
@@ -808,22 +812,30 @@ class OrchestratorCore:
             return True
         if key not in self._pending_perms:
             return False
+        # Claim ДО await: иначе второй клик (другой адаптер / дабл-клик), пришедший
+        # во время send_permission, пройдёт membership-check и отправит ВТОРОЙ
+        # вердикт (allow и deny наперегонки). Discard сейчас — гарантия «первый
+        # ответ побеждает»; при ошибке отправки возвращаем ключ для повтора.
+        self._pending_perms.discard(key)
         try:
             await self.manager.send_permission(session, request_id, behavior)
         except Exception as e:
+            self._pending_perms.add(key)
             logger.error("Сессия %s: не удалось передать вердикт: %s", session.name, e)
             raise UserError(self.t("perm_fail", error=e)) from e
-        self._pending_perms.discard(key)
         await self._broadcast_perm_resolved(session, request_id, behavior, via)
         return True
 
-    def _drop_pending_perms(self, session: Session) -> None:
-        """Снять все ожидающие запросы разрешений сессии (close/clear/delete):
+    async def _drop_pending_perms(self, session: Session) -> None:
+        """Снять все ожидающие запросы разрешений сессии (close/clear/delete/idle):
         иначе _pending_perms растёт вечно, а старая кнопка после resume била бы
-        по чужому (новому) процессу с несуществующим request_id."""
+        по чужому (новому) процессу с несуществующим request_id. Плюс ГАСИМ кнопки
+        в адаптерах (broadcast resolved) — иначе ✅/❌ висят навсегда, а
+        _perm_msgs в Telegram течёт."""
         stale = [k for k in self._pending_perms if k[0] == session.name]
         for k in stale:
             self._pending_perms.discard(k)
+            await self._broadcast_perm_resolved(session, k[1], "deny", "cancelled")
         for k, fut in list(self._local_perms.items()):
             if k[0] == session.name and not fut.done():
                 fut.set_result(False)  # разбудить ожидающего request_confirmation
@@ -1143,7 +1155,7 @@ class OrchestratorCore:
     async def notify_session_dead(self, session: Session, code: int | str) -> None:
         """Колбэк SessionManager: Claude умер сам по себе."""
         self.turns.stop(session.name)
-        self._drop_pending_perms(session)
+        await self._drop_pending_perms(session)
         await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
         text = self.t("session_died", name=session.title, code=code)
@@ -1156,6 +1168,8 @@ class OrchestratorCore:
         """Колбэк sweeper: сессии остановлены по простою."""
         for session in sessions:
             self.turns.stop(session.name)
+            await self._drop_pending_perms(session)  # как в close/clear/dead — иначе
+            self._last_tool.pop(session.name, None)  # висящая ✅/❌ ударит по resume
             await asyncio.to_thread(self.bash.close_for_session, session.name)
             await self.bubbles.close(session.name)
             await self.notice(

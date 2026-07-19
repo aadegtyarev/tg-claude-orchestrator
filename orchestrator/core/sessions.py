@@ -896,6 +896,20 @@ class SessionManager:
         grew = prev is not None and cpu > prev
         return grew or has_kids
 
+    def has_children(self, session: Session) -> bool:
+        """Есть ли живые дочерние процессы (идёт тул) — для кнопки ⏭. В отличие
+        от is_busy НЕ трогает CPU-baseline: is_busy обязан вызываться только из
+        _watchdog_loop (хранит прошлый отсчёт), а кнопка дёргается из каждого
+        _flush бабла (~1.5с) и сбивала бы 15-секундную CPU-дельту вотчдога."""
+        pid = session.process.pid if session.running and session.process else None
+        if pid is None:
+            return False
+        try:
+            _cpu, has_kids = proc_tree_signals(pid)
+        except Exception:
+            return True  # /proc недоступен — перестраховочно «есть работа»
+        return has_kids
+
     async def run_and_capture(self, session: Session, cmd: str, wait: float = 6.0) -> str:
         """Ввести слэш-команду в PTY и вернуть новый вывод claude.log без ANSI.
 

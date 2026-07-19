@@ -126,12 +126,13 @@ async def test_pending_perms_cleanup():
     core.adapters = {"tg": FakeTr()}
     await core.handle_permission_request("noos", {"request_id": "r1", "tool": "Bash"})
     assert ("noos", "r1") in core._pending_perms
-    # close чистит — старая кнопка потом не пройдёт гейт.
-    core._drop_pending_perms(SESSION)
+    # close чистит — старая кнопка потом не пройдёт гейт + гасится в адаптере.
+    await core._drop_pending_perms(SESSION)
     assert ("noos", "r1") not in core._pending_perms
+    assert ("r1", "deny", "cancelled") in resolved  # кнопка погашена
     handled = await core.permission_verdict(SESSION, "r1", "allow", via="tg")
     assert handled is False and core.manager.perm_calls == []
-    print("OK _pending_perms чистится: снятая кнопка не бьёт по мёртвому запросу")
+    print("OK _pending_perms чистится: кнопка гасится и не бьёт по мёртвому запросу")
 
 
 async def test_confirmation_timeout_clears_buttons():
