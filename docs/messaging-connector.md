@@ -36,7 +36,7 @@ Transport») выполнен: ядро и транспорты разделен
 | «печатает…» | chat action | typing notification |
 | Белый список | user id | MXID |
 
-Неудобство Matrix — отсутствие inline-кнопок: permission relay и «⏹/⛔»
+Неудобство Matrix — отсутствие inline-кнопок: permission relay и «📋/⛔»
 придётся эмулировать реакциями (✅/❌) или текстовыми ответами; протокол ядра
 этого не запрещает — `permission_prompt` волен рисовать что угодно, вердикт
 возвращается через `core.permission_verdict`.

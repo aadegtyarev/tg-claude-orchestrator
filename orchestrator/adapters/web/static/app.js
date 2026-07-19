@@ -291,6 +291,10 @@ let backoff = 1000;
 function wsConnect() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   let url = proto + "//" + location.host + "/api/ws";
+  // WS-хендшейк несёт HttpOnly-cookie (первичная авторизация, как у REST через
+  // Bearer-заголовок). ?token= — фолбэк, если cookie ещё не проставлен (зашли
+  // без /?token=). Токен в URL виден локальному access-логу aiohttp — на
+  // localhost под моделью угроз оператора это принято (не отправляем наружу).
   if (TOKEN) url += "?token=" + encodeURIComponent(TOKEN);
   ws = new WebSocket(url);
 

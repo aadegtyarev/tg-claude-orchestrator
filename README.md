@@ -141,7 +141,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | `DELETE_BUBBLE` | `true` | Удалять бабл после ответа (`false` — журнал) |
 | `SHOW_COMMAND_MENU` | `true` | Меню «/» в Telegram |
 | `INCOMING_DIR` | `incoming` | Куда класть присланные файлы |
-| `PERMISSION_MODE` | `auto` | `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan` |
+| `PERMISSION_MODE` | `auto` | `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan`/`default` |
 | `SANDBOX` | `bwrap` | `bwrap` / `agent-vm` (эксперимент) / `off` |
 | `SANDBOX_EXTRA_RW` | — | Доп. RW-пути из песочницы (через `:`) |
 | `SANDBOX_DBUS` | `true` | Проброс **всего** system D-Bus в песочницу (для mDNS/`.local`/avahi-browse); `off` — запретить |
