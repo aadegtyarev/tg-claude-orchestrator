@@ -33,23 +33,28 @@ Claude Code в изолированных виртуальных машинах 
 
 ## Как это ложится на оркестратор
 
-Точка входа готова — **раннер-шов** (`orchestrator/runner.py`): и `claude`,
-и `/bash` запускаются через `Runner.wrap(argv, chdir, extra_rw)`. Третий
-раннер встаёт рядом с bwrap:
+Точка входа готова — **раннер-шов** (пакет `orchestrator/runners/`): и `claude`,
+и `/bash` запускаются через `Runner.wrap(argv, *, chdir, extra_rw, home_dir,
+publish_ports)`. Раннер объявляет `supports_prefix` (можно ли изолировать
+отдельный `/bash`); у agent-vm он `False` — `/bash` в VM отдельно от claude не
+поднять (одна VM на cwd), ядро отдаёт понятный отказ. Реализация —
+`runners/agentvm.py`; ниже упрощённый эскиз (актуальную сборку argv см. в коде):
 
 ```python
 class AgentVmRunner:
     name = "agent-vm"
-    def wrap(self, argv, *, chdir, extra_rw):
-        # argv = ["claude", "--session-id=…", …] → agent-vm сам знает "claude"
-        return [
-            "agent-vm", argv[0],
-            "--allow-host",                      # хуки/канал → оркестратор на хосте
-            "--publish", f"{port}:{port}",       # /notify /ping канала — с хоста в гостя
-            "--mount", f"{repo}:{repo}",         # channel_server.py + .venv (RO нет — просить upstream)
-            *(f"--mount={p}" for p in extra_rw), # папка сессии (cwd монтируется сам)
-            "--", *argv[1:],
-        ]
+    unique_cwd = True          # имя VM = hash(cwd) → вторая сессия убьёт первую
+    supports_prefix = False    # отдельный /bash в VM не изолировать
+    def wrap(self, argv, *, chdir, extra_rw, home_dir=None, publish_ports=()):
+        if not argv:           # префикс-режим (/bash) — в VM не заворачиваем
+            return []
+        cmd, *rest = argv      # agent-vm сам знает "claude"
+        out = ["agent-vm", Path(cmd).name, "--allow-host"]
+        for port in publish_ports:
+            out += ["--publish", f"{port}:{port}"]   # /notify /ping канала
+        for m in {chdir, *extra_rw}:
+            out += ["--mount", f"{m}:{m}"]           # channel_server.py + пути сессии
+        return out + ["--", *rest]
 ```
 
 Выбор — тем же конфигом: `SANDBOX=agent-vm` (валидация в
@@ -85,8 +90,8 @@ class AgentVmRunner:
    монтировать свой каталог под транскрипты или читать их через
    `agent-vm shell`-вызов.
 4. **Одна VM на cwd.** Две сессии на одну и ту же `linked_path` невозможны
-   (вторая убьёт VM первой). Нужен гвард в `SessionManager.create`
-   (отказ с понятным текстом) — при bwrap такой проблемы нет.
+   (вторая убьёт VM первой). Гвард уже есть — `_guard_unique_cwd` (вызывается
+   в `create`/resume/clear, отказ с понятным текстом); при bwrap проблемы нет.
 5. **Login/креды.** agent-vm сам берёт `~/.claude/.credentials.json` хоста и
    работает через свой прокси — `CLAUDE_CONFIG_DIR` из нашего `.env` теряет
    смысл внутри VM; `CLAUDE_ENV_*` надо пробрасывать через env гостя

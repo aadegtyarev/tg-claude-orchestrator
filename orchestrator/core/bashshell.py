@@ -9,7 +9,8 @@
 Права и cwd — как у процесса бота (мимо Claude Code, без permission relay), но
 при SANDBOX=bwrap оболочка запускается в той же файловой песочнице, что и
 claude: видит только папку сессии/проекта и конфиг Claude Code, не остальную ФС
-(обёртка передаётся параметром wrapper из bot.py, см. sandbox.py).
+(обёртка-префикс приходит параметром wrapper из ядра — core/app.py собирает её
+через manager.sandbox_prefix, см. runners/sandbox.py).
 """
 
 from __future__ import annotations
