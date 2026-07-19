@@ -23,3 +23,17 @@ jobs:
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: ruff check .
       - run: python -m pytest
+
+  # Скан секретов: gitleaks в режиме detect сканит и содержимое файлов, и
+  # СООБЩЕНИЯ коммитов (ровно класс утечки, если секрет подставится в
+  # commit message). Плейсхолдеры в доках (ghp_xxx и т.п.) заглушены в
+  # .gitleaks.toml, чтобы не было ложных срабатываний.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # вся история — иначе scan видит только один коммит
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ""  # для публичного репо лицензия не требуется
