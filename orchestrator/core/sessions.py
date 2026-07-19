@@ -473,10 +473,6 @@ class SessionManager:
         hooks: dict = {"Stop": [{"hooks": [hook_cmd]}]}  # Stop не поддерживает matcher
         if self.config.show_tool_calls:
             hooks["PreToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
-            # PostToolUse (завершение тула + exit-код) и SubagentStop (сабагент
-            # завершился) — тот же диспетчер; ядро роутит по hook_event_name.
-            hooks["PostToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
-            hooks["SubagentStop"] = [{"matcher": "", "hooks": [hook_cmd]}]
         settings["hooks"] = hooks
         (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
 
