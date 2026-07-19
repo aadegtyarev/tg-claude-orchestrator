@@ -19,6 +19,12 @@
 
 * { box-sizing: border-box; }
 
+/* Атрибут hidden должен побеждать любые id-селекторы с display (#chat-area,
+   #bash-panel, #drop-hint заданы через display:flex — без этого правила
+   element.hidden=true в JS не скрывал бы их, и тулбар/drop-hint/bash висели
+   бы поверх пустого экрана). */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;

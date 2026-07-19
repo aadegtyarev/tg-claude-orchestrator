@@ -142,6 +142,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | `PERMISSION_MODE` | `auto` | `auto`/`bypass`/`acceptEdits`/`manual`/`dontAsk`/`plan` |
 | `SANDBOX` | `bwrap` | `bwrap` / `agent-vm` (эксперимент) / `off` |
 | `SANDBOX_EXTRA_RW` | — | Доп. RW-пути из песочницы (через `:`) |
+| `SANDBOX_DBUS` | `true` | Проброс **всего** system D-Bus в песочницу (для mDNS/`.local`/avahi-browse); `off` — запретить |
 | `AGENT_VM_MEMORY_GIB`/`_CPUS`/`_IMAGE` | — | Ресурсы/пин образа microVM |
 | `BOT_LANG` | `ru` | Язык сообщений: `ru` / `en` |
 | `IDLE_TIMEOUT_H` | 6 | Авто-останов после N ч простоя (0 — выкл.) |
@@ -185,8 +186,20 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 
 Всё остальное — другие проекты, `~/.ssh`, `~/.aws`, реальный `$HOME` — не
 видно ни на чтение, ни на запись. В отличие от нативного `/sandbox` Claude
-Code (только Bash-тул), обёртка накрывает все инструменты разом. Сеть общая
-с хостом (нужна для API и localhost-ядра).
+Code (только Bash-тул), обёртка накрывает все инструменты разом.
+
+⚠️ **`$HOME` изолирован.** Раз реальный дом скрыт, глобальный `~/.venv` и
+инструменты из твоего дома агенту не видны. Держи окружение **в проекте**
+(`python -m venv .venv` в папке проекта — она RW и переживает рестарты); venv
+в `~` сессии тоже переживёт рестарты (дом персистентный), но проект чище.
+
+**Сеть** общая с хостом (нужна для API и localhost-ядра). DNS работает и под
+песочницей (цель симлинка `resolv.conf` проброшена). mDNS/локальная сеть
+(`.local`-хосты, `avahi-browse`, DNS-SD) доступны при `SANDBOX_DBUS=true`
+(по умолчанию) — для этого в песочницу проброшен **весь** system D-Bus (не
+только Avahi: systemd/logind/NetworkManager тоже, read-методы работают,
+мутации под polkit). `SANDBOX_DBUS=off` запрещает его (базовый `.local`-резолв
+хоста остаётся — он идёт multicast'ом без D-Bus).
 
 `SANDBOX=agent-vm` — сессии в microVM через
 [wirenboard/agent-vm](https://github.com/wirenboard/agent-vm): жёсткая

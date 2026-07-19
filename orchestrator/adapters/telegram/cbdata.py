@@ -34,6 +34,17 @@ def parse_esc(data: str) -> int | None:
         return None
 
 
+def bg_cb(thread_id: int) -> str:
+    return f"bg:{thread_id}"
+
+
+def parse_bg(data: str) -> int | None:
+    try:
+        return int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def model_cb(thread_id: int, alias: str) -> str:
     return f"model:{thread_id}:{alias}"
 
