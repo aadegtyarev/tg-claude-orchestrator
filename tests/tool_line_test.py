@@ -137,5 +137,8 @@ def main():
     print("ALL TOOL_LINE OK")
 
 
+def test_tool_line():
+    main()
+
 if __name__ == "__main__":
     main()

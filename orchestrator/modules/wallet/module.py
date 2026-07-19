@@ -233,9 +233,12 @@ class WalletModule:
         перебор без раннего выхода — тайминг не выдаёт «почти угадал»."""
         header = request.headers.get("Authorization", "")
         token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
+        # На байтах: compare_digest на str с не-ASCII бросает TypeError (был бы
+        # 500 вместо 401). Перебор без раннего выхода — тайминг не выдаёт «почти».
+        token_b = token.encode("utf-8", "replace")
         found: str | None = None
         for known, sname in self._tokens.items():
-            if secrets.compare_digest(known, token):
+            if secrets.compare_digest(known.encode("utf-8"), token_b):
                 found = sname
         if not token or found is None:
             return None

@@ -47,9 +47,17 @@ def test_config():
 
 
 async def test_channel_server():
+    await _run_channel_server()
+
+
+async def _run_channel_server():
     port = free_port()
+    # ORCH_TOKEN явно убираем: под pytest (один процесс) load_dotenv из
+    # соседнего теста мог протащить реальный .env-токен в os.environ, и тогда
+    # channel_server встал бы в auth-режим, а тест контракта шлёт без токена.
     env = {**os.environ, "CHANNEL_PORT": str(port), "SESSION_NAME": "smoke",
            "ORCH_HOST": "127.0.0.1", "ORCH_PORT": str(free_port())}
+    env.pop("ORCH_TOKEN", None)
     proc = await asyncio.create_subprocess_exec(
         sys.executable, str(ROOT / "orchestrator" / "channel_server.py"),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -62,49 +70,56 @@ async def test_channel_server():
     async def recv():
         return json.loads(await asyncio.wait_for(proc.stdout.readline(), 10))
 
-    await send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    r = await recv()
-    caps = r["result"]["capabilities"]
-    assert caps["experimental"]["claude/channel"] == {}
-    assert caps["experimental"]["claude/channel/permission"] == {}
-    assert caps["tools"] == {} and r["result"]["instructions"]
-    # Регресс: инструкция явно предупреждает, что голый текст невидим —
-    # источник «потерянных финалов» (см. REVIEW.md, tests/stop_fallback_test.py).
-    assert "INVISIBLE" in r["result"]["instructions"]
-    await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    try:
+        await send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        r = await recv()
+        caps = r["result"]["capabilities"]
+        assert caps["experimental"]["claude/channel"] == {}
+        assert caps["experimental"]["claude/channel/permission"] == {}
+        assert caps["tools"] == {} and r["result"]["instructions"]
+        # Регресс: инструкция явно предупреждает, что голый текст невидим —
+        # источник «потерянных финалов» (см. tests/stop_fallback_test.py).
+        assert "INVISIBLE" in r["result"]["instructions"]
+        await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    # битая строка не роняет цикл
-    proc.stdin.write(b"{broken json\n")
-    await proc.stdin.drain()
+        # битая строка не роняет цикл
+        proc.stdin.write(b"{broken json\n")
+        await proc.stdin.drain()
 
-    await send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    tools = [t["name"] for t in (await recv())["result"]["tools"]]
-    assert tools == ["reply_to_user", "send_file_to_user"], tools
+        await send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        tools = [t["name"] for t in (await recv())["result"]["tools"]]
+        assert tools == ["reply_to_user", "send_file_to_user"], tools
 
-    import aiohttp
-    await asyncio.sleep(0.3)
-    async with aiohttp.ClientSession() as http:
-        async with http.get(f"http://127.0.0.1:{port}/ping") as resp:
-            assert resp.status == 200
-        async with http.post(f"http://127.0.0.1:{port}/notify",
-                             json={"content": "тест", "context_id": "telegram:smoke:1:2:3"}) as resp:
-            assert resp.status == 200
-    push = await recv()
-    assert push["params"] == {"content": "тест", "meta": {"context_id": "telegram:smoke:1:2:3"}}
+        import aiohttp
+        await asyncio.sleep(0.3)
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"http://127.0.0.1:{port}/ping") as resp:
+                assert resp.status == 200
+            async with http.post(f"http://127.0.0.1:{port}/notify",
+                                 json={"content": "тест", "context_id": "telegram:smoke:1:2:3"}) as resp:
+                assert resp.status == 200
+        push = await recv()
+        assert push["params"] == {"content": "тест", "meta": {"context_id": "telegram:smoke:1:2:3"}}
 
-    # вердикт разрешения
-    async with aiohttp.ClientSession() as http:
-        async with http.post(f"http://127.0.0.1:{port}/permission",
-                             json={"request_id": "ABCDE", "behavior": "allow"}) as resp:
-            assert resp.status == 200
-    verdict = await recv()
-    assert verdict["method"] == "notifications/claude/channel/permission"
-    assert verdict["params"] == {"request_id": "abcde", "behavior": "allow"}
+        # вердикт разрешения
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f"http://127.0.0.1:{port}/permission",
+                                 json={"request_id": "ABCDE", "behavior": "allow"}) as resp:
+                assert resp.status == 200
+        verdict = await recv()
+        assert verdict["method"] == "notifications/claude/channel/permission"
+        assert verdict["params"] == {"request_id": "abcde", "behavior": "allow"}
 
-    proc.stdin.close()
-    await asyncio.wait_for(proc.wait(), 10)
-    assert proc.returncode == 0
-    print("OK channel_server (handshake, tools, push, permission)")
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 10)
+        assert proc.returncode == 0
+        print("OK channel_server (handshake, tools, push, permission)")
+    finally:
+        # Гарантированно прибираем subprocess: иначе под pytest (один процесс)
+        # он висит дочерним и ломает watchdog_test (has_kids=True).
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
 
 
 if __name__ == "__main__":
