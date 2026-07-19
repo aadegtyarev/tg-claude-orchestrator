@@ -177,6 +177,24 @@ async def main():
     assert not bm.has("s9")
     print("OK close() разом убирает все замороженные сообщения цикла + текущее")
 
+    # ── живой пульс: спиннер-глагол внизу бабла, обновляется ──
+    bm.open("s7")
+    await bm.set_pulse("s7", "Cogitating")  # бабл создаётся из одного пульса
+    await _settle(bm, "s7")
+    text = bm._render_text(bm._bubbles["s7"])
+    assert "✻ Cogitating" in text, text
+    # смена глагола обновляет строку (не копит)
+    await bm.set_pulse("s7", "Quantumizing")
+    await _settle(bm, "s7")
+    text2 = bm._render_text(bm._bubbles["s7"])
+    assert "✻ Quantumizing" in text2 and "Cogitating" not in text2, text2
+    # тот же глагол повторно — без изменения (нет лишней правки)
+    prev = bm._bubbles["s7"].sent_text
+    await bm.set_pulse("s7", "Quantumizing")
+    assert bm._bubbles["s7"].sent_text == prev
+    await bm.close("s7")
+    print("OK пульс: глагол внизу бабла, обновляется на месте, дубль не копит")
+
     print("ALL BUBBLE OK")
 
 

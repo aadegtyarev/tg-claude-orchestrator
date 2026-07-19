@@ -79,11 +79,14 @@ class TurnSupervisor:
         t: Callable[..., str],
         send: Callable[["Session", str], Awaitable[None]],
         typing: Callable[["Session"], Awaitable[bool]],
+        pulse: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self.manager = manager
         self.t = t
         self._send = send
         self._typing_action = typing
+        # Колбэк живого пульса (спиннер-глагол → бабл). None = не показывать.
+        self._pulse = pulse or (lambda name, verb: asyncio.sleep(0))
         # session.name -> задача, шлющая «печатает…» пока Claude обрабатывает запрос.
         self._typing: dict[str, asyncio.Task] = {}
         # имя сессии -> сторож зависаний (стартует/гаснет вместе с typing).
@@ -232,6 +235,7 @@ class TurnSupervisor:
         last_retry_at = -RETRY_SURFACE_INTERVAL
         restart_count = 0
         last_restart_at = -ERROR_RELAY_COOLDOWN
+        last_quota_at = -ERROR_RELAY_REPEAT
         loop_time = asyncio.get_running_loop().time
 
         async def _surf(text: str) -> None:
@@ -252,6 +256,26 @@ class TurnSupervisor:
             chunk = strip_ansi(delta)
             sig = detect_log_signals(chunk)
             now = loop_time()
+
+            # 0. Живой пульс: спиннер-глагол Claude Code (Cogitating…) → бабл.
+            #    Признак «модель жива», когда tool-событий нет (думает/ждёт API).
+            if sig["pulse"]:
+                try:
+                    await self._pulse(name, sig["pulse"])
+                except Exception as e:
+                    logger.debug("pulse: %s", e)
+
+            # 0б. Лимит-баннер (Weekly/Monthly exhausted, серверный throttle без
+            #     3-значного кода) — частая причина «часами молчит и не едет»:
+            #     модель ретраит недельный лимит по кругу. Показываем причину и
+            #     дату сброса; редко (раз в REPEAT), чтобы не спамить в цикле.
+            if sig["quota"] is not None and now - last_quota_at >= ERROR_RELAY_REPEAT:
+                last_quota_at = now
+                reset = sig["quota"]
+                await _surf(
+                    self.t("api_error_quota", reset=reset) if reset
+                    else self.t("api_error_quota_noreset")
+                )
 
             # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
             if sig["api_error"]:
