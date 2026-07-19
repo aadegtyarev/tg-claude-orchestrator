@@ -62,9 +62,10 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory=$DIR
-# Гарантия одного инстанса: перед стартом добить сбежавший из cgroup
-# «-m orchestrator» (осиротевший инстанс дублирует Telegram/уведомления — спам).
-ExecStartPre=/bin/sh -c 'pkill -TERM -f "python -m orchestrator"; sleep 1; exit 0'
+# Гарантия одного инстанса: перед стартом добить сбежавший из cgroup инстанс.
+# Паттерн через [.]venv — регэксп-трюк, чтобы pkill НЕ сматчил собственную
+# командную строку (иначе убивает свой control-process → старт падает).
+ExecStartPre=/bin/sh -c 'pkill -TERM -f "[.]venv/bin/python -m orchestrator" || true; sleep 1'
 ExecStart=$DIR/.venv/bin/python -m orchestrator
 Restart=on-failure
 RestartSec=5
