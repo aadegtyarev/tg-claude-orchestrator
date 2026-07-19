@@ -56,6 +56,12 @@ def make_env(tmp: Path):
         'sessions = ["*"]\n'
         'commands = ["sh -c *"]\n'
         'confirm = true\n'
+        '\n'
+        '[secrets.hostgh]\n'                # host-passthrough: без value/env
+        'description = "gh на хосте (keyring)"\n'
+        'sessions = ["dev"]\n'
+        'commands = ["sh -c *"]\n'
+        'confirm = false\n'
     )
     os.chmod(secrets_file, 0o600)
 
@@ -120,7 +126,7 @@ async def main():
                 assert r.status == 200
                 listed = await r.json()
             names = {s["name"] for s in listed}
-            assert names == {"deploy", "careful"}, names
+            assert names == {"deploy", "careful", "hostgh"}, names
             assert "S3CR3T" not in json.dumps(listed)
             print("OK /secrets: policy по сессии, значений нет")
 
@@ -176,6 +182,19 @@ async def main():
                 assert await r.json() == []
             os.chmod(secrets_file, 0o600)
             print("OK права 0644 → секреты отключены целиком")
+
+            # host-passthrough (без value/env): команда на хосте с ХОСТОВЫМ
+            # окружением, секрет в env НЕ инжектится. Проверяем: доступен, и в
+            # env нет инъекции (GITHUB_TOKEN/CAREFUL не появились от wallet).
+            async with http.get(f"{url}/secrets", headers=good) as r:
+                names = {s["name"] for s in await r.json()}
+            assert "hostgh" in names, names
+            async with http.post(f"{url}/run", headers=good,
+                                 json={"secret": "hostgh",
+                                       "cmd": ["sh", "-c", "echo hg=[$GITHUB_TOKEN][$CAREFUL]"]}) as r:
+                data = await r.json()
+            assert data["code"] == 0 and "hg=[][]" in data["stdout"], data
+            print("OK host-passthrough: команда на хосте без инъекции секрета в env")
 
         # редакция: вложенные значения, длинные первыми
         out = _redact(b"a=S3CR3T-DEPLOY b=S3CR3T-OTHER", ["S3CR3T-DEPLOY", "S3CR3T-OTHER"])

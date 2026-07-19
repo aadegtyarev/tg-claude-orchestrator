@@ -48,15 +48,29 @@ REDACTED = "•••"
 
 @dataclass(frozen=True)
 class Secret:
-    """Один секрет из secrets.toml вместе со своей policy."""
+    """Один секрет/доступ из secrets.toml вместе со своей policy.
+
+    Два вида:
+      * inject — value+env: команда получает секрет в env-переменной (env=…,
+        value=…). Классический кошелёк.
+      * host-passthrough — БЕЗ value/env: команда просто исполняется на ХОСТЕ
+        с хостовым окружением (keyring, gh/git auth). Для инструментов, уже
+        авторизованных на хосте (gh, git), чьи токены лежат в keyring/файле
+        вне песочницы — модель их не видит, а команда работает. Ничего в env
+        не инжектим.
+    """
 
     name: str
-    value: str
-    env: str  # имя env-переменной, в которой секрет получит команда
+    value: str  # "" для host-passthrough
+    env: str    # "" для host-passthrough
     description: str
     sessions: tuple[str, ...]  # fnmatch-шаблоны имён сессий; пусто = никому
     commands: tuple[str, ...]  # fnmatch-шаблоны строки команды; пусто = ничего
     confirm: bool  # спрашивать ли подтверждение кнопками перед запуском
+
+    @property
+    def host_passthrough(self) -> bool:
+        return not (self.value and self.env)
 
     def session_allowed(self, session_name: str) -> bool:
         return any(fnmatch.fnmatch(session_name, pat) for pat in self.sessions)
@@ -102,13 +116,21 @@ class SecretStore:
             logger.error("wallet: не удалось прочитать %s: %s", self._path, e)
             return {}
         for name, raw in (data.get("secrets") or {}).items():
-            if not isinstance(raw, dict) or "value" not in raw or "env" not in raw:
-                logger.error("wallet: секрет %r без value/env — пропущен", name)
+            if not isinstance(raw, dict):
+                logger.error("wallet: запись %r — не таблица, пропущена", name)
+                continue
+            has_value, has_env = "value" in raw, "env" in raw
+            # inject-секрет требует ОБА поля; host-passthrough — НИ ОДНОГО.
+            # Одно без другого — ошибка конфига (пропускаем).
+            if has_value != has_env:
+                logger.error(
+                    "wallet: секрет %r — value и env задаются только вместе "
+                    "(inject) либо оба отсутствуют (host-passthrough)", name)
                 continue
             self._secrets[name] = Secret(
                 name=str(name),
-                value=str(raw["value"]),
-                env=str(raw["env"]),
+                value=str(raw.get("value", "")),
+                env=str(raw.get("env", "")),
                 description=str(raw.get("description", "")),
                 sessions=tuple(str(p) for p in raw.get("sessions", ())),
                 commands=tuple(str(p) for p in raw.get("commands", ())),
@@ -313,28 +335,28 @@ class WalletModule:
         )
 
     async def _execute(self, session, secret: Secret, cmd: list[str]) -> tuple[int, bytes, bytes]:
-        """Запустить команду НА ХОСТЕ (вне песочницы) с секретом в env ребёнка.
+        """Запустить команду НА ХОСТЕ (вне песочницы).
 
-        Это суть дизайна: секрет живёт только в env короткоживущего процесса
-        на хосте и никогда — в адресном пространстве песочницы.
+        Суть дизайна: секрет/auth живёт только на хосте, никогда — в адресном
+        пространстве песочницы. Два режима (см. Secret):
+          * inject — секрет в env ребёнка (env=…, value=…);
+          * host-passthrough — чистое хостовое окружение (keyring, gh/git auth):
+            ничего не инжектим, глобальный git-конфиг НЕ обнуляем (в нём живёт
+            gh credential helper).
 
-        ⚠️ ОГРАНИЧЕНИЕ (см. docs/secrets-wallet.md): команда исполняется в
-        cwd проекта, куда модель имеет запись из песочницы. Узкий шаблон
-        (`git push*`) НЕ гарантирует безопасность — модель может подложить
-        `./.git/config` (core.sshCommand/hooksPath/alias) и получить исполнение
-        на хосте с секретом. Защита — исключительно policy: разрешать секрет
-        только доверенным сессиям и только тем командам, чьё поведение не
-        зависит от содержимого cwd; для git выставляем безопасные env ниже, но
-        полностью класс атак это не закрывает.
+        ⚠️ ОГРАНИЧЕНИЕ (docs/secrets-wallet.md): команда исполняется в cwd
+        проекта, куда модель пишет из песочницы. Узкий шаблон НЕ гарантирует
+        безопасность — модель может подложить `./.git/config` и получить
+        исполнение на хосте. Барьер — policy (sessions/commands/confirm).
         """
         env = dict(os.environ)
-        env[secret.env] = secret.value
-        # Частичная защита git от подложенного локального конфига: игнорируем
-        # системный/глобальный git-конфиг и (git ≥2.36) не читаем конфиг из
-        # рабочего дерева. Локальный ./.git/config это не отменяет — только
-        # снижает поверхность; основной барьер — policy.
-        env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
-        env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
+        if not secret.host_passthrough:
+            env[secret.env] = secret.value
+            # Частичная защита git от подложенного локального конфига (только
+            # inject-режим: у host-passthrough gh credential helper в глобальном
+            # ~/.gitconfig, обнулять его нельзя — иначе push потеряет auth).
+            env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+            env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
