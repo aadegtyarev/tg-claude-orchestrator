@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import html
 import os
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib  # stdlib с 3.11
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 import tomlkit
 

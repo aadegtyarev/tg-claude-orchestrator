@@ -38,10 +38,14 @@ import shutil
 import signal
 import socket
 import tempfile
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+try:
+    import tomllib  # stdlib с 3.11
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 from aiohttp import web
 
