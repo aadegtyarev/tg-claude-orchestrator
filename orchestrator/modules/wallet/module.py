@@ -24,8 +24,10 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import socket
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,16 @@ RUN_TIMEOUT = 300.0
 STREAM_LIMIT = 200_000
 # Чем заменяем значения секретов в выводе.
 REDACTED = "•••"
+# Плейсхолдеры инъекции секрета В САМУ КОМАНДУ (только inject-секреты, со
+# значением). Нужны там, где токен должен попасть в аргумент/файл, а не в env
+# (exec без шелла — «$ENV» в аргументе не развернулся бы):
+#   {{secret}}      — значение в строку аргумента (curl -H "Authorization: Bearer {{secret}}");
+#   {{secret_file}} — путь к временному 0600-файлу со значением (ssh -i {{secret_file}},
+#                     клиентские сертификаты, JSON-креды).
+# Подстановка в демоне ПОСЛЕ проверок policy/guard, перед exec — значение в
+# контекст/песочницу модели не попадает; вывод редактируется от значения.
+PH_VALUE = "{{secret}}"
+PH_FILE = "{{secret_file}}"
 # Дефолтный набор для host-passthrough, когда `commands` не задан: инструменты,
 # которые обычно уже авторизованы на хосте и не отдают сам секрет наружу. Смысл
 # кошелька — «используй, но не читай»: gh/git/ssh/scp применяют креды сами,
@@ -557,38 +569,69 @@ class WalletModule:
         env["GIT_TERMINAL_PROMPT"] = "0"
         env.pop("DISPLAY", None)
         env.pop("SSH_ASKPASS", None)
-        if not secret.host_passthrough:
+
+        # Плейсхолдеры {{secret}} / {{secret_file}} — только у inject-секретов.
+        has_val = any(PH_VALUE in a for a in cmd)
+        has_file = any(PH_FILE in a for a in cmd)
+        tmpdir: str | None = None
+        if secret.host_passthrough:
+            if has_val or has_file:
+                return 2, b"", (
+                    f"{PH_VALUE}/{PH_FILE} работают только с inject-секретом "
+                    "(value+env); у host-passthrough значения нет — подставлять нечего. "
+                    "SSH/git по ключам на хосте идут host-passthrough без плейсхолдеров."
+                ).encode()
+        else:
             env[secret.env] = secret.value
             # Частичная защита git от подложенного локального конфига (только
             # inject-режим: у host-passthrough gh credential helper в глобальном
             # ~/.gitconfig, обнулять его нельзя — иначе push потеряет auth).
             env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
             env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
+            if has_val:
+                cmd = [a.replace(PH_VALUE, secret.value) for a in cmd]
+            if has_file:
+                # Значение → временный 0600-файл на ХОСТЕ. Песочница видит свой
+                # tmpfs /tmp (см. runners/sandbox.py), этот файл ей недоступен;
+                # команда бежит на хосте и читает его по подставленному пути.
+                # Каталог сносим в finally. Для ssh-ключей/сертификатов/JSON-кред.
+                tmpdir = tempfile.mkdtemp(prefix="wallet-")
+                path = os.path.join(tmpdir, "secret")
+                data = secret.value if secret.value.endswith("\n") else secret.value + "\n"
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(data)
+                cmd = [a.replace(PH_FILE, path) for a in cmd]
+
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=self.core.manager.effective_cwd(session),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,  # своя группа процессов — killpg по таймауту
-            )
-        except OSError as e:
-            return 127, b"", str(e).encode()
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), RUN_TIMEOUT)
-            return proc.returncode if proc.returncode is not None else 1, out, err
-        except asyncio.TimeoutError:
-            # Убиваем всю группу: сама команда могла наплодить детей.
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=self.core.manager.effective_cwd(session),
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,  # своя группа процессов — killpg по таймауту
+                )
+            except OSError as e:
+                return 127, b"", str(e).encode()
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), RUN_TIMEOUT)
+                return proc.returncode if proc.returncode is not None else 1, out, err
+            except asyncio.TimeoutError:
+                # Убиваем всю группу: сама команда могла наплодить детей.
                 try:
-                    proc.kill()
+                    os.killpg(proc.pid, signal.SIGKILL)
                 except OSError:
-                    pass
-            try:
-                out, err = await proc.communicate()
-            except Exception:
-                out = err = b""
-            return 124, out, err
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    out, err = await proc.communicate()
+                except Exception:
+                    out = err = b""
+                return 124, out, err
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)

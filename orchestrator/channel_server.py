@@ -130,15 +130,30 @@ def _wallet_catalog() -> str | None:
     if not secrets_list:
         return "Run `wallet ls` — this session currently has no wallet secrets."
     lines = []
+    any_inject = False
     for s in secrets_list:
         cmds = ", ".join(s.get("commands", [])) or "—"
         desc = f" ({s['description']})" if s.get("description") else ""
-        inj = (
-            f" [inject → use ${s['env']} in the command]"
-            if s.get("mode") == "inject" and s.get("env") else ""
-        )
+        if s.get("mode") == "inject" and s.get("env"):
+            any_inject = True
+            inj = f" [inject: env ${s['env']} set; or use placeholders {{{{secret}}}} / {{{{secret_file}}}}]"
+        else:
+            inj = ""
         lines.append(f"  • `{s['name']}`{desc} — {cmds}{inj}")
-    return "You may run these via `wallet run <name> -- <cmd>`:\n" + "\n".join(lines)
+    out = "You may run these via `wallet run <name> -- <cmd>`:\n" + "\n".join(lines)
+    if any_inject:
+        # Как класть значение inject-секрета туда, где env не читается (curl,
+        # ssh-ключ): плейсхолдеры подставляются демоном, значение к тебе не
+        # попадает. НЕ пытайся прочитать/вывести само значение.
+        out += (
+            "\nInject secrets: the token is set in its env var (tools like gh/aws/"
+            "kubectl read it automatically). For a token that must go INTO the "
+            "command string use `{{secret}}` (e.g. curl -H "
+            "'Authorization: Bearer {{secret}}'); for one that must be a FILE use "
+            "`{{secret_file}}` (e.g. ssh -i {{secret_file}}). The daemon substitutes "
+            "them — you never see the value."
+        )
+    return out
 
 
 _WALLET_CATALOG = _wallet_catalog()

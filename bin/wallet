@@ -93,9 +93,14 @@ def cmd_ls(cfg: dict) -> int:
         confirm = " [confirm]" if s.get("confirm") else ""
         print(f"{s['name']}{desc}{confirm}")
         # host — команда на хосте с его кредами (keyring/gh/git), инъекции нет.
-        # inject — значение в env-переменную $<env>; ссылайся на неё в команде.
+        # inject — значение в env-переменную $<env> (инструменты вроде gh/aws/
+        # kubectl читают её сами), а где нужно значение В КОМАНДЕ — плейсхолдеры
+        # {{secret}} (в строку, напр. curl -H '... {{secret}}') и {{secret_file}}
+        # (во временный файл, напр. ssh -i {{secret_file}}). Подставляет демон —
+        # значение к тебе не попадает.
         if s.get("mode") == "inject" and s.get("env"):
-            print(f"    режим: inject → в команде используй ${s['env']}")
+            print(f"    режим: inject → env ${s['env']}; в строке — {{{{secret}}}},"
+                  " файлом — {{secret_file}}")
         else:
             print("    режим: host (креды хоста: keyring/gh/git)")
         for pat in s.get("commands", []):
