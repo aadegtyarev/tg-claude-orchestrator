@@ -376,11 +376,27 @@ class WalletModule:
         for session in core.manager.list_all():
             await self._provision(session)
         core.session_hooks.append(self._provision)
+        # Авто-инъект shared-секретов (inject_at_start) в env процесса claude.
+        core.manager.env_hooks.append(self.session_env)
+
+    def session_env(self, session) -> dict[str, str]:
+        """env для авто-инъекта в песочницу сессии: shared-секреты с
+        inject_at_start и заданным env, доступные этой сессии. Значение
+        попадает в env процесса claude (его наследуют Bash-тул и сервисы)."""
+        out: dict[str, str] = {}
+        for s in self.store.load().values():
+            if s.shared and s.inject_at_start and s.env and s.session_allowed(session.name):
+                out[s.env] = s.value
+        return out
 
     async def stop(self) -> None:
         if self.core is not None:
             try:
                 self.core.session_hooks.remove(self._provision)
+            except ValueError:
+                pass
+            try:
+                self.core.manager.env_hooks.remove(self.session_env)
             except ValueError:
                 pass
         if self._runner is not None:

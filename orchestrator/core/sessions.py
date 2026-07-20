@@ -159,6 +159,9 @@ class SessionManager:
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
+        # Модули дописывают env для процесса claude (напр. wallet: shared-секреты
+        # с inject_at_start). Синхронные, session -> {ИМЯ: значение}.
+        self.env_hooks: list[Callable[[Session], dict[str, str]]] = []
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -529,6 +532,14 @@ class SessionManager:
         for key in [k for k in env if k.startswith("CLAUDE_ENV_")]:
             del env[key]
         env.update(self.config.claude_env)
+        # Модульные env-вклады (wallet: shared-секреты с inject_at_start). Env
+        # процесса claude наследуют его Bash-тул и сервисы, что он запускает —
+        # значит переменная доступна там, где сервис её читает.
+        for hook in self.env_hooks:
+            try:
+                env.update(hook(session))
+            except Exception:
+                logger.exception("env_hook для сессии %s", session.name)
 
         # --session-id обязан быть UUID; --resume продолжает прежний диалог.
         session_arg = (

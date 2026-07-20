@@ -82,6 +82,7 @@ def make_env(tmp: Path):
             get=lambda n: session if n == "dev" else None,
             effective_cwd=lambda s: cwd,
             session_home=lambda s: home,
+            env_hooks=[],
         ),
         session_hooks=[],
         # has()=False → бабла нет (как фоновый вызов) → notice всегда шлётся,

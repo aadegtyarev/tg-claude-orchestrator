@@ -97,6 +97,23 @@ async def run():
     assert r.status == 403 and b"V-secret" not in r.body
     print("OK get с confirm: отказ кнопкой → значение не выдаётся")
 
+    # session_env: авто-инъект — только shared + inject_at_start + env.
+    st3 = _store(
+        '[secrets.svc]\nshared=true\nvalue="KEYVAL"\nenv="OPENAI_API_KEY"\n'
+        'inject_at_start=true\nsessions=["*"]\n\n'
+        '[secrets.manual]\nshared=true\nvalue="V"\nenv="X"\nsessions=["*"]\n\n'
+        '[secrets.other]\nshared=true\nvalue="Z"\nenv="Y"\ninject_at_start=true\n'
+        'sessions=["prod-*"]\n\n'
+        '[secrets.host]\nsessions=["*"]\ncommands=["gh"]\n'
+    )
+    m3 = WalletModule.__new__(WalletModule)
+    m3.store = st3
+    env = m3.session_env(SESSION)
+    # svc: shared+inject_at_start+env+доступен → да; manual: без inject_at_start → нет;
+    # other: сессия не матчится (prod-*) → нет; host: не shared → нет.
+    assert env == {"OPENAI_API_KEY": "KEYVAL"}, env
+    print("OK session_env: только shared+inject_at_start+env+доступ попадают в env")
+
 
 def main():
     asyncio.run(run())
