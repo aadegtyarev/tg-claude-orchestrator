@@ -215,6 +215,7 @@ class WebAdapter:
         r.add_get("/api/sessions", self.h_sessions)
         r.add_post("/api/sessions", self.h_create)
         r.add_post("/api/sessions/{name}/message", self.h_message)
+        r.add_get("/api/sessions/{name}/bg", self.h_bg)
         r.add_post("/api/sessions/{name}/close", self.h_close)
         r.add_post("/api/sessions/{name}/clear", self.h_clear)
         r.add_post("/api/sessions/{name}/delete", self.h_delete)
@@ -671,6 +672,17 @@ class WebAdapter:
     async def h_ls(self, request: web.Request) -> web.Response:
         path = request.query.get("path") or None
         return web.json_response({"text": self.core.ls_text(path)})
+
+    async def h_bg(self, request: web.Request) -> web.Response:
+        """Фоновые процессы/кроны сессии (снимок из последнего Stop-хука)."""
+        session = self._session_of(request)
+        if session is None:
+            return self._err("session not found", 404)
+        return web.json_response({
+            "text": self.core.bg_text(session),
+            "background_tasks": session.background_tasks,
+            "session_crons": session.session_crons,
+        })
 
     async def h_skills(self, request: web.Request) -> web.Response:
         skills = await asyncio.to_thread(self.core.collect_skills)

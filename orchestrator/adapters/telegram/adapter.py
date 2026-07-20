@@ -71,6 +71,7 @@ class TelegramAdapter:
             BotCommand(command="new", description=self.t("menu_new")),
             BotCommand(command="list", description=self.t("menu_list")),
             BotCommand(command="ls", description=self.t("menu_ls")),
+            BotCommand(command="bg", description=self.t("menu_bg")),
             BotCommand(command="wallet", description=self.t("menu_wallet")),
             BotCommand(command="orchestrator_restart", description=self.t("menu_restart")),
             BotCommand(command="orchestrator_web", description=self.t("menu_web")),
@@ -382,6 +383,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_new, Command("new"))
         dp.message.register(self.cmd_list, Command("list"))
         dp.message.register(self.cmd_ls, Command("ls"))
+        dp.message.register(self.cmd_bg, Command("bg"))
         dp.message.register(self.cmd_wallet, Command("wallet"))
         dp.message.register(self.cmd_restart, Command("orchestrator_restart"))
         dp.message.register(self.cmd_web, Command("orchestrator_web"))
@@ -534,6 +536,16 @@ class TelegramAdapter:
         # cwd как у /bash: в топике сессии — папка проекта, в главном чате — дом.
         session = self._topic_session(message)
         await message.reply(self.core.ls_text(command.args, session))
+
+    async def cmd_bg(self, message: Message, command: CommandObject) -> None:
+        """Фоновые процессы/кроны сессии (снимок из последнего Stop-хука)."""
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        if session is None:
+            await message.reply(self.t("bg_no_session"))
+            return
+        await message.reply(self.core.bg_text(session), parse_mode="HTML")
 
     async def cmd_wallet(self, message: Message, command: CommandObject) -> None:
         """Policy кошелька: просмотр/правка (значения токенов не показываются)."""
