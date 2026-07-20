@@ -1131,11 +1131,22 @@ class OrchestratorCore:
                 result.append((name, desc))
         return result
 
-    def ls_text(self, arg: str | None) -> str:
-        """Листинг файлов для /ls (по умолчанию SESSIONS_DIR)."""
-        target = self.config.sessions_dir
-        if arg:
-            target = Path(arg.strip()).expanduser().resolve()
+    def ls_text(self, arg: str | None, session: "Session | None" = None) -> str:
+        """Листинг файлов для /ls. Базовый каталог — то же разделение, что у
+        /bash: в сессии папка проекта (effective_cwd), в главном чате — дом
+        пользователя на хосте. Относительный аргумент (`./`, `sub/dir`)
+        резолвится ОТ этой базы, а не от cwd процесса-оркестратора; абсолютный
+        путь и `~` — как есть."""
+        base = (
+            self.manager.effective_cwd(session)
+            if session is not None
+            else Path.home()
+        )
+        if arg and arg.strip():
+            p = Path(arg.strip()).expanduser()
+            target = (p if p.is_absolute() else base / p).resolve()
+        else:
+            target = base
         if not target.exists():
             return self.t("ls_not_exists", path=target)
         if not target.is_dir():

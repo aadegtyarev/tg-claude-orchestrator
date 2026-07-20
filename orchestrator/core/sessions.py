@@ -359,8 +359,13 @@ class SessionManager:
         """Рабочая директория проекта: claude запускается прямо в ней
         (натуральный cwd — грузит CLAUDE.md/.mcp.json/.claude проекта).
         Несуществующая директория создаётся автоматически.
+
+        `/new` — команда главного чата, поэтому относительный путь резолвим ОТ
+        дома пользователя (а не от cwd процесса-оркестратора = репозитория);
+        абсолютный путь и `~` — как указано.
         """
-        real_path = Path(project_path).expanduser().resolve()
+        p = Path(project_path).expanduser()
+        real_path = (p if p.is_absolute() else Path.home() / p).resolve()
         if real_path.is_file():
             raise SessionError(f"Это файл, а не директория: {project_path}")
         real_path.mkdir(parents=True, exist_ok=True)

@@ -531,7 +531,9 @@ class TelegramAdapter:
     async def cmd_ls(self, message: Message, command: CommandObject) -> None:
         if not self._accept(message):
             return
-        await message.reply(self.core.ls_text(command.args))
+        # cwd как у /bash: в топике сессии — папка проекта, в главном чате — дом.
+        session = self._topic_session(message)
+        await message.reply(self.core.ls_text(command.args, session))
 
     async def cmd_wallet(self, message: Message, command: CommandObject) -> None:
         """Policy кошелька: просмотр/правка (значения токенов не показываются)."""
