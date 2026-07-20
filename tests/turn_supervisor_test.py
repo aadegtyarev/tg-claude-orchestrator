@@ -49,14 +49,16 @@ class _Mgr:
         return None
 
 
-def _sup(mgr, sends):
+def _sup(mgr, sends, tool_inflight=None):
     async def send(session, text):
         sends.append(text)
 
     async def typing(session):
         return False  # typing-цикл гаснет сразу, он не под тестом
 
-    return TurnSupervisor(mgr, t=lambda k, **kw: k, send=send, typing=typing)
+    return TurnSupervisor(
+        mgr, t=lambda k, **kw: k, send=send, typing=typing, tool_inflight=tool_inflight
+    )
 
 
 async def _wait(cond, timeout=2.0):
@@ -141,6 +143,23 @@ async def test_watchdog_silent_while_busy(tmp_path):
     print("OK watchdog: сессия busy → не срабатывает")
 
 
+async def test_watchdog_silent_while_tool_inflight(tmp_path):
+    """Лог не растёт И CPU не растёт (is_busy=False), НО идёт foreground-тул
+    (Bash `sleep`/сетевое ожидание) → живой, вотчдог молчит. Это ровно кейс,
+    который под bwrap раньше держал has_kids, а теперь — сигнал хуков."""
+    _fast_intervals()
+    log = tmp_path / "claude.log"
+    log.write_bytes(b"start")  # не растёт
+    session = SimpleNamespace(name="s", session_dir=tmp_path)
+    sends: list = []
+    sup = _sup(_Mgr(session, busy=False), sends, tool_inflight=lambda name: True)
+    task = asyncio.create_task(sup._watchdog_loop("s"))
+    await asyncio.sleep(0.2)  # несколько проверок
+    task.cancel()
+    assert sends == [], sends
+    print("OK watchdog: тул in-flight (CPU замер) → не срабатывает")
+
+
 # ── error-relay ─────────────────────────────────────────────────
 
 async def test_error_relay_surfaces_api_error_once(tmp_path):
@@ -175,6 +194,7 @@ def main():
     for fn in (
         test_watchdog_fires_on_stall,
         test_watchdog_silent_while_busy,
+        test_watchdog_silent_while_tool_inflight,
         test_error_relay_surfaces_api_error_once,
     ):
         d = Path(tempfile.mkdtemp())

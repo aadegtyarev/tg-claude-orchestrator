@@ -80,11 +80,17 @@ class TurnSupervisor:
         send: Callable[["Session", str], Awaitable[None]],
         typing: Callable[["Session"], Awaitable[bool]],
         status: Callable[..., Awaitable[None]] | None = None,
+        tool_inflight: Callable[[str], bool] | None = None,
     ):
         self.manager = manager
         self.t = t
         self._send = send
         self._typing_action = typing
+        # Идёт ли СЕЙЧАС foreground-тул (PreToolUse без PostToolUse) — сигнал
+        # «жив, даже если CPU дерева на миг замер» (напр. Bash `sleep`/сетевое
+        # ожидание). Заменяет has_kids из /proc, который под bwrap структурно
+        # всегда True (дочерний bwrap-init) и делал вотчдог вечно-«живым».
+        self._tool_inflight = tool_inflight or (lambda name: False)
         # Колбэк живого статуса (спиннер-глагол + реальная модель → бабл).
         # None = не показывать. Сигнатура: (name, pulse=…, model=…).
         self._status = status or (lambda name, **kw: asyncio.sleep(0))
@@ -186,10 +192,16 @@ class TurnSupervisor:
                 size = log.stat().st_size
             except OSError:
                 size = last_size
-            # Жизнь = лог растёт ИЛИ claude (с потомками-тулами) ест CPU.
+            # Жизнь = лог растёт ИЛИ дерево claude ест CPU ИЛИ идёт foreground-тул.
             # Одних байт мало: спиннер «almost done» может на секунды замолчать
-            # в нормальной работе, и это не зависание.
-            alive = size != last_size or self.manager.is_busy(session)
+            # в нормальной работе, и это не зависание. is_busy — только CPU-дельта
+            # (has_kids выкинут: под bwrap всегда True); _tool_inflight ловит
+            # «тул идёт, но CPU замер» (Bash sleep/сетевое ожидание).
+            alive = (
+                size != last_size
+                or self.manager.is_busy(session)
+                or self._tool_inflight(name)
+            )
             last_size = size
             stalls = 0 if alive else stalls + 1
             if stalls < STALL_CHECKS:
