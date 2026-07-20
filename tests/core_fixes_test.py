@@ -44,6 +44,8 @@ def make_core():
     core.config = SimpleNamespace(max_instances=5)
     core._history = {}
     core._last_tool = {}
+    core._agent_types = {}
+    core._agent_spawns = {}
     core.adapters = {}
     core._pending_perms = set()
     core._local_perms = {}
