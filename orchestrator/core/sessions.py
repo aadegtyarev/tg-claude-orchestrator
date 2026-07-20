@@ -164,9 +164,12 @@ class SessionManager:
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
-        # Модули дописывают env для процесса claude (напр. wallet: shared-секреты
-        # с inject_at_start). Синхронные, session -> {ИМЯ: значение}.
+        # Модули дописывают env для процесса claude (напр. wallet: $NAME для
+        # секретов — маркер/значение). Синхронные, session -> {ИМЯ: значение}.
         self.env_hooks: list[Callable[[Session], dict[str, str]]] = []
+        # Модули добавляют каталоги в НАЧАЛО PATH песочницы (напр. wallet:
+        # обёртки-шлюз gh/git/curl). Синхронные, session -> [каталоги].
+        self.path_hooks: list[Callable[[Session], list[str]]] = []
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -528,8 +531,17 @@ class SessionManager:
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
         # CLI-обвязка оркестратора (bin/wallet и т.п.): репозиторий RO-виден
-        # и в песочнице, поэтому PATH работает и там.
-        env["PATH"] = f"{ROOT / 'bin'}:{env.get('PATH', '')}"
+        # и в песочнице, поэтому PATH работает и там. Модульные path_hooks
+        # (напр. обёртки-шлюз кошелька) кладём ещё раньше — они должны побеждать
+        # настоящие бинари. Каталоги под session_home появляются/наполняются из
+        # session_hooks уже после старта, но bind-смонтированы живыми.
+        prepend = [str(ROOT / "bin")]
+        for hook in self.path_hooks:
+            try:
+                prepend = [*hook(session), *prepend]
+            except Exception:
+                logger.exception("path_hook для сессии %s", session.name)
+        env["PATH"] = ":".join([*prepend, env.get("PATH", "")])
         if self.config.claude_config_dir is not None:
             env["CLAUDE_CONFIG_DIR"] = str(self.config.claude_config_dir)
         # Явные переменные для Claude Code (CLAUDE_ENV_ANTHROPIC_BASE_URL=…
@@ -537,9 +549,9 @@ class SessionManager:
         for key in [k for k in env if k.startswith("CLAUDE_ENV_")]:
             del env[key]
         env.update(self.config.claude_env)
-        # Модульные env-вклады (wallet: shared-секреты с inject_at_start). Env
-        # процесса claude наследуют его Bash-тул и сервисы, что он запускает —
-        # значит переменная доступна там, где сервис её читает.
+        # Модульные env-вклады (wallet: $NAME для секретов). Env процесса claude
+        # наследуют его Bash-тул и сервисы, что он запускает — значит переменная
+        # доступна там, где сервис/команда её читает.
         for hook in self.env_hooks:
             try:
                 env.update(hook(session))

@@ -83,6 +83,7 @@ def make_env(tmp: Path):
             effective_cwd=lambda s: cwd,
             session_home=lambda s: home,
             env_hooks=[],
+            path_hooks=[],
         ),
         session_hooks=[],
         output_redactors=[],
@@ -225,7 +226,7 @@ async def main():
 
         def mk(name, value, env, sessions, commands, deny=(), allow_unsafe=False):
             return Secret(name, value, env, "", sessions, commands, deny, allow_unsafe,
-                          False, False, False)
+                          False, False)  # confirm, shared
 
         # commands (allow): голое имя = любой вызов; шаблон с пробелом = fnmatch
         s_bare = mk("x", "", "", ("*",), ("gh", "curl https://api/*"))

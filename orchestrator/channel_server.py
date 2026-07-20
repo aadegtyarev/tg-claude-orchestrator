@@ -103,10 +103,11 @@ INSTRUCTIONS = (
 
 # Авто-подсказка про кошелёк секретов: добавляется в системный промпт ТОЛЬКО
 # когда сессии выдан ~/.wallet.json (MODULES=wallet + сессия в чьей-то policy).
-# Смысл — модель сама роутит gh/git/curl через кошелёк, не спрашивая пользователя
-# («автоматом с подсказками»). Под bwrap $HOME процесса подменён приватным домом
-# сессии, поэтому файл лежит ровно по ~/.wallet.json. Значений секретов тут нет —
-# только факт наличия; конкретику модель узнаёт из `wallet ls`.
+# Смысл — прозрачный шлюз: обёртки в PATH (.wallet-bin) заворачивают gh/git/curl/
+# ssh в кошелёк, поэтому модель просто зовёт инструмент как обычно, а токен
+# подставляется на хосте. Промпт лишь называет, ЧТО доступно (из policy). Под
+# bwrap $HOME подменён приватным домом сессии, файл лежит ровно по ~/.wallet.json.
+# Значений секретов тут нет — только факт наличия; конкретику — из `wallet ls`.
 def _wallet_catalog() -> str | None:
     """Каталог доступных сессии секретов ИЗ POLICY (демон /secrets), а не хардкод.
 
@@ -144,18 +145,18 @@ def _wallet_catalog() -> str | None:
         cmds = ", ".join(s.get("commands", [])) or "—"
         if mode == "inject" and s.get("env"):
             any_inject = True
-            inj = f" [inject: env ${s['env']} set; or use placeholders {{{{secret}}}} / {{{{secret_file}}}}]"
+            inj = f" [inject: use ${s['env']} in the command; ${s['env']}_FILE for a file]"
         else:
             inj = ""
         lines.append(f"  • `{s['name']}`{desc} — {cmds}{inj}")
     out = (
-        "Run these via `wallet run <name> -- <cmd>`. `wallet` is ALREADY on your "
-        "PATH — call it exactly as `wallet run ...`, with NO full path and NO "
-        "leading `cd`: the command runs on the host IN YOUR PROJECT DIRECTORY, so a "
-        "`cd` in your shell does not affect it. One `wallet run` = one command; do "
-        "NOT wrap it in a `while`/poll loop — use the tool's own watch (e.g. `gh run "
-        "watch`) inside a single `wallet run`. Run `wallet help` for the full "
-        "reference (modes, placeholders, rules) before doing wallet work.\n"
+        "These tools are wired through the wallet TRANSPARENTLY — just run them "
+        "NORMALLY (e.g. `gh pr create`, `git push`, `curl ...`); a wrapper on your "
+        "PATH routes the call to the host with the right credential attached, and you "
+        "never handle the token. They run on the host IN YOUR PROJECT DIRECTORY, so a "
+        "`cd` in your shell does not move them. Use each tool's own watch (e.g. `gh "
+        "run watch`) — do NOT wrap calls in a `while`/poll loop. `wallet ls` lists "
+        "this again; `wallet help` has the full reference.\n"
         + "\n".join(lines)
     )
     if any_shared:
@@ -167,16 +168,16 @@ def _wallet_catalog() -> str | None:
             "aren't pasted in chat or committed — don't echo them into the chat."
         )
     if any_inject:
-        # Как класть значение inject-секрета туда, где env не читается (curl,
-        # ssh-ключ): плейсхолдеры подставляются демоном, значение к тебе не
-        # попадает. НЕ пытайся прочитать/вывести само значение.
+        # Inject-секрет отдаётся привычной env-переменной $ИМЯ (в песочнице там
+        # маркер, реальное значение подставляется на хосте). Модель просто
+        # использует $ИМЯ; значение читать/выводить не надо.
         out += (
-            "\nInject secrets: the token is set in its env var (tools like gh/aws/"
-            "kubectl read it automatically). For a token that must go INTO the "
-            "command string use `{{secret}}` (e.g. curl -H "
-            "'Authorization: Bearer {{secret}}'); for one that must be a FILE use "
-            "`{{secret_file}}` (e.g. ssh -i {{secret_file}}). The daemon substitutes "
-            "them — you never see the value."
+            "\nInject secrets appear as an env var — use it as usual: the tool reads "
+            "$NAME itself (gh/aws/kubectl), or you drop $NAME into the command "
+            "(curl -H 'Authorization: Bearer $OPENAI_KEY'); use $NAME_FILE where a "
+            "FILE path is needed (ssh -i $DEPLOY_KEY_FILE). In the sandbox $NAME "
+            "holds only a marker — the real value is filled in on the host, you never "
+            "see it. Don't try to print or transform the value."
         )
     return out
 
@@ -184,23 +185,23 @@ def _wallet_catalog() -> str | None:
 _WALLET_CATALOG = _wallet_catalog()
 if _WALLET_CATALOG is not None:
     INSTRUCTIONS += (
-        "\nSECRETS WALLET: `wallet run <name> -- <cmd>` runs a credential-bearing "
-        "command on the host — the token stays on the host and never reaches you "
-        "(its value is auto-redacted from the output). " + _WALLET_CATALOG + "\n"
-        "PICK the secret by <name> from that list: each line shows its description "
-        "and its allowed commands (e.g. which URL), so match your target to the right "
-        "one — one run uses exactly one secret. Pass its value with env (gh/aws/"
-        "kubectl read it themselves), `{{secret}}` for an inline argument (curl -H "
-        "'Authorization: Bearer {{secret}}'), or `{{secret_file}}` for a file (ssh -i "
-        "{{secret_file}}, client certs). Keep wallet commands non-interactive (ssh "
-        "`-o BatchMode=yes -o StrictHostKeyChecking=accept-new`).\n"
-        "Use the wallet only for a credential you do NOT have (the host's gh/git/ssh "
-        "auth, a token in the list). A credential you already HAVE — the user gave it "
-        "to you, or you generated your own for a NEW resource — just use directly with "
-        "normal commands; the wallet only stands in for secrets you cannot see. If the "
-        "wallet can't do it (secret not listed, denied, or it keeps failing), don't "
-        "improvise a workaround — tell the operator via reply_to_user with the exact "
-        "`wallet run ...` and the error.\n"
+        "\nSECRETS WALLET: some tools are wired to run with a host-side credential you "
+        "cannot see. For the tools listed below, just RUN THEM NORMALLY — a wrapper on "
+        "your PATH forwards the call to the host with the right secret attached, and any "
+        "secret value is auto-redacted from the output. " + _WALLET_CATALOG + "\n"
+        "For git this covers the network subcommands (push/fetch/pull/clone); local git "
+        "(status/commit/diff/log) just runs in place. A secret's value reaches a command "
+        "through its env var $NAME — the tool reads it (gh/aws/kubectl), or you put $NAME "
+        "in the command (curl -H 'Authorization: Bearer $OPENAI_KEY'), or $NAME_FILE "
+        "where a file is needed (ssh -i $DEPLOY_KEY_FILE). Keep these commands "
+        "non-interactive (ssh `-o BatchMode=yes -o StrictHostKeyChecking=accept-new`).\n"
+        "To force a specific secret, `wallet run <name> -- <cmd>` picks it by name; "
+        "`wallet ls`/`wallet help` show what's available. Use the wallet only for a "
+        "credential you do NOT have — one you already have (the user gave it to you, or "
+        "you generated your own for a NEW resource) you just use directly. If the wallet "
+        "can't do it (secret not listed, denied, or it keeps failing), don't improvise a "
+        "workaround — tell the operator via reply_to_user with the exact command and the "
+        "error.\n"
         "The wallet hides values by design: don't try to print or transform a token "
         "to see its value — if you think you need the raw value, you don't."
     )

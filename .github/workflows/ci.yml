@@ -37,3 +37,6 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITLEAKS_LICENSE: ""  # для публичного репо лицензия не требуется
+          # gitleaks-action v2 требует токен для сканирования pull_request-событий
+          # (сравнивает диапазон коммитов PR через GitHub API).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
