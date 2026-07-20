@@ -30,17 +30,27 @@ class FakeSession:
         self.ops = asyncio.Lock()
 
 
+def _free_port() -> int:
+    # Свободный порт динамически — хардкод падал по TIME_WAIT при полном прогоне
+    # (пул из одного порта + bind без SO_REUSEADDR в _find_free_port).
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 async def run():
     old_grace = sessions.RESUME_GRACE
     sessions.RESUME_GRACE = 0.0
     try:
+        port = _free_port()
         m = SessionManager.__new__(SessionManager)
-        m.config = SimpleNamespace(channel_port_start=53010, channel_port_end=53010)
+        m.config = SimpleNamespace(channel_port_start=port, channel_port_end=port)
         m._by_name = {}
         m._inflight_ports = set()
         m._lock = asyncio.Lock()
 
-        session = FakeSession(53010)
+        session = FakeSession(port)
         m._by_name["s"] = session
         reserved_during_wait = {"ok": None}
 
@@ -76,7 +86,7 @@ async def run():
         assert session.running is True
         # После успешного рестарта watcher снял именно inflight-резерв (порт
         # теперь держит running-сессия, а не «в полёте»).
-        assert 53010 not in m._inflight_ports
+        assert port not in m._inflight_ports
         print("OK resume-фолбэк держит порт зарезервированным на чистый рестарт")
     finally:
         sessions.RESUME_GRACE = old_grace

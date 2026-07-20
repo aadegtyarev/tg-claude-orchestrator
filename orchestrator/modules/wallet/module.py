@@ -146,10 +146,22 @@ class Secret:
     # рубится WALLET_GUARD=0; это — гранулярно, на один секрет.
     allow_unsafe: bool
     confirm: bool  # спрашивать ли подтверждение кнопками перед запуском
+    # shared: секрет, значение которого модель ДОЛЖНА получить (dev-ключ для её
+    # сервиса, логин/пароль для ввода в браузер). Не про конфиденциальность от
+    # модели — про хранение вне чата/репо. Выдаётся `wallet get`/`wallet env`,
+    # опц. авто-инъект в env песочницы. host/inject значения НЕ выдаются никогда.
+    shared: bool
+    inject_at_start: bool  # для shared: положить `env`=value в env песочницы на старте
 
     @property
     def host_passthrough(self) -> bool:
         return not (self.value and self.env)
+
+    @property
+    def mode(self) -> str:
+        if self.shared:
+            return "shared"
+        return "host" if self.host_passthrough else "inject"
 
     @property
     def effective_commands(self) -> tuple[str, ...]:
@@ -237,9 +249,14 @@ class SecretStore:
                 logger.error("wallet: запись %r — не таблица, пропущена", name)
                 continue
             has_value, has_env = "value" in raw, "env" in raw
-            # inject-секрет требует ОБА поля; host-passthrough — НИ ОДНОГО.
-            # Одно без другого — ошибка конфига (пропускаем).
-            if has_value != has_env:
+            is_shared = bool(raw.get("shared", False))
+            # shared-секрет требует value (env опционален — для env-выдачи);
+            # inject — ОБА поля; host-passthrough — НИ ОДНОГО. Иначе ошибка.
+            if is_shared:
+                if not has_value:
+                    logger.error("wallet: shared-секрет %r без value — пропущен", name)
+                    continue
+            elif has_value != has_env:
                 logger.error(
                     "wallet: секрет %r — value и env задаются только вместе "
                     "(inject) либо оба отсутствуют (host-passthrough)", name)
@@ -254,6 +271,8 @@ class SecretStore:
                 deny=tuple(str(p) for p in raw.get("deny", ())),
                 allow_unsafe=bool(raw.get("allow_unsafe", False)),
                 confirm=bool(raw.get("confirm", True)),
+                shared=is_shared,
+                inject_at_start=bool(raw.get("inject_at_start", False)),
             )
         return self._secrets
 
@@ -341,6 +360,7 @@ class WalletModule:
         app = web.Application()
         app.router.add_get("/secrets", self._handle_secrets)
         app.router.add_post("/run", self._handle_run)
+        app.router.add_post("/get", self._handle_get)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         # Порт выдаёт ОС: свой сокет вместо TCPSite, чтобы узнать номер без
@@ -445,16 +465,64 @@ class WalletModule:
                 "description": s.description,
                 "commands": list(s.effective_commands),
                 "confirm": s.confirm,
-                # host — команда идёт на хосте с его окружением (keyring/gh/git),
-                # инъекции нет; inject — значение секрета кладётся в env-переменную
-                # `env` дочернего процесса (модель ссылается на неё как $env).
-                "mode": "host" if s.host_passthrough else "inject",
-                "env": None if s.host_passthrough else s.env,
+                # host — команда на хосте с его окружением; inject — значение в
+                # env-переменную `env` дочернего процесса; shared — значение
+                # ВЫДАётся сессии (wallet get/env), не прячется.
+                "mode": s.mode,
+                "env": s.env or None,
             }
             for s in self.store.load().values()
             if s.session_allowed(session.name)
         ]
         return web.json_response(out)
+
+    async def _handle_get(self, request: web.Request) -> web.Response:
+        """Выдать сессии ЗНАЧЕНИЕ shared-секрета (dev-ключ, логин/пароль).
+
+        Только для shared — host/inject значения не выдаются НИКОГДА (в этом их
+        смысл). shared — про хранение вне чата/репо, не про сокрытие от модели."""
+        session = self._auth(request)
+        if session is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        name = str(data.get("secret", ""))
+        secret = self.store.load().get(name)
+        if secret is None or not secret.session_allowed(session.name):
+            return web.json_response(
+                {"error": "denied",
+                 "reason": f"нет shared-секрета «{name}» для этой сессии (см. wallet ls)"},
+                status=403,
+            )
+        if not secret.shared:
+            return web.json_response(
+                {"error": "denied",
+                 "reason": f"секрет «{name}» не shared — значение не выдаётся "
+                           "(для host/inject используй wallet run)"},
+                status=403,
+            )
+        if secret.confirm:
+            ok = await self.core.request_confirmation(
+                session, tool="wallet",
+                description=f"выдать значение shared-секрета «{name}» сессии",
+                preview=f"wallet get {name}",
+            )
+            if not ok:
+                return web.json_response(
+                    {"error": "denied", "reason": "отклонено кнопкой подтверждения"},
+                    status=403,
+                )
+        # Наблюдаемость: выдача видна строкой (без значения).
+        await self.core.bubbles.append_background(
+            session.name,
+            f"🔐 <b>wallet get</b> <code>{html.escape(name)}</code>", tool="wallet",
+        )
+        self.core._record(session, "wallet", secret=name, cmd=f"get {name}", allowed=True)
+        return web.json_response(
+            {"name": name, "env": secret.env or None, "value": secret.value}
+        )
 
     async def _handle_run(self, request: web.Request) -> web.Response:
         session = self._auth(request)

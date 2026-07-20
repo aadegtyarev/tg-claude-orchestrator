@@ -222,7 +222,8 @@ async def main():
         )
 
         def mk(name, value, env, sessions, commands, deny=(), allow_unsafe=False):
-            return Secret(name, value, env, "", sessions, commands, deny, allow_unsafe, False)
+            return Secret(name, value, env, "", sessions, commands, deny, allow_unsafe,
+                          False, False, False)
 
         # commands (allow): голое имя = любой вызов; шаблон с пробелом = fnmatch
         s_bare = mk("x", "", "", ("*",), ("gh", "curl https://api/*"))

@@ -130,17 +130,33 @@ def _wallet_catalog() -> str | None:
     if not secrets_list:
         return "Run `wallet ls` — this session currently has no wallet secrets."
     lines = []
-    any_inject = False
+    any_inject = any_shared = False
     for s in secrets_list:
-        cmds = ", ".join(s.get("commands", [])) or "—"
         desc = f" ({s['description']})" if s.get("description") else ""
-        if s.get("mode") == "inject" and s.get("env"):
+        mode = s.get("mode")
+        if mode == "shared":
+            any_shared = True
+            how = f"`wallet get {s['name']}`"
+            if s.get("env"):
+                how += f" or `wallet env {s['name']}` (${s['env']})"
+            lines.append(f"  • `{s['name']}`{desc} — SHARED value, get it with {how}")
+            continue
+        cmds = ", ".join(s.get("commands", [])) or "—"
+        if mode == "inject" and s.get("env"):
             any_inject = True
             inj = f" [inject: env ${s['env']} set; or use placeholders {{{{secret}}}} / {{{{secret_file}}}}]"
         else:
             inj = ""
         lines.append(f"  • `{s['name']}`{desc} — {cmds}{inj}")
     out = "You may run these via `wallet run <name> -- <cmd>`:\n" + "\n".join(lines)
+    if any_shared:
+        out += (
+            "\nShared secrets are values you MAY read and use (a dev API key for a "
+            "service you build, a login/password to enter somewhere): `wallet get "
+            "<name>` prints the value, `wallet env <name>` prints `export VAR=value` "
+            "for `eval \"$(wallet env <name>)\"`. They live in the wallet so they "
+            "aren't pasted in chat or committed — don't echo them into the chat."
+        )
     if any_inject:
         # Как класть значение inject-секрета туда, где env не читается (curl,
         # ssh-ключ): плейсхолдеры подставляются демоном, значение к тебе не

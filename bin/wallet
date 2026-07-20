@@ -9,6 +9,8 @@
 Использование:
     wallet ls                       — какие секреты доступны этой сессии
     wallet run <имя> -- <cmd ...>   — выполнить команду с секретом
+    wallet get <имя>                — значение shared-секрета (dev-ключ, логин/пароль)
+    wallet env <имя>                — shared-секрет как `export ENV=…` (для eval/.env)
 
 Конфиг ищется в $WALLET_FILE, затем ~/.wallet.json (внутри песочницы
 персистентный дом сессии смонтирован как $HOME — файл кладёт туда демон).
@@ -98,13 +100,20 @@ def cmd_ls(cfg: dict) -> int:
         # {{secret}} (в строку, напр. curl -H '... {{secret}}') и {{secret_file}}
         # (во временный файл, напр. ssh -i {{secret_file}}). Подставляет демон —
         # значение к тебе не попадает.
-        if s.get("mode") == "inject" and s.get("env"):
+        mode = s.get("mode")
+        if mode == "shared":
+            # shared — значение ВЫДАётся тебе (dev-ключ, логин/пароль): его можно
+            # прочитать/вставить, оно просто хранится в кошельке, не в чате/репо.
+            hint = f", env ${s['env']}" if s.get("env") else ""
+            print(f"    режим: shared → `wallet get {s['name']}` (значение{hint})")
+        elif mode == "inject" and s.get("env"):
             print(f"    режим: inject → env ${s['env']}; в строке — {{{{secret}}}},"
                   " файлом — {{secret_file}}")
         else:
             print("    режим: host (креды хоста: keyring/gh/git)")
-        for pat in s.get("commands", []):
-            print(f"    разрешено: {pat}")
+        if mode != "shared":
+            for pat in s.get("commands", []):
+                print(f"    разрешено: {pat}")
     return 0
 
 
@@ -127,6 +136,33 @@ def cmd_run(cfg: dict, argv: list) -> int:
     return int(result.get("code", 1))
 
 
+def cmd_get(cfg: dict, argv: list) -> int:
+    """Выдать ЗНАЧЕНИЕ shared-секрета (dev-ключ, логин/пароль). Только для
+    секретов с shared=true; host/inject значения не выдаются."""
+    if len(argv) != 1:
+        die("использование: wallet get <имя>")
+    result = call(cfg, "POST", "/get", {"secret": argv[0]})
+    sys.stdout.write(result.get("value", ""))
+    if not result.get("value", "").endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def cmd_env(cfg: dict, argv: list) -> int:
+    """Выдать shared-секрет в виде `export ENV=значение` — для eval или .env
+    сервиса: eval \"$(wallet env <имя>)\"."""
+    if len(argv) != 1:
+        die("использование: wallet env <имя>")
+    result = call(cfg, "POST", "/get", {"secret": argv[0]})
+    env = result.get("env")
+    if not env:
+        die(f"у секрета «{argv[0]}» не задан env — используй `wallet get {argv[0]}`")
+    # Значение в одинарных кавычках с экранированием ' — безопасно для eval.
+    val = result.get("value", "").replace("'", "'\\''")
+    print(f"export {env}='{val}'")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -137,7 +173,11 @@ def main() -> int:
         return cmd_ls(cfg)
     if args[0] == "run":
         return cmd_run(cfg, args[1:])
-    die(f"неизвестная команда {args[0]!r} (ls | run)")
+    if args[0] == "get":
+        return cmd_get(cfg, args[1:])
+    if args[0] == "env":
+        return cmd_env(cfg, args[1:])
+    die(f"неизвестная команда {args[0]!r} (ls | run | get | env)")
 
 
 if __name__ == "__main__":

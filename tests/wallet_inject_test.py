@@ -23,7 +23,8 @@ from orchestrator.modules.wallet.module import (  # noqa: E402
 
 def _secret(**kw) -> Secret:
     d = dict(name="api", value="TOPSECRET-abc", env="API_TOKEN", description="",
-             sessions=("*",), commands=("*",), deny=(), allow_unsafe=False, confirm=False)
+             sessions=("*",), commands=("*",), deny=(), allow_unsafe=False, confirm=False,
+             shared=False, inject_at_start=False)
     d.update(kw)
     return Secret(**d)
 
