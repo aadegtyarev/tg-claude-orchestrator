@@ -75,6 +75,11 @@ class OrchestratorCore:
         self._texts = get_texts(config.bot_lang)
         self.adapters: dict[str, Transport] = {}
         self.modules: list = []  # модули (modules/*) — start/stop вместе с ядром
+        # Редакторы исходящего в чат текста (reply/notice/бабл): модули вымарывают
+        # свои значения. wallet чистит значения секретов (shared модель видит и
+        # может случайно эхнуть — safety-net, чтобы не улетело в Telegram). Пусто
+        # без модулей → _scrub бесплатный no-op.
+        self.output_redactors: list[Callable[[str], str]] = []
         self.bubbles = BubbleManager(
             self._transports, manager.get, self.t, config.delete_bubble,
             unblock_available=self._unblock_available,
@@ -216,8 +221,20 @@ class OrchestratorCore:
 
     # ── доставка во все адаптеры ────────────────────────────────
 
+    def _scrub(self, text: str) -> str:
+        """Прогнать текст через редакторы модулей (вымарать значения секретов).
+        No-op, если редакторов нет (кошелёк выключен). getattr — для фикстур,
+        строящих core через __new__ без полного __init__."""
+        for redactor in getattr(self, "output_redactors", ()):
+            try:
+                text = redactor(text)
+            except Exception:
+                logger.exception("output redactor")
+        return text
+
     async def notice(self, session: Session | None, text: str) -> None:
         """Служебное сообщение (сторож, релей ошибок, смерть сессии…)."""
+        text = self._scrub(text)
         if session is not None:
             self._record(session, "notice", text=text)
         for tr in self._transports():
@@ -238,6 +255,7 @@ class OrchestratorCore:
     async def _deliver_text(
         self, session: Session, text: str, origin: Origin | None, intermediate: bool
     ) -> None:
+        text = self._scrub(text)
         self._record(
             session, "intermediate" if intermediate else "reply", text=text
         )
@@ -720,10 +738,12 @@ class OrchestratorCore:
         collapsible = tool not in AGENT_SPAWN_TOOLS and tool != "TodoWrite"
         await self.bubbles.append(
             session.name,
-            tool_line(tool, tool_input, self.t),
+            # Вымарываем значения секретов: команда-инпут (напр. `echo <shared>`
+            # или запись ключа в .env) не должна светить значение в Telegram.
+            self._scrub(tool_line(tool, tool_input, self.t)),
             agent_id=str(agent_id) if agent_id else None,
             tool=tool if collapsible else None,
-            full_html=tool_line_full(tool, tool_input),  # текущий bash — полно
+            full_html=self._scrub(tool_line_full(tool, tool_input)),
             tool_use_id=str(payload.get("tool_use_id") or ""),  # для PostToolUse
         )
 

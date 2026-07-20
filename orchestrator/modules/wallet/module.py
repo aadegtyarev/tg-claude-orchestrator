@@ -378,6 +378,20 @@ class WalletModule:
         core.session_hooks.append(self._provision)
         # Авто-инъект shared-секретов (inject_at_start) в env процесса claude.
         core.manager.env_hooks.append(self.session_env)
+        # Вымарывать значения секретов из чат-вывода (shared модель видит и может
+        # случайно эхнуть — safety-net, чтобы не улетело в Telegram/историю).
+        core.output_redactors.append(self.redact_output)
+
+    def redact_output(self, text: str) -> str:
+        """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
+        нет. Длинные первыми — вложенные не оставляют хвостов."""
+        for v in sorted(
+            (s.value for s in self.store.load().values() if s.value),
+            key=len, reverse=True,
+        ):
+            if v in text:
+                text = text.replace(v, REDACTED)
+        return text
 
     def session_env(self, session) -> dict[str, str]:
         """env для авто-инъекта в песочницу сессии: shared-секреты с
@@ -397,6 +411,10 @@ class WalletModule:
                 pass
             try:
                 self.core.manager.env_hooks.remove(self.session_env)
+            except ValueError:
+                pass
+            try:
+                self.core.output_redactors.remove(self.redact_output)
             except ValueError:
                 pass
         if self._runner is not None:

@@ -114,6 +114,19 @@ async def run():
     assert env == {"OPENAI_API_KEY": "KEYVAL"}, env
     print("OK session_env: только shared+inject_at_start+env+доступ попадают в env")
 
+    # redact_output: значения (shared/inject) вымарываются из чат-текста.
+    st4 = _store(
+        '[secrets.a]\nshared=true\nvalue="SHARED-VAL-123"\nsessions=["*"]\n\n'
+        '[secrets.b]\nvalue="INJ-VAL"\nenv="T"\nsessions=["*"]\ncommands=["gh"]\n\n'
+        '[secrets.h]\nsessions=["*"]\ncommands=["gh"]\n'  # host: значения нет
+    )
+    m4 = WalletModule.__new__(WalletModule)
+    m4.store = st4
+    scrubbed = m4.redact_output("ключ SHARED-VAL-123 и токен INJ-VAL в тексте")
+    assert "SHARED-VAL-123" not in scrubbed and "INJ-VAL" not in scrubbed
+    assert scrubbed.count("•••") == 2, scrubbed
+    print("OK redact_output: значения shared/inject → •••")
+
 
 def main():
     asyncio.run(run())

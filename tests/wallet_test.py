@@ -85,6 +85,7 @@ def make_env(tmp: Path):
             env_hooks=[],
         ),
         session_hooks=[],
+        output_redactors=[],
         # has()=False → бабла нет (как фоновый вызов) → notice всегда шлётся,
         # чтобы тест проверял путь уведомления/редакции.
         bubbles=SimpleNamespace(
