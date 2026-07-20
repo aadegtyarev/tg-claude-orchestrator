@@ -146,6 +146,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | `SANDBOX` | `bwrap` | `bwrap` / `agent-vm` (эксперимент) / `off` |
 | `SANDBOX_EXTRA_RW` | — | Доп. RW-пути из песочницы (через `:`) |
 | `SANDBOX_DBUS` | `true` | Проброс **всего** system D-Bus в песочницу (для mDNS/`.local`/avahi-browse); `off` — запретить |
+| `SANDBOX_X11` | `off` | Проброс X/Wayland в песочницу; по умолчанию вырезан (`DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY`), чтобы процесс не дёргал хостовый GUI; `1` — оставить |
 | `AGENT_VM_MEMORY_GIB`/`_CPUS`/`_IMAGE` | — | Ресурсы/пин образа microVM |
 | `BOT_LANG` | `ru` | Язык сообщений: `ru` / `en` |
 | `IDLE_TIMEOUT_H` | 6 | Авто-останов после N ч простоя (0 — выкл.) |
@@ -205,6 +206,12 @@ Code (только Bash-тул), обёртка накрывает все инс
 только Avahi: systemd/logind/NetworkManager тоже, read-методы работают,
 мутации под polkit). `SANDBOX_DBUS=off` запрещает его (базовый `.local`-резолв
 хоста остаётся — он идёт multicast'ом без D-Bus).
+
+Поскольку сеть общая, абстрактный сокет X-сервера достижим из песочницы даже
+при tmpfs `/tmp`. Поэтому **X/Wayland по умолчанию вырезан** (`DISPLAY`/
+`XAUTHORITY`/`WAYLAND_DISPLAY` убираются) — иначе процесс в песочнице мог бы
+дёрнуть хостовый GUI (askpass-диалоги, скриншоты, перехват ввода).
+`SANDBOX_X11=1` оставляет X, если он реально нужен.
 
 `SANDBOX=agent-vm` — сессии в microVM через
 [wirenboard/agent-vm](https://github.com/wirenboard/agent-vm): жёсткая

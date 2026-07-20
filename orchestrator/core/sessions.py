@@ -530,6 +530,15 @@ class SessionManager:
         """
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        # Под bwrap по умолчанию вырезаем доступ к X/Wayland: сеть у песочницы
+        # общая с хостом, поэтому абстрактный сокет X-сервера (@/tmp/.X11-unix/X0)
+        # достижим даже при tmpfs /tmp — с $DISPLAY процесс в песочнице мог бы
+        # дёрнуть хостовый GUI (диалоги askpass, скриншоты, ввод). CLI-режиму X не
+        # нужен; убираем переменные, чтобы клиенты не знали, куда подключаться.
+        # SANDBOX_X11=1 оставляет X (если модели он реально нужен).
+        if self.config.sandbox == "bwrap" and not self.config.sandbox_x11:
+            for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
+                env.pop(var, None)
         # CLI-обвязка оркестратора (bin/wallet и т.п.): репозиторий RO-виден
         # и в песочнице, поэтому PATH работает и там. Модульные path_hooks
         # (напр. обёртки-шлюз кошелька) кладём ещё раньше — они должны побеждать
