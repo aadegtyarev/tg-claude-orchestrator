@@ -136,6 +136,22 @@ class OrchestratorCore:
     def _transports(self) -> list[Transport]:
         return list(self.adapters.values())
 
+    async def _each_transport(self, action, label: str, *, warn: bool = False) -> None:
+        """Выполнить `action(tr)` на каждом транспорте, изолируя сбой одного
+        адаптера от прочих (per-adapter try/except — единая точка). `warn=True` —
+        короткий logger.warning для ОЖИДАЕМОГО сбоя доставки (сеть/адаптер);
+        иначе logger.exception со стеком для неожиданного. `_deliver_text`/
+        `_send_file`/`_typing_any` НЕ идут через этот хелпер: они фильтруют origin
+        и агрегируют возврат."""
+        for tr in self._transports():
+            try:
+                await action(tr)
+            except Exception as e:
+                if warn:
+                    logger.warning("%s через %s: %s", label, tr.name, e)
+                else:
+                    logger.exception("%s через %s", label, tr.name)
+
     async def start(self) -> None:
         for tr in self._transports():
             await tr.start()
@@ -237,11 +253,7 @@ class OrchestratorCore:
         text = self._scrub(text)
         if session is not None:
             self._record(session, "notice", text=text)
-        for tr in self._transports():
-            try:
-                await tr.notify(session, text)
-            except Exception as e:
-                logger.warning("notify через %s: %s", tr.name, e)
+        await self._each_transport(lambda tr: tr.notify(session, text), "notify", warn=True)
 
     async def _typing_any(self, session: Session) -> bool:
         alive = False
@@ -392,11 +404,9 @@ class OrchestratorCore:
         не ломает операцию. Источник — ядро, поэтому изменение из любого
         адаптера / idle / смерти доходит до всех (раньше веб обновлял список
         только после СВОИХ REST и залипал на чужих переходах)."""
-        for tr in self._transports():
-            try:
-                await tr.session_state_changed(session)
-            except Exception:
-                logger.exception("Адаптер %s: session_state_changed", tr.name)
+        await self._each_transport(
+            lambda tr: tr.session_state_changed(session), "session_state_changed"
+        )
 
     async def close_session(self, session: Session) -> None:
         await self._teardown_runtime(session)
@@ -980,11 +990,9 @@ class OrchestratorCore:
             request_id=request.request_id, tool=request.tool,
             description=request.description, preview=request.preview,
         )
-        for tr in self._transports():
-            try:
-                await tr.permission_prompt(session, request)
-            except Exception:
-                logger.exception("permission_prompt через %s", tr.name)
+        await self._each_transport(
+            lambda tr: tr.permission_prompt(session, request), "permission_prompt"
+        )
 
     async def request_confirmation(
         self,
@@ -1010,11 +1018,9 @@ class OrchestratorCore:
             request_id=request_id, tool=tool, description=description,
             preview=request.preview,
         )
-        for tr in self._transports():
-            try:
-                await tr.permission_prompt(session, request)
-            except Exception:
-                logger.exception("permission_prompt (local) через %s", tr.name)
+        await self._each_transport(
+            lambda tr: tr.permission_prompt(session, request), "permission_prompt (local)"
+        )
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -1029,11 +1035,10 @@ class OrchestratorCore:
         self, session: Session, request_id: str, behavior: str, via: str
     ) -> None:
         self._record(session, "perm_resolved", request_id=request_id, behavior=behavior)
-        for tr in self._transports():
-            try:
-                await tr.permission_resolved(session, request_id, behavior, via)
-            except Exception:
-                logger.exception("permission_resolved через %s", tr.name)
+        await self._each_transport(
+            lambda tr: tr.permission_resolved(session, request_id, behavior, via),
+            "permission_resolved",
+        )
 
     async def permission_verdict(
         self, session: Session, request_id: str, behavior: str, via: str
@@ -1442,13 +1447,12 @@ class OrchestratorCore:
         """Сообщить во все адаптеры, что оркестратор онлайн."""
         config_dir = self.config.claude_config_dir or Path.home() / ".claude"
         base_url = self.config.claude_env.get("ANTHROPIC_BASE_URL") or self.t("url_default")
-        for tr in self._transports():
-            try:
-                await tr.notify(
-                    None, self.t("startup", n=restored, config=config_dir, url=base_url)
-                )
-            except Exception as e:
-                logger.warning("Стартовое уведомление через %s: %s", tr.name, e)
+        await self._each_transport(
+            lambda tr: tr.notify(
+                None, self.t("startup", n=restored, config=config_dir, url=base_url)
+            ),
+            "Стартовое уведомление", warn=True,
+        )
 
     # ── форматирование ──────────────────────────────────────────
 

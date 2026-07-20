@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import functools
 import html
 import json
 import logging
@@ -53,6 +54,7 @@ from .policy import PolicyEditor, PolicyError
 
 if TYPE_CHECKING:
     from ...config import Config
+    from ...core.sessions import Session
 
 logger = logging.getLogger(__name__)
 
@@ -317,13 +319,26 @@ class SecretStore:
         return self._secrets
 
 
-def _redact(data: bytes, values: list[str]) -> str:
-    """Вывод команды → строка без значений секретов, обрезанная по лимиту.
+def _authed(handler):
+    """Декоратор wallet-роут-хендлеров: резолвит сессию через `_auth`, отдаёт 401
+    если Bearer-токен не признан, иначе зовёт хендлер с готовым `session`. Единая
+    точка 401-политики на все 4 роута (/secrets, /run, /exec, /get)."""
+    @functools.wraps(handler)
+    async def wrapper(self, request: web.Request) -> web.Response:
+        session = self._auth(request)
+        if session is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(self, request, session)
+    return wrapper
 
-    Заменяем значения ВСЕХ известных секретов (не только запрошенного):
-    `gh auth status --show-token` и подобное не должно выносить соседний
-    секрет. Длинные значения первыми — чтобы вложенные не оставляли хвостов.
-    Редакция строго ДО обрезки: обрезка могла бы разрезать значение пополам.
+
+def _redact_text(text: str, values) -> str:
+    """Заменить в строке значения ВСЕХ переданных секретов на `REDACTED`.
+
+    Единый примитив редакции для `_redact` (вывод команд, bytes) и
+    `WalletModule.redact_output` (чат-вывод, str) — расхождение реализаций
+    означало бы тихую утечку секрета в одном из путей. Длинные значения
+    первыми — чтобы вложенные не оставляли хвостов; пустые пропускаем.
 
     ВАЖНО: это ГИГИЕНА против СЛУЧАЙНОГО эха, НЕ барьер. Замена только точных
     вхождений — любая трансформация (base64/hex/reverse, запись в файл, вывод
@@ -331,9 +346,20 @@ def _redact(data: bytes, values: list[str]) -> str:
     (значения секрета вообще нет в пространстве модели) + не давать шелл в
     `commands` секрета. См. модель угроз в docs/REVIEW-2026-07-19.md §1.
     """
-    text = data.decode("utf-8", errors="replace")
     for value in sorted((v for v in values if v), key=len, reverse=True):
         text = text.replace(value, REDACTED)
+    return text
+
+
+def _redact(data: bytes, values: list[str]) -> str:
+    """Вывод команды → строка без значений секретов, обрезанная по лимиту.
+
+    Заменяем значения ВСЕХ известных секретов (не только запрошенного):
+    `gh auth status --show-token` и подобное не должно выносить соседний
+    секрет. Редакция строго ДО обрезки: обрезка могла бы разрезать значение
+    пополам.
+    """
+    text = _redact_text(data.decode("utf-8", errors="replace"), values)
     if len(text) > STREAM_LIMIT:
         text = text[:STREAM_LIMIT] + "\n…(обрезано)"
     return text
@@ -423,14 +449,8 @@ class WalletModule:
 
     def redact_output(self, text: str) -> str:
         """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
-        нет. Длинные первыми — вложенные не оставляют хвостов."""
-        for v in sorted(
-            (s.value for s in self.store.load().values() if s.value),
-            key=len, reverse=True,
-        ):
-            if v in text:
-                text = text.replace(v, REDACTED)
-        return text
+        нет. Общий примитив с `_redact` — см. `_redact_text`."""
+        return _redact_text(text, [s.value for s in self.store.load().values()])
 
     def session_env(self, session) -> dict[str, str]:
         """env для песочницы сессии — чтобы модель писала привычный `$ENV`:
@@ -470,24 +490,20 @@ class WalletModule:
         except OSError as e:
             logger.error("wallet: не удалось создать дефолтный %s: %s", path, e)
 
+    @staticmethod
+    def _discard(seq: list, item) -> None:
+        """Снять хук из списка, молча стерпев отсутствие (идемпотентный stop)."""
+        try:
+            seq.remove(item)
+        except ValueError:
+            pass
+
     async def stop(self) -> None:
         if self.core is not None:
-            try:
-                self.core.session_hooks.remove(self._provision)
-            except ValueError:
-                pass
-            try:
-                self.core.manager.path_hooks.remove(self.session_path)
-            except ValueError:
-                pass
-            try:
-                self.core.manager.env_hooks.remove(self.session_env)
-            except ValueError:
-                pass
-            try:
-                self.core.output_redactors.remove(self.redact_output)
-            except ValueError:
-                pass
+            self._discard(self.core.session_hooks, self._provision)
+            self._discard(self.core.manager.path_hooks, self.session_path)
+            self._discard(self.core.manager.env_hooks, self.session_env)
+            self._discard(self.core.output_redactors, self.redact_output)
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -633,11 +649,9 @@ class WalletModule:
             return None
         return self.core.manager.get(found)
 
-    async def _handle_secrets(self, request: web.Request) -> web.Response:
+    @_authed
+    async def _handle_secrets(self, request: web.Request, session: Session) -> web.Response:
         """Список секретов, разрешённых этой сессии, — БЕЗ значений."""
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
         out = [
             {
                 "name": s.name,
@@ -655,14 +669,12 @@ class WalletModule:
         ]
         return web.json_response(out)
 
-    async def _handle_get(self, request: web.Request) -> web.Response:
+    @_authed
+    async def _handle_get(self, request: web.Request, session: Session) -> web.Response:
         """Выдать сессии ЗНАЧЕНИЕ shared-секрета (dev-ключ, логин/пароль).
 
         Только для shared — host/inject значения не выдаются НИКОГДА (в этом их
         смысл). shared — про хранение вне чата/репо, не про сокрытие от модели."""
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             data = await request.json()
         except Exception:
@@ -703,11 +715,9 @@ class WalletModule:
             {"name": name, "env": secret.env or None, "value": secret.value}
         )
 
-    async def _handle_run(self, request: web.Request) -> web.Response:
+    @_authed
+    async def _handle_run(self, request: web.Request, session: Session) -> web.Response:
         """Явный вызов: `wallet run <name> -- <cmd>` — секрет задан именем."""
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
             name = str(body["secret"])
@@ -718,13 +728,11 @@ class WalletModule:
             return web.json_response({"error": "bad request"}, status=400)
         return await self._run_secret(session, self.store.load().get(name), cmd, name)
 
-    async def _handle_exec(self, request: web.Request) -> web.Response:
+    @_authed
+    async def _handle_exec(self, request: web.Request, session: Session) -> web.Response:
         """Прозрачный шлюз: `wallet exec <cmd>` (зовут обёртки в PATH песочницы)
         — секрет подбирается ПО КОМАНДЕ (чей `commands` её разрешает). Модель
         зовёт инструмент как обычно."""
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
             cmd = [str(c) for c in body["cmd"]]
