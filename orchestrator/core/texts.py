@@ -12,6 +12,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new имя /путь</code> — то же, со своим именем\n"
             "• <code>/list</code> — сессии со статусами и кнопками\n"
             "• <code>/ls [путь]</code> — показать файлы\n"
+            "• <code>/wallet</code> — policy кошелька (просмотр/правка; значения скрыты)\n"
             "• <code>/skills</code> — список скиллов\n"
             "• <code>/chat_id</code> — ID чата и привязка бота\n\n"
             "В топике сессии:\n"
@@ -163,6 +164,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "по умолчанию (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "отказано (policy/подтверждение)",
+        "wallet_disabled": "🔐 Кошелёк не подключён (MODULES=wallet). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
         "sendfile_denied": "⛔ Не отправляю: файл вне рабочей папки сессии ({path}). send_file_to_user разрешён только для файлов проекта/сессии — защита от утечки секретов.",
@@ -187,6 +189,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_new": "Новая сессия (имя или /путь)",
         "menu_list": "Список сессий",
         "menu_ls": "Показать файлы",
+        "menu_wallet": "Кошелёк: policy секретов",
         "menu_stats": "Контекст и статистика сессии",
         "menu_usage": "Расходы и лимиты плана",
         "menu_model": "Модель сессии (fable/opus/sonnet/haiku)",
@@ -224,6 +227,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new name /path</code> — same, with a custom name\n"
             "• <code>/list</code> — sessions with statuses and buttons\n"
             "• <code>/ls [path]</code> — list files\n"
+            "• <code>/wallet</code> — wallet policy (view/edit; values hidden)\n"
             "• <code>/skills</code> — list skills\n"
             "• <code>/chat_id</code> — chat ID and bot binding\n\n"
             "In a session topic:\n"
@@ -375,6 +379,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "default (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "denied (policy/confirmation)",
+        "wallet_disabled": "🔐 Wallet not enabled (MODULES=wallet). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
         "sendfile_denied": "⛔ Refused: the file is outside the session workspace ({path}). send_file_to_user is allowed only for project/session files — this prevents secret exfiltration.",
@@ -399,6 +404,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_new": "New session (name or /path)",
         "menu_list": "List sessions",
         "menu_ls": "List files",
+        "menu_wallet": "Wallet: secrets policy",
         "menu_stats": "Session context and stats",
         "menu_usage": "Cost and plan limits",
         "menu_model": "Session model (fable/opus/sonnet/haiku)",

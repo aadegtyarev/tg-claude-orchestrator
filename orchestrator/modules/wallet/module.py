@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from .policy import PolicyEditor, PolicyError
+
 if TYPE_CHECKING:
     from ...config import Config
 
@@ -274,12 +276,24 @@ class WalletModule:
     def __init__(self, config: "Config"):
         self.config = config
         self.store = SecretStore(config.wallet_secrets_file)
+        # Правка policy из бота (/wallet) — просмотр + sessions/commands/deny/
+        # confirm/new/rm; значения токенов не показывает и не принимает.
+        self.policy = PolicyEditor(config.wallet_secrets_file)
         self.core = None
         self.port: int | None = None
         self._runner: web.AppRunner | None = None
         # Токен → имя сессии. Session-объект резолвим на каждый запрос через
         # manager.get: сессия могла быть удалена после выдачи токена.
         self._tokens: dict[str, str] = {}
+
+    def handle_command(self, args_str: str) -> str:
+        """`/wallet <args>` — просмотр/правка policy кошелька (HTML-текст).
+        Ошибки policy возвращаем текстом (не исключением) — ядру не нужно знать
+        внутренние типы модуля."""
+        try:
+            return self.policy.apply((args_str or "").split())
+        except PolicyError as e:
+            return f"⚠️ {e}"
 
     # ── жизненный цикл ──────────────────────────────────────────
 

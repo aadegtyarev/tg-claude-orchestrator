@@ -429,6 +429,15 @@ class OrchestratorCore:
         await self._notify_state_changed(session)
         return resumed
 
+    def wallet_command(self, args_str: str) -> str:
+        """`/wallet …` — просмотр/правка policy кошелька. Ядро находит модуль
+        `wallet` по имени (как прочие команды; полный реестр команд модулей —
+        отложенный §3-рефактор). UserError, если кошелёк не подключён."""
+        mod = next((m for m in self.modules if getattr(m, "name", "") == "wallet"), None)
+        if mod is None:
+            raise UserError(self.t("wallet_disabled"))
+        return mod.handle_command(args_str)
+
     async def ensure_running(self, session: Session) -> str:
         """Возобновить остановленную сессию. Возвращает running|resumed|fresh."""
         if session.running:

@@ -71,6 +71,7 @@ class TelegramAdapter:
             BotCommand(command="new", description=self.t("menu_new")),
             BotCommand(command="list", description=self.t("menu_list")),
             BotCommand(command="ls", description=self.t("menu_ls")),
+            BotCommand(command="wallet", description=self.t("menu_wallet")),
             BotCommand(command="stats", description=self.t("menu_stats")),
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
@@ -379,6 +380,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_new, Command("new"))
         dp.message.register(self.cmd_list, Command("list"))
         dp.message.register(self.cmd_ls, Command("ls"))
+        dp.message.register(self.cmd_wallet, Command("wallet"))
         dp.message.register(self.cmd_close, Command("close_session", "stop"))
         dp.message.register(self.cmd_delete, Command("delete_session"))
         dp.message.register(self.cmd_compact, Command("compact"))
@@ -526,6 +528,16 @@ class TelegramAdapter:
         if not self._accept(message):
             return
         await message.reply(self.core.ls_text(command.args))
+
+    async def cmd_wallet(self, message: Message, command: CommandObject) -> None:
+        """Policy кошелька: просмотр/правка (значения токенов не показываются)."""
+        if not self._accept(message):
+            return
+        try:
+            text = self.core.wallet_command(command.args or "")
+        except UserError as e:
+            text = str(e)
+        await message.reply(text, parse_mode="HTML")
 
     async def cmd_skills(self, message: Message) -> None:
         if not self._accept(message):
