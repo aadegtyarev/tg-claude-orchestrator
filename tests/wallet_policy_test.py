@@ -79,7 +79,10 @@ def test_edits_persist_and_keep_comments():
     ed.apply(["deny", "host", "+--force"])
     ed.apply(["new", "proj"])
     ed.apply(["rm", "tok"])
-    import tomllib
+    try:
+        import tomllib  # stdlib с 3.11
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
     d = tomllib.loads(p.read_text())
     s = d["secrets"]
     assert s["host"]["confirm"] is True
