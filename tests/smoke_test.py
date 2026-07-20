@@ -30,6 +30,22 @@ def test_split_text():
     print("OK split_text")
 
 
+def test_md_table():
+    from orchestrator.core.mdrender import md_to_html
+    md = "| a | b |\n|---|---|\n| 1 | longcell |\n| 22 | x |"
+    out = md_to_html(md)
+    assert "<pre>" in out and "</pre>" in out, out
+    # колонки выровнены (моношрифт): "1 " добито под ширину "22".
+    assert "a  | b       " in out, out          # шапка добита под ширину колонок
+    assert "1  | longcell" in out and "22 | x" in out, out
+    # обычная строка с | (без разделителя) — не таблица, не оборачивается
+    assert "<pre>" not in md_to_html("cd /a | grep b")
+    # таблица внутри код-блока не пере-форматируется (одно <pre>, как есть)
+    fenced = md_to_html("```\n| a | b |\n|---|---|\n```")
+    assert fenced.count("<pre>") == 1 and "|---|---|" in fenced
+    print("OK md-таблица → выровненный <pre>; обычный | и код-блок не тронуты")
+
+
 def test_texts():
     from orchestrator.core.texts import MESSAGES
     assert set(MESSAGES["ru"]) == set(MESSAGES["en"]), \
@@ -124,6 +140,7 @@ async def _run_channel_server():
 
 if __name__ == "__main__":
     test_split_text()
+    test_md_table()
     test_texts()
     test_config()
     asyncio.run(test_channel_server())

@@ -23,6 +23,57 @@ _ITALIC_RE = re.compile(r"(?<![\w*])_(?!\s)(.+?)(?<!\s)_(?![\w*])", re.DOTALL)
 _PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
 
 
+def _is_table_sep(line: str) -> bool:
+    """Разделитель markdown-таблицы: `|---|:--:|` (только -, :, |, пробелы)."""
+    s = line.strip()
+    return bool(s) and "-" in s and set(s) <= set("|-: ")
+
+
+def _table_cells(line: str) -> list[str]:
+    """Ячейки строки таблицы (внешние пайпы отрезаны, `\\|` → литеральный |)."""
+    parts = [c.replace("\x01", "|").strip() for c in line.replace("\\|", "\x01").split("|")]
+    if parts and parts[0] == "":
+        parts = parts[1:]
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return parts
+
+
+def _render_table(lines: list[str]) -> str:
+    """Строки md-таблицы → выровненный моноширинный текст (экранированный)."""
+    rows = [_table_cells(lines[0])] + [_table_cells(ln) for ln in lines[2:]]
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    widths = [max(len(r[c]) for r in rows) for c in range(ncol)]
+
+    def fmt(r: list[str]) -> str:
+        return " | ".join(r[c].ljust(widths[c]) for c in range(ncol))
+
+    sep = "-+-".join("-" * w for w in widths)
+    body = "\n".join(fmt(r) for r in rows[1:])
+    return html.escape(f"{fmt(rows[0])}\n{sep}\n{body}".rstrip())
+
+
+def _reformat_tables(text: str, keep) -> str:
+    """Найти md-таблицы (шапка + разделитель + тело) и заменить на выровненный
+    <pre>-блок — Telegram таблиц не умеет, а моношрифт держит колонки ровно."""
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if ("|" in lines[i] and i + 1 < len(lines) and _is_table_sep(lines[i + 1])
+                and lines[i].strip()):
+            j = i + 2
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                j += 1
+            out.append(keep(_render_table(lines[i:j]), "pre"))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 def split_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> list[str]:
     """Разбить текст под лимит Telegram, по возможности по переводу строки."""
     chunks = []
@@ -48,6 +99,9 @@ def md_to_html(text: str) -> str:
 
     text = _CODE_BLOCK_RE.sub(lambda m: _keep(html.escape(m.group(1)), "pre"), text)
     text = _CODE_INLINE_RE.sub(lambda m: _keep(html.escape(m.group(1)), "code"), text)
+    # md-таблицы → выровненный <pre> (после выноса кода: таблицу внутри ``` не
+    # трогаем, она уже в stash). До html.escape — _render_table экранирует сам.
+    text = _reformat_tables(text, _keep)
     text = html.escape(text)
     text = _BOLD_RE.sub(r"<b>\1</b>", text)
     text = _STRIKE_RE.sub(r"<s>\1</s>", text)
