@@ -19,6 +19,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.turn import TurnSupervisor  # noqa: E402
 
 SESSION = SimpleNamespace(name="noos")
@@ -37,7 +38,7 @@ def make_core():
     core.manager = FakeMgr()
     core._texts = {}
     core._history = {}
-    core._last_tool = {}
+    core.tools = ToolActivity()
     core.adapters = {}
     # Реальный TurnSupervisor: проверяем настоящий Stop-гейт (note_tool/
     # pop_reply_flag), доставка — заглушки.

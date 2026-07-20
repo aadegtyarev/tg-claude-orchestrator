@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
+from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.turn import TurnSupervisor  # noqa: E402
 
 
@@ -68,7 +69,7 @@ def make_core(bm: BubbleManager) -> OrchestratorCore:
         "subagent_done": "✅ Сабагент завершил · {model}",
         "subagent_done_nomodel": "✅ Сабагент завершил",
     }
-    core._last_tool = {}
+    core.tools = ToolActivity()
     core._agent_types = {}
     core._agent_spawns = {}
     core.bubbles = bm

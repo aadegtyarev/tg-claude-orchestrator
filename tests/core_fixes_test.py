@@ -17,8 +17,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import orchestrator.core.app as appmod  # noqa: E402
+from orchestrator.core import toolactivity  # noqa: E402
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
 from orchestrator.core.turn import TurnSupervisor  # noqa: E402
@@ -45,9 +46,7 @@ def make_core():
     core._texts = get_texts("ru")
     core.config = SimpleNamespace(max_instances=5)
     core._history = {}
-    core._last_tool = {}
-    core._inflight_tools = {}
-    core._inflight_cleared_at = {}
+    core.tools = ToolActivity()
     core._agent_types = {}
     core._agent_spawns = {}
     core.adapters = {}
@@ -112,7 +111,7 @@ async def test_taskoutput_and_bg_available():
                                           "tool_response": {}})
     assert core._unblock_available("noos") is True, "grace: сразу после Post ещё активна"
     # Grace истёк (нет тулов дольше окна) → ⏭ гаснет.
-    core._inflight_cleared_at["noos"] = time.monotonic() - appmod.UNBLOCK_GRACE - 1
+    core.tools._cleared_at["noos"] = time.monotonic() - toolactivity.UNBLOCK_GRACE - 1
     assert core._unblock_available("noos") is False, "grace истёк — ⏭ гаснет"
     # TaskOutput → «ждёт фон»: строка в бабле + ⏭ активна (пнуть Esc'ом).
     await core.handle_tool_event("noos", {"tool_name": "TaskOutput", "tool_input": {}})
@@ -120,8 +119,8 @@ async def test_taskoutput_and_bg_available():
     assert core._unblock_available("noos") is True, "ожидание фона можно прервать"
     assert core.unblock_action("noos") == "kick"
     # Простой (нет тула в работе, не ждёт фон) → ⏭ неактивна.
-    core._inflight_tools.pop("noos", None)
-    core._last_tool["noos"] = "Read"
+    core.tools.forget("noos")
+    core.tools.note_tool("noos", "Read")
     assert core._unblock_available("noos") is False
     print("OK ⏭ разблокировка: Bash-inflight→background, Post→гаснет, TaskOutput→kick, покой→неактивна")
 
@@ -273,12 +272,12 @@ async def test_teardown_runtime_unified():
     # сабагентов (agent_types/spawns — иначе имя чужого сабагента прилипнет к
     # следующему). Arrange пишет в поля напрямую; при выносе состояния в HookTracker
     # эти строки переедут на hooks.* — assert'ы поведенческие/по наблюдаемому.
-    # ВАЖНО: _inflight_cleared_at ставим на time.monotonic() (свежий grace-хвост),
-    # а не 0.0: иначе _foreground_tool_active вернул бы False и без очистки — тест
-    # был бы ложно-зелёным на регресс grace-pop.
-    core._last_tool["noos"] = "TaskOutput"                 # → был бы "kick"
-    core._inflight_tools["noos"] = {"t1"}                  # → был бы "background"
-    core._inflight_cleared_at["noos"] = time.monotonic()  # свежий grace-хвост
+    # ВАЖНО: grace-хвост ставим свежим (start→finish даёт _cleared_at=now), а не
+    # протухшим: иначе foreground_active вернул бы False и без очистки — тест был
+    # бы ложно-зелёным на регресс grace-очистки в forget().
+    core.tools.note_tool("noos", "TaskOutput")  # → был бы "kick"
+    core.tools.start("noos", "t1")
+    core.tools.finish("noos", "t1")             # inflight пуст, _cleared_at=now (grace)
     core._agent_types["noos"] = {"a1": "dev-planner"}
     core._agent_spawns["noos"] = ["dev-builder"]
     await core._teardown_runtime(SESSION)
@@ -291,9 +290,8 @@ async def test_teardown_runtime_unified():
 
     # Продолжение (clear/switch): forget_turn + НЕ трогаем bash.
     events.clear()
-    core._last_tool["noos"] = "Read"
-    core._inflight_tools["noos"] = {"t2"}
-    core._inflight_cleared_at["noos"] = time.monotonic()
+    core.tools.note_tool("noos", "Read")
+    core.tools.start("noos", "t2")  # in-flight → был бы "background"
     await core._teardown_runtime(SESSION, close_bash=False, forget_turn=True)
     assert ("forget", "noos") in events
     assert not any(e[0] == "bash" for e in events), events
