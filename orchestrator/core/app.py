@@ -34,6 +34,7 @@ from .bubble import BubbleManager
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
 from .texts import get_texts
+from .toolactivity import ToolActivity
 from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line, tool_line_full
 from .transcript import read_last_model
 from .transport import Origin, PermissionRequest, Transport
@@ -62,10 +63,6 @@ MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 
 # Сколько последних событий сессии держать в журнале (история веб-интерфейса).
 HISTORY_LIMIT = 300
-# Сколько секунд держать кнопку ⏭ активной ПОСЛЕ завершения последнего тула —
-# дебаунс против мигания на паузах-размышлениях между быстрыми тулами. Кнопка
-# гаснет, только если foreground-тулов нет дольше этого окна (или ход завершился).
-UNBLOCK_GRACE = 4.0
 
 
 class UserError(Exception):
@@ -89,20 +86,10 @@ class OrchestratorCore:
             unblock_available=self._unblock_available,
             persist_path=config.sessions_dir / ".live_bubbles.json",
         )
-        # Последний значимый тул на сессию — для детекта состояния «ждёт
-        # фоновую задачу» (TaskOutput) и активности кнопки ⏬.
-        self._last_tool: dict[str, str] = {}
-        # tool_use_id'ы тулов, СЕЙЧАС идущих в ходе (PreToolUse без PostToolUse) —
-        # на сессию. Это авторитетный сигнал «идёт foreground-команда» вместо
-        # скана /proc: под bwrap у процесса сессии всегда есть дочерний процесс
-        # (внутренний bwrap pid-ns init), поэтому has_children там структурно
-        # всегда True — кнопка ⏭ висела бы вечно, а вотчдог всегда считал бы сессию
-        # живой. Хуки же точно бракетят реальное исполнение тула.
-        self._inflight_tools: dict[str, set[str]] = {}
-        # monotonic-время, когда in-flight множество стало пустым — для
-        # grace-дебаунса кнопки ⏭ (UNBLOCK_GRACE): паузы-размышления между тулами
-        # не гасят её и не мигают.
-        self._inflight_cleared_at: dict[str, float] = {}
+        # Активность инструментов сессии (кнопка ⏭ + сигнал жизни для вотчдога) —
+        # см. core/toolactivity.py. Кормится из hook-хендлеров, читается кнопкой/
+        # вотчдогом, снимается одним forget(name) на границе хода/teardown.
+        self.tools = ToolActivity()
         # agent_id → тип сабагента (dev-planner/…), на сессию. Наполняется из
         # дочерних тул-событий (в payload есть agent_id+agent_type) и из спавн-
         # строки (subagent_type). Нужно, чтобы «✅ Сабагент завершил» назвал
@@ -117,7 +104,7 @@ class OrchestratorCore:
         # единым владельцем (turn.py). Доставка — колбэками в адаптеры.
         self.turns = TurnSupervisor(
             manager, self.t, self.notice, self._typing_any, self.bubbles.set_status,
-            tool_inflight=lambda name: bool(self._inflight_tools.get(name)),
+            tool_inflight=self.tools.inflight,
         )
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
@@ -394,10 +381,10 @@ class OrchestratorCore:
         висящие permission-кнопки во всех адаптерах, bg-состояние кнопки ⏭,
         статус-бабл и (для терминальных остановок) bash-оболочки.
 
-        Раньше эта последовательность дублировалась в 5+ местах (close/delete/
-        clear/switch_model/dead/idle) и УЖЕ разъехалась — idle гасил
-        `_last_tool`, остальные нет; drop не всегда гасил кнопки. Один метод
-        держит их согласованными.
+        Единая точка вместо дублирования в 5+ местах (close/delete/clear/
+        switch_model/dead/idle), которое раньше уже разъезжалось (часть очисток
+        забывалась). Per-session состояние снимается через владельцев: активность
+        тула — `tools.forget`, именование сабагентов — `_agent_types/_agent_spawns`.
 
         close_bash=False — сессия продолжится (clear/switch_model перезапускают
         Claude в той же папке), терминалы /bash не трогаем. forget_turn=True —
@@ -407,9 +394,7 @@ class OrchestratorCore:
         else:
             self.turns.stop(session.name)
         await self._drop_pending_perms(session)
-        self._last_tool.pop(session.name, None)
-        self._inflight_tools.pop(session.name, None)
-        self._inflight_cleared_at.pop(session.name, None)
+        self.tools.forget(session.name)
         self._agent_types.pop(session.name, None)
         self._agent_spawns.pop(session.name, None)
         if close_bash:
@@ -557,9 +542,7 @@ class OrchestratorCore:
             await self.bubbles.close(session.name)
             raise UserError(self.t("forward_fail", error=e)) from e
         self._record(session, "user", text=text, via=origin.adapter)
-        self._last_tool.pop(session.name, None)  # новый ход — сброс bg-состояния
-        self._inflight_tools.pop(session.name, None)
-        self._inflight_cleared_at.pop(session.name, None)
+        self.tools.forget(session.name)  # новый ход — сброс bg-состояния
         snippet = html.escape(shorten(text, 28))
         await self.bubbles.append(session.name, f"📨 {snippet}")
         self.turns.start(session.name)
@@ -590,28 +573,11 @@ class OrchestratorCore:
 
     def unblock_action(self, name: str) -> str | None:
         """Что сделает кнопка ⏭ сейчас: "kick" (Esc — прервать ожидание фона),
-        "background" (Ctrl+B — свернуть идущую задачу) или None (нечего)."""
-        session = self.manager.get(name)
-        if session is None:
+        "background" (Ctrl+B — свернуть идущую задачу) или None (нечего). Логика —
+        в ToolActivity; здесь только гейт «сессия существует»."""
+        if self.manager.get(name) is None:
             return None
-        if self._last_tool.get(name) == "TaskOutput":
-            return "kick"
-        # Идёт реальный foreground-тул (или завершился < UNBLOCK_GRACE назад) —
-        # можно свернуть в фон (Ctrl+B). НЕ /proc: под bwrap дочерний процесс есть
-        # всегда. Grace-окно гасит мигание кнопки в паузах между тулами.
-        if self._foreground_tool_active(name):
-            return "background"
-        return None
-
-    def _foreground_tool_active(self, name: str) -> bool:
-        """Идёт ли foreground-тул сейчас, ИЛИ завершился только что (в пределах
-        UNBLOCK_GRACE) — дебаунс кнопки ⏭ против мигания на паузах между быстрыми
-        тулами. Ход завершается → `_inflight_cleared_at` очищается, бабл гасит
-        кнопки сам, поэтому grace не «залипает» после хода."""
-        if self._inflight_tools.get(name):
-            return True
-        cleared = self._inflight_cleared_at.get(name)
-        return cleared is not None and (time.monotonic() - cleared) < UNBLOCK_GRACE
+        return self.tools.unblock_action(name)
 
     async def unblock(self, session: Session) -> None:
         """Разблокировать ввод модели, НЕ прерывая ход насмерть (для этого —
@@ -690,9 +656,7 @@ class OrchestratorCore:
         # не крутился вечно. Сначала сообщение, потом чистка бабла — окна
         # «ответа ещё нет» не остаётся.
         self.turns.stop(session.name)
-        self._last_tool.pop(session.name, None)  # ход завершён — сброс bg-состояния
-        self._inflight_tools.pop(session.name, None)
-        self._inflight_cleared_at.pop(session.name, None)
+        self.tools.forget(session.name)  # ход завершён — сброс bg-состояния
         if text:
             await self._deliver_text(session, text, origin, intermediate=False)
         await self.bubbles.close(session.name)
@@ -799,7 +763,7 @@ class OrchestratorCore:
         # Запоминаем последний значимый тул: TaskOutput = модель ждёт фоновую
         # задачу (заглушка-ожидание в TUI), в этом состоянии кнопка ⏬ неактивна
         # (сворачивать нечего — уже в фоне), а ⛔ прерывает именно ожидание.
-        self._last_tool[session.name] = tool
+        self.tools.note_tool(session.name, tool)
         tool_input = payload.get("tool_input") or {}
         if tool == "TaskOutput":
             # Явно показываем «ждёт фон» — иначе для пользователя это выглядит
@@ -808,11 +772,8 @@ class OrchestratorCore:
             await self.bubbles.append(session.name, self.t("bubble_waiting_bg"))
             return
         # Реальный тул стартовал (не reply/file/TaskOutput) — помечаем как in-flight
-        # до его PostToolUse. Пока непусто — идёт foreground-команда: кнопка ⏭
-        # активна («свернуть в фон»), вотчдог считает сессию живой (см. TurnSupervisor).
-        tuid = str(payload.get("tool_use_id") or "")
-        if tuid:
-            self._inflight_tools.setdefault(session.name, set()).add(tuid)
+        # до его PostToolUse (кнопка ⏭ активна, вотчдог видит сессию живой).
+        self.tools.start(session.name, str(payload.get("tool_use_id") or ""))
         # agent_id/agent_type — на каждом тул-вызове ВНУТРИ сабагента.
         agent_id = payload.get("agent_id")
         # Запоминаем тип сабагента для будущей строки «✅ … завершил»:
@@ -842,13 +803,8 @@ class OrchestratorCore:
         приписываем итог. exit_code в payload НЕТ (проверено на 2.1.215), поэтому
         статус по tool_response: ✗ — прервано, ⚠ — есть stderr, иначе ✓; + время."""
         # Тул завершился — снимаем его из in-flight (для ЛЮБОГО тула, не только
-        # Bash: иначе множество не очистилось бы для Read/Edit/… и кнопка ⏭
-        # осталась бы активной до конца хода).
-        inflight = self._inflight_tools.get(session.name)
-        if inflight is not None:
-            inflight.discard(str(payload.get("tool_use_id") or ""))
-            if not inflight:  # опустело — засекаем для grace-дебаунса кнопки ⏭
-                self._inflight_cleared_at[session.name] = time.monotonic()
+        # Bash: иначе кнопка ⏭ осталась бы активной до конца хода).
+        self.tools.finish(session.name, str(payload.get("tool_use_id") or ""))
         if str(payload.get("tool_name") or "") != "Bash":
             return  # подробный вид/итог пока только для Bash
         resp = payload.get("tool_response") or {}
