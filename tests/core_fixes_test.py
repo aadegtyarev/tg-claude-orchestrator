@@ -11,11 +11,13 @@
 """
 import asyncio
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import orchestrator.core.app as appmod  # noqa: E402
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
@@ -44,6 +46,8 @@ def make_core():
     core.config = SimpleNamespace(max_instances=5)
     core._history = {}
     core._last_tool = {}
+    core._inflight_tools = {}
+    core._inflight_cleared_at = {}
     core._agent_types = {}
     core._agent_spawns = {}
     core.adapters = {}
@@ -89,27 +93,37 @@ async def test_taskoutput_and_bg_available():
 
     async def fake_append(name, html, **kw):
         lines.append(html)
-    core.bubbles = SimpleNamespace(append=fake_append, close=lambda n: asyncio.sleep(0))
+    core.bubbles = SimpleNamespace(
+        append=fake_append, close=lambda n: asyncio.sleep(0),
+        complete=lambda *a, **kw: asyncio.sleep(0),
+    )
 
-    # has_children управляем через фейк-менеджер (кнопка ⏭ теперь на нём, не is_busy).
-    busy = {"v": True}
-    core.manager.has_children = lambda s: busy["v"]
-
-    # Обычный Bash идёт (has_children) → можно свернуть в фон (⏭ активна, Ctrl+B).
-    await core.handle_tool_event("noos", {"tool_name": "Bash",
+    # Кнопка ⏭ теперь на in-flight тулах (хуки PreToolUse/PostToolUse), НЕ на
+    # /proc: под bwrap у процесса сессии всегда есть дочерний → has_children там
+    # вечно True. Bash стартовал (Pre без Post) → можно свернуть в фон (Ctrl+B).
+    await core.handle_tool_event("noos", {"tool_name": "Bash", "tool_use_id": "t1",
                                           "tool_input": {"command": "make build"}})
     assert core._unblock_available("noos") is True
     assert core.unblock_action("noos") == "background"
+    # Bash завершился (PostToolUse) → в grace-окне кнопка ещё держится (дебаунс
+    # против мигания на паузах между тулами).
+    await core.handle_tool_event("noos", {"hook_event_name": "PostToolUse",
+                                          "tool_name": "Bash", "tool_use_id": "t1",
+                                          "tool_response": {}})
+    assert core._unblock_available("noos") is True, "grace: сразу после Post ещё активна"
+    # Grace истёк (нет тулов дольше окна) → ⏭ гаснет.
+    core._inflight_cleared_at["noos"] = time.monotonic() - appmod.UNBLOCK_GRACE - 1
+    assert core._unblock_available("noos") is False, "grace истёк — ⏭ гаснет"
     # TaskOutput → «ждёт фон»: строка в бабле + ⏭ активна (пнуть Esc'ом).
     await core.handle_tool_event("noos", {"tool_name": "TaskOutput", "tool_input": {}})
     assert any("Ждёт фоновую задачу" in ln for ln in lines), lines
     assert core._unblock_available("noos") is True, "ожидание фона можно прервать"
     assert core.unblock_action("noos") == "kick"
-    # Простой (нет команды, не ждёт фон) → ⏭ неактивна.
-    busy["v"] = False
+    # Простой (нет тула в работе, не ждёт фон) → ⏭ неактивна.
+    core._inflight_tools.pop("noos", None)
     core._last_tool["noos"] = "Read"
     assert core._unblock_available("noos") is False
-    print("OK ⏭ разблокировка: Bash→background, TaskOutput→kick, покой→неактивна")
+    print("OK ⏭ разблокировка: Bash-inflight→background, Post→гаснет, TaskOutput→kick, покой→неактивна")
 
 
 async def test_pending_perms_cleanup():

@@ -980,12 +980,16 @@ class SessionManager:
         return "\n".join(tail)
 
     def is_busy(self, session: Session) -> bool:
-        """Делает ли сессия работу прямо сейчас — признак жизни для вотчдога.
+        """Растёт ли CPU-время дерева процессов claude — признак жизни для вотчдога.
 
-        Жив, если CPU-время дерева процессов claude (он сам + запущенные тулы)
-        выросло с прошлой проверки ИЛИ у него есть живые дочерние процессы
-        (идёт тул — Bash/сборка и т.п.). Если /proc недоступен — считаем
-        живым: лучше пропустить редкое реальное зависание, чем спамить ложным.
+        Жив, если сумма CPU-тиков дерева (claude + запущенные им тулы) выросла с
+        прошлой проверки. Раньше учитывался и `has_kids` («есть дочерний процесс»),
+        но под bwrap у процесса сессии ВСЕГДА есть дочерний (внутренний bwrap
+        pid-ns init), из-за чего is_busy был вечно True и вотчдог не срабатывал.
+        Случай «тул идёт, но CPU на миг замер» (Bash `sleep`/сетевое ожидание)
+        теперь ловит _watchdog_loop отдельным сигналом `_tool_inflight` (хуки).
+        Если /proc недоступен — считаем живым: лучше пропустить редкое реальное
+        зависание, чем спамить ложным.
 
         Вызывать из единственного места (_watchdog_loop): метод хранит
         предыдущий отсчёт CPU по имени сессии между вызовами.
@@ -994,28 +998,13 @@ class SessionManager:
         if pid is None:
             return False
         try:
-            cpu, has_kids = proc_tree_signals(pid)
+            cpu, _has_kids = proc_tree_signals(pid)
         except Exception:  # /proc недоступен — перестраховочно «жив»
             logger.debug("is_busy: /proc недоступен для pid=%s", pid)
             return True
         prev = self._cpu.get(session.name)
         self._cpu[session.name] = cpu
-        grew = prev is not None and cpu > prev
-        return grew or has_kids
-
-    def has_children(self, session: Session) -> bool:
-        """Есть ли живые дочерние процессы (идёт тул) — для кнопки ⏭. В отличие
-        от is_busy НЕ трогает CPU-baseline: is_busy обязан вызываться только из
-        _watchdog_loop (хранит прошлый отсчёт), а кнопка дёргается из каждого
-        _flush бабла (~1.5с) и сбивала бы 15-секундную CPU-дельту вотчдога."""
-        pid = session.process.pid if session.running and session.process else None
-        if pid is None:
-            return False
-        try:
-            _cpu, has_kids = proc_tree_signals(pid)
-        except Exception:
-            return True  # /proc недоступен — перестраховочно «есть работа»
-        return has_kids
+        return prev is not None and cpu > prev
 
     async def run_and_capture(self, session: Session, cmd: str, wait: float = 6.0) -> str:
         """Ввести слэш-команду в PTY и вернуть новый вывод claude.log без ANSI.
