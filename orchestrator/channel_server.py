@@ -189,7 +189,7 @@ if _WALLET_CATALOG is not None:
         "cannot see. For the tools listed below, just RUN THEM NORMALLY — a wrapper on "
         "your PATH forwards the call to the host with the right secret attached, and any "
         "secret value is auto-redacted from the output. " + _WALLET_CATALOG + "\n"
-        "For git this covers the network subcommands (push/fetch/pull/clone); local git "
+        "For git this covers the network subcommands (push/fetch/pull/clone/…); local git "
         "(status/commit/diff/log) just runs in place. A secret's value reaches a command "
         "through its env var $NAME — the tool reads it (gh/aws/kubectl), or you put $NAME "
         "in the command (curl -H 'Authorization: Bearer $OPENAI_KEY'), or $NAME_FILE "

@@ -68,6 +68,12 @@ class Config:
     sandbox: str  # "bwrap" (файловая песочница) | "agent-vm" (microVM) | "off"
     sandbox_extra_rw: tuple[Path, ...]  # доп. пути, доступные из песочницы на запись
     sandbox_dbus: bool  # прокидывать ли system D-Bus для mDNS/avahi-browse (bwrap)
+    # Прокидывать ли X/Wayland в песочницу (bwrap). Сеть у песочницы общая с
+    # хостом, поэтому абстрактный сокет X достижим даже при tmpfs /tmp — с
+    # $DISPLAY процесс мог бы дёрнуть хостовый GUI (askpass-диалоги, скриншоты,
+    # ввод). Off (дефолт) вырезает DISPLAY/XAUTHORITY/WAYLAND_DISPLAY; on —
+    # оставить (если модели действительно нужен X в песочнице).
+    sandbox_x11: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
     agent_vm_memory_gib: float | None
     agent_vm_cpus: int | None
@@ -161,6 +167,9 @@ class Config:
             # (полезно: агент видит .local-хосты и сервисы), off — запретить
             # доступ к system D-Bus из песочницы.
             sandbox_dbus=cls._parse_bool(os.getenv("SANDBOX_DBUS", "true")),
+            # X/Wayland в песочницу по умолчанию НЕ прокидываем (закрываем доступ
+            # к хостовому GUI); SANDBOX_X11=1 — оставить, если модели нужен X.
+            sandbox_x11=cls._parse_bool(os.getenv("SANDBOX_X11", "false")),
             agent_vm_memory_gib=(
                 float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
             ),
