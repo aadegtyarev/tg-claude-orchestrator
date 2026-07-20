@@ -1202,20 +1202,16 @@ class OrchestratorCore:
         return f"s:{session.name}:{scope}" if session is not None else f"main:{scope}"
 
     def bash_cwd(self, session: Session | None) -> Path:
-        """Стартовый cwd терминала: папка проекта сессии, иначе отдельный
-        каталог для main-chat /bash.
-
-        Для session=None НЕ отдаём весь SESSIONS_DIR: иначе его RW-бинд в
-        песочнице открыл бы приватные дома всех сессий (.homes/*, ключи,
-        ~/.wallet.json) и state-файл .sessions.json на запись. Выделяем
-        нейтральный SESSIONS_DIR/.bash-main (пользователь при желании cd
-        куда угодно — но по умолчанию не видит чужого).
+        """Стартовый cwd терминала — то же разделение, что у /ls и /new:
+          * в сессии → папка проекта (та же файловая песочница, что у claude);
+          * в главном чате → дом пользователя на хосте. Main-chat /bash бежит
+            ВНЕ песочницы (операторский терминал, полный скоуп — см. run_bash),
+            поэтому прежний нейтральный `.bash-main` не нужен: изоляции нет,
+            оператор и так с полным доступом к хосту.
         """
         if session is not None:
             return self.manager.effective_cwd(session)
-        main = self.config.sessions_dir / ".bash-main"
-        main.mkdir(parents=True, exist_ok=True)
-        return main
+        return Path.home()
 
     async def run_bash(
         self,
@@ -1224,9 +1220,11 @@ class OrchestratorCore:
         cmd: str,
         on_update: Callable[[str, bool], Awaitable[None]],
     ) -> None:
-        """Выполнить команду в постоянном bash-терминале (та же песочница, что
-        у claude). Стримит рендер (HTML) через on_update(html, done); в конце —
-        код возврата. Если терминал занят — UserError.
+        """Выполнить команду в постоянном bash-терминале. Скоуп зависит от
+        контекста: в сессии — та же файловая песочница, что у claude (только
+        папка сессии/проекта); в главном чате — на ХОСТЕ без песочницы (полный
+        операторский скоуп, cwd = дом). Стримит рендер (HTML) через
+        on_update(html, done); в конце — код возврата. Занят — UserError.
         """
         cwd = self.bash_cwd(session)
         if session is not None:
