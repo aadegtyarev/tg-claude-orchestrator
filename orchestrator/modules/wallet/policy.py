@@ -25,19 +25,23 @@ import tomlkit
 # под-команда правки списка → ключ в TOML
 _LIST_FIELDS = {"session": "sessions", "cmd": "commands", "deny": "deny"}
 
+# Список под-команд правки — моноширинным блоком (ровно, без «плавающих»
+# переносов построчных <code>). Внутри <pre> экранируем только &<> (quote=False).
+_EDIT_CMDS = (
+    "/wallet confirm <имя> on|off\n"
+    "/wallet session <имя> +<шаблон> | -<шаблон>\n"
+    "/wallet cmd     <имя> +<шаблон> | -<шаблон>\n"
+    "/wallet deny    <имя> +<шаблон> | -<шаблон>\n"
+    "/wallet new <имя>\n"
+    "/wallet rm  <имя>\n"
+    "/wallet help"
+)
+
 USAGE = (
     "🔐 <b>/wallet</b> — policy кошелька (значения токенов не видны и не вводятся):\n"
-    "• <code>/wallet</code> — показать секреты и policy\n"
-    "• <code>/wallet confirm &lt;имя&gt; on|off</code> — спрашивать кнопкой\n"
-    "• <code>/wallet session &lt;имя&gt; +&lt;шаблон&gt;|-&lt;шаблон&gt;</code>"
-    " — кому доступен (fnmatch: * или dev-*)\n"
-    "• <code>/wallet cmd &lt;имя&gt; +&lt;шаблон&gt;|-&lt;шаблон&gt;</code>"
-    " — команды (gh, git, «gh api *»)\n"
-    "• <code>/wallet deny &lt;имя&gt; +&lt;шаблон&gt;|-&lt;шаблон&gt;</code>"
-    " — запрет поверх commands\n"
-    "• <code>/wallet new &lt;имя&gt;</code> — создать host-passthrough (deny-by-default)\n"
-    "• <code>/wallet rm &lt;имя&gt;</code> — удалить секрет\n"
-    "Значения (inject value/env) и allow_unsafe — только host-файлом."
+    "<pre>" + html.escape(_EDIT_CMDS, quote=False) + "</pre>\n"
+    "session/cmd/deny — fnmatch-шаблоны (напр. <code>*</code>, <code>dev-*</code>, "
+    "<code>gh api *</code>). Значения (inject value/env) и allow_unsafe — только host-файлом."
 )
 
 
@@ -54,15 +58,12 @@ def _edit_footer(allow_edit: bool) -> str:
     """Подсказка по правке прямо в ответе /wallet (или заметка, что выключено)."""
     if not allow_edit:
         return (
-            "<i>✏️ Правка из чата выключена (WALLET_POLICY_EDIT=0) — "
+            "✏️ <i>Правка из чата выключена (WALLET_POLICY_EDIT=0) — "
             "меняй host-файл secrets.toml.</i>"
         )
     return (
-        "<i>✏️ Правка (значения токенов — только host-файлом):</i>\n"
-        "<code>/wallet confirm &lt;имя&gt; on|off</code>\n"
-        "<code>/wallet session|cmd|deny &lt;имя&gt; +&lt;шаблон&gt; | -&lt;шаблон&gt;</code>\n"
-        "<code>/wallet new &lt;имя&gt;</code> · <code>/wallet rm &lt;имя&gt;</code> · "
-        "<code>/wallet help</code>"
+        "✏️ <i>Правка (значения токенов — только host-файлом):</i>\n"
+        "<pre>" + html.escape(_EDIT_CMDS, quote=False) + "</pre>"
     )
 
 
