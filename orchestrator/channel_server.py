@@ -148,7 +148,15 @@ def _wallet_catalog() -> str | None:
         else:
             inj = ""
         lines.append(f"  • `{s['name']}`{desc} — {cmds}{inj}")
-    out = "You may run these via `wallet run <name> -- <cmd>`:\n" + "\n".join(lines)
+    out = (
+        "Run these via `wallet run <name> -- <cmd>`. `wallet` is ALREADY on your "
+        "PATH — call it exactly as `wallet run ...`, with NO full path and NO "
+        "leading `cd`: the command runs on the host IN YOUR PROJECT DIRECTORY, so a "
+        "`cd` in your shell does not affect it. One `wallet run` = one command; do "
+        "NOT wrap it in a `while`/poll loop — use the tool's own watch (e.g. `gh run "
+        "watch`) inside a single `wallet run`.\n"
+        + "\n".join(lines)
+    )
     if any_shared:
         out += (
             "\nShared secrets are values you MAY read and use (a dev API key for a "
