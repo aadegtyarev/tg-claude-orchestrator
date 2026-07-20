@@ -6,9 +6,13 @@ host-passthrough (gh/git/ssh/scp на все сессии), 0600, и он вал
 import os
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+
+try:
+    import tomllib  # stdlib с 3.11
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
