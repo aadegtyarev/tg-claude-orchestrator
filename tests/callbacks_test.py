@@ -70,6 +70,11 @@ class FakeCore:
     async def hard_stop(self, s):
         calls.append(("esc_sent",))
 
+    _unblock: str | None = "background"  # что вернёт unblock_action (None = нечего)
+
+    def unblock_action(self, name):
+        return self._unblock
+
     async def unblock(self, s):
         calls.append(("unblock_sent",))
 
@@ -143,6 +148,15 @@ async def main():
     await a.on_bg_button(cb("bg:7"))
     assert ("unblock_sent",) in calls
     print("OK on_bg_button (Ctrl+B в фон)")
+
+    # Дефис-заглушка: сворачивать нечего (unblock_action=None) → тап ничего не
+    # делает (без unblock, без тоста), кнопка лишь держит место в ряду.
+    calls.clear()
+    a.core._unblock = None
+    await a.on_bg_button(cb("bg:7"))
+    assert ("unblock_sent",) not in calls
+    a.core._unblock = "background"
+    print("OK on_bg_button: нечего сворачивать → молчаливый no-op")
 
     calls.clear()
     await a.on_esc_button(cb("esc:7", uid=999))  # чужой
