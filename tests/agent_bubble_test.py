@@ -46,6 +46,11 @@ class FakeMgr:
 
     get_by_name = get
 
+    def transcript_path(self, session):
+        # Несуществующий путь → read_last_model вернёт None (модель неизвестна):
+        # тест проверяет ИМЕНОВАНИЕ и фолбэки, не чтение файла.
+        return Path("/nonexistent/does-not-exist.jsonl")
+
 
 async def _settle(bm: BubbleManager, name: str) -> None:
     bubble = bm._bubbles.get(name)
@@ -56,8 +61,16 @@ async def _settle(bm: BubbleManager, name: str) -> None:
 def make_core(bm: BubbleManager) -> OrchestratorCore:
     core = OrchestratorCore.__new__(OrchestratorCore)
     core.manager = FakeMgr()
-    core._texts = {"subagent": "🤖 {agent}"}
+    core._texts = {
+        "subagent": "🤖 {agent}",
+        "subagent_done_named": "✅ Сабагент {agent} завершил · {model}",
+        "subagent_done_named_nomodel": "✅ Сабагент {agent} завершил",
+        "subagent_done": "✅ Сабагент завершил · {model}",
+        "subagent_done_nomodel": "✅ Сабагент завершил",
+    }
     core._last_tool = {}
+    core._agent_types = {}
+    core._agent_spawns = {}
     core.bubbles = bm
     core.turns = TurnSupervisor(
         core.manager, core.t,
@@ -122,7 +135,64 @@ async def main():
     assert len(bm._bubbles["noos"].entries) == n_before
     print("OK reply/send_file не попадают в бабл (без изменений)")
 
+    await _named_subagent_stop()
     print("ALL AGENT-BUBBLE OK")
+
+
+async def _named_subagent_stop():
+    """SubagentStop называет ИМЕННО завершившегося сабагента (dev-planner/…),
+    даже когда их несколько подряд — иначе безымянное «завершил» читалось как
+    «завершил, но идёт дальше». Плюс мягкая деградация: тип из дочернего
+    события → из порядка спавнов → без имени."""
+    _TEXTS = {
+        "bubble_working": "Работаю", "subagent": "🤖 {agent}",
+        "subagent_done_named": "✅ Сабагент {agent} завершил · {model}",
+        "subagent_done_named_nomodel": "✅ Сабагент {agent} завершил",
+        "subagent_done": "✅ Сабагент завершил · {model}",
+        "subagent_done_nomodel": "✅ Сабагент завершил",
+    }
+    tr = FakeTransport()
+    bm = BubbleManager(
+        lambda: [tr], lambda n: SESSION if n == "noos" else None,
+        lambda k, **kw: _TEXTS[k].format(**kw), delete_after=True,
+    )
+    core = make_core(bm)
+    bm.open("noos")
+
+    # Тип из ДОЧЕРНЕГО тул-события (agent_id + agent_type) — самый надёжный путь.
+    await core.handle_tool_event("noos", {
+        "tool_name": "Bash", "agent_id": "a1", "agent_type": "dev-planner",
+        "tool_input": {"command": "grep x"},
+    })
+    await core.handle_tool_event("noos", {
+        "hook_event_name": "SubagentStop", "agent_id": "a1",
+    })
+    await _settle(bm, "noos")
+    text = bm._render_text(bm._bubbles["noos"])
+    assert "Сабагент dev-planner завершил" in text, text
+    print("OK завершение названо по agent_type из дочернего события")
+
+    # Фолбэк: только спавн-строка (agent_id ещё нет) → тип по порядку спавнов.
+    await core.handle_tool_event("noos", {
+        "tool_name": "Agent",
+        "tool_input": {"subagent_type": "dev-builder", "description": "build"},
+    })
+    await core.handle_tool_event("noos", {
+        "hook_event_name": "SubagentStop", "agent_id": "a2",
+    })
+    await _settle(bm, "noos")
+    text = bm._render_text(bm._bubbles["noos"])
+    assert "Сабагент dev-builder завершил" in text, text
+    print("OK завершение названо по порядку спавнов (фолбэк без agent_id)")
+
+    # Мягкая деградация: ничего не известно о типе → безымянная строка (не падаем).
+    await core.handle_tool_event("noos", {
+        "hook_event_name": "SubagentStop", "agent_id": "unknown",
+    })
+    await _settle(bm, "noos")
+    text = bm._render_text(bm._bubbles["noos"])
+    assert "✅ Сабагент завершил" in text, text
+    print("OK неизвестный сабагент — мягкая деградация до безымянной строки")
 
 
 async def test_agent_bubble():
