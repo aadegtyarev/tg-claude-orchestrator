@@ -1,8 +1,10 @@
-"""Разделение cwd у файловых команд оператора (как у /bash):
+"""Разделение cwd у файловых команд оператора:
 
 - /ls в сессии → папка проекта (effective_cwd), в главном чате → дом хоста;
   относительный аргумент (`./`, `sub`) резолвится ОТ этой базы, а не от cwd
   процесса-оркестратора (репозитория); абсолютный путь перекрывает базу.
+- /bash в сессии → папка проекта (та же песочница, что у claude), в главном
+  чате → дом хоста (терминал на хосте вне песочницы).
 - /new — команда главного чата: относительный путь проекта резолвится от дома
   пользователя, абсолютный — как указан.
 
@@ -56,6 +58,24 @@ def test_ls_cwd_split():
             os.environ["HOME"] = old_home
 
 
+def test_bash_cwd_split():
+    proj = Path(tempfile.mkdtemp()).resolve()
+    home = Path(tempfile.mkdtemp()).resolve()
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    try:
+        c = _core(proj)
+        sess = SimpleNamespace(name="s")
+        # в сессии → папка проекта (та же песочница, что у claude)
+        assert c.bash_cwd(sess) == proj
+        # в главном чате → дом хоста (терминал на хосте вне песочницы)
+        assert c.bash_cwd(None) == home
+        print("OK /bash cwd: сессия→проект, main→дом хоста (вне песочницы)")
+    finally:
+        if old_home is not None:
+            os.environ["HOME"] = old_home
+
+
 def test_link_project_base():
     home = Path(tempfile.mkdtemp()).resolve()
     old_home = os.environ.get("HOME")
@@ -77,6 +97,7 @@ def test_link_project_base():
 
 def main():
     test_ls_cwd_split()
+    test_bash_cwd_split()
     test_link_project_base()
     print("ALL LS-CWD OK")
 
