@@ -309,14 +309,22 @@ class TurnSupervisor:
                             )
                     await _surf(msg)
 
-            # 2. Живой ретрай: пере-файр, когда attempt вырос — чтобы было видно
-            #    прогресс (3/100 → 47/100), а не одна тишина. Throttle — RETRY_SURFACE_INTERVAL.
+            # 2. Живой ретрай: показываем прогресс (3/100 → 47/100) в СТАТУСЕ
+            #    бабла (set_status), а не отдельным сообщением — он редактируется
+            #    на месте (не насыпать N сообщений), сам резолвится: как модель
+            #    оживёт, следующий pulse перезапишет статус; конец хода — бабл
+            #    закроется. Throttle — RETRY_SURFACE_INTERVAL (реже правок).
             if sig["retry"]:
                 k, total = sig["retry"]
                 if k > last_retry_k and now - last_retry_at >= RETRY_SURFACE_INTERVAL:
                     last_retry_k = k
                     last_retry_at = now
-                    await _surf(self.t("api_retrying", attempt=k, total=total))
+                    try:
+                        await self._status(
+                            name, pulse=self.t("api_retrying", attempt=k, total=total)
+                        )
+                    except Exception as e:
+                        logger.debug("error_relay: retry-статус: %s", e)
 
             # 3. Краш-рестарт-луп: баннер «Resume this session» mid-хода = Claude
             #    упал и поднялся. Растёт счётчик — предупреждаем (раз в COOLDOWN).
