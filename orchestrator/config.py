@@ -108,9 +108,12 @@ class Config:
 
         chat_id_raw = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
+        sandbox = cls._parse_sandbox(os.getenv("SANDBOX", "bwrap"))
+        modules = cls._default_modules(os.getenv("MODULES"), sandbox)
+
         return cls(
             adapters=adapters,
-            modules=cls._parse_modules(os.getenv("MODULES", "")),
+            modules=modules,
             telegram_bot_token=token,
             telegram_chat_id=cls._parse_chat_id(chat_id_raw),
             web_host=os.getenv("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
@@ -161,7 +164,7 @@ class Config:
             # claude и /bash видят только папку сессии/проекта и конфиг Claude
             # Code, всё остальное в $HOME и системе — недоступно. SANDBOX=off
             # отключает (нужно на машинах без bwrap/без unprivileged userns).
-            sandbox=cls._parse_sandbox(os.getenv("SANDBOX", "bwrap")),
+            sandbox=sandbox,
             sandbox_extra_rw=cls._parse_paths(os.getenv("SANDBOX_EXTRA_RW", "")),
             # mDNS/локальная сеть через system D-Bus. По умолчанию включено
             # (полезно: агент видит .local-хосты и сервисы), off — запретить
@@ -217,6 +220,16 @@ class Config:
                 f"допустимо: {', '.join(sorted(valid))}"
             )
         return tuple(dict.fromkeys(names))
+
+    @classmethod
+    def _default_modules(cls, raw: str | None, sandbox: str) -> tuple[str, ...]:
+        """Набор модулей. MODULES не задан (`None`) → кошелёк включён по умолчанию
+        при песочнице bwrap: работа с хостовыми секретами (gh/git/ssh как на
+        хосте) без выдачи их значений модели — безопасно. Без bwrap кошелёк не
+        страхует, поэтому не тащим. Явный MODULES (в т.ч. пустой) уважаем как есть."""
+        if raw is None:
+            return ("wallet",) if sandbox == "bwrap" else ()
+        return cls._parse_modules(raw)
 
     @staticmethod
     def _parse_sandbox(raw: str) -> str:

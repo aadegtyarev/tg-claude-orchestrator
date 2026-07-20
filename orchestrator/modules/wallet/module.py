@@ -89,6 +89,25 @@ SHIM_DIRNAME = ".wallet-bin"
 # (status/add/commit/log/diff) бежит настоящим git прямо в песочнице — быстро и
 # без хостового раунд-трипа. Список намеренно узкий: только то, что ходит в сеть.
 GIT_NETWORK = ("push", "fetch", "pull", "clone", "ls-remote", "send-pack", "fetch-pack")
+# Дефолтный secrets.toml — создаётся при первом запуске, если файла ещё нет, чтобы
+# кошелёк работал «из коробки»: прокол на хост (host-passthrough) для gh/git/ssh/
+# scp на все сессии, обёртки в PATH заворачивают их сами. Права строго 0600.
+DEFAULT_SECRETS_TOML = """\
+# Кошелёк секретов claude-orchestrator — создан автоматически при первом запуске.
+# Формат, режимы и policy: docs/secrets-wallet.md. Права строго 0600 (иначе файл
+# НЕ загрузится). Правится из бота командой /wallet или руками здесь.
+#
+# Дефолт ниже — «прокол на хост» (host-passthrough) для gh/git/ssh/scp: команды
+# идут на ХОСТ с его кредами (keyring, gh-auth, ~/.ssh), модель их значений не
+# видит. Обёртки в PATH заворачивают эти инструменты сами — модель зовёт gh/git/
+# ssh как обычно. Встроенный guard рубит опасное (печать токена, git-RCE) и здесь.
+
+[secrets.host]
+description = "хостовые креды gh/git/ssh/scp"
+sessions = ["*"]                          # все сессии; сузь при желании: ["dev-*"]
+commands = ["gh", "git", "ssh", "scp"]    # эти инструменты завернутся обёртками
+confirm = false                           # без кнопок подтверждения; guard — щит
+"""
 
 
 def _always_denied(cmd: list[str]) -> str | None:
@@ -371,12 +390,8 @@ class WalletModule:
                 self.config.sandbox, self.config.wallet_secrets_file,
             )
         if not self.config.wallet_secrets_file.exists():
-            logger.warning(
-                "wallet: файл секретов %s отсутствует — модуль работает, но секретов нет",
-                self.config.wallet_secrets_file,
-            )
-        else:
-            self.store.load()  # ранняя диагностика прав/синтаксиса — в лог на старте
+            self._write_default_secrets()  # прокол на хост gh/git/ssh/scp «из коробки»
+        self.store.load()  # ранняя диагностика прав/синтаксиса — в лог на старте
 
         app = web.Application()
         app.router.add_get("/secrets", self._handle_secrets)
@@ -435,6 +450,25 @@ class WalletModule:
                 out[s.env] = marker(s.name)
                 out[s.env + "_FILE"] = marker(s.name, as_file=True)
         return out
+
+    def _write_default_secrets(self) -> None:
+        """Создать secrets.toml с дефолтным host-passthrough (gh/git/ssh/scp на
+        все сессии), чтобы кошелёк работал «из коробки». Пишем 0600 через
+        O_EXCL (ни мгновения без прав); гонку/недоступный каталог не роняем."""
+        path = self.config.wallet_secrets_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_SECRETS_TOML)
+            logger.info(
+                "wallet: создан дефолтный %s — прокол на хост gh/git/ssh/scp для "
+                "всех сессий (правь через /wallet или руками)", path,
+            )
+        except FileExistsError:
+            pass  # появился параллельно — просто загрузим существующий
+        except OSError as e:
+            logger.error("wallet: не удалось создать дефолтный %s: %s", path, e)
 
     async def stop(self) -> None:
         if self.core is not None:
