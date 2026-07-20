@@ -69,6 +69,14 @@ class WebAdapter:
             self.config.web_host, self.config.web_port, self._token,
         )
 
+    def public_url(self) -> str:
+        """URL веб-интерфейса с токеном (для команды /orchestrator_web). Для
+        host 0.0.0.0/:: показываем 127.0.0.1 — по нему открывают локально."""
+        host = self.config.web_host
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        return f"http://{host}:{self.config.web_port}/?token={self._token}"
+
     async def stop(self) -> None:
         for ws in list(self._ws_clients):
             try:

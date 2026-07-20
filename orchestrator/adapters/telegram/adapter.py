@@ -73,6 +73,7 @@ class TelegramAdapter:
             BotCommand(command="ls", description=self.t("menu_ls")),
             BotCommand(command="wallet", description=self.t("menu_wallet")),
             BotCommand(command="orchestrator_restart", description=self.t("menu_restart")),
+            BotCommand(command="orchestrator_web", description=self.t("menu_web")),
             BotCommand(command="stats", description=self.t("menu_stats")),
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
@@ -383,6 +384,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_ls, Command("ls"))
         dp.message.register(self.cmd_wallet, Command("wallet"))
         dp.message.register(self.cmd_restart, Command("orchestrator_restart"))
+        dp.message.register(self.cmd_web, Command("orchestrator_web"))
         dp.message.register(self.cmd_close, Command("close_session", "stop"))
         dp.message.register(self.cmd_delete, Command("delete_session"))
         dp.message.register(self.cmd_compact, Command("compact"))
@@ -555,6 +557,16 @@ class TelegramAdapter:
             await self.core.restart_service()
         except UserError as e:
             await message.reply(str(e))
+
+    async def cmd_web(self, message: Message) -> None:
+        """Ссылка на локальный веб-интерфейс с токеном — если веб запущен."""
+        if not self._accept(message):
+            return
+        url = self.core.web_url()
+        if url is None:
+            await message.reply(self.t("web_disabled"))
+            return
+        await message.reply(self.t("web_url", url=url), parse_mode="HTML")
 
     async def cmd_skills(self, message: Message) -> None:
         if not self._accept(message):

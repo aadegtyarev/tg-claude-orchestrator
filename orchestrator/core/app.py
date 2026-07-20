@@ -480,6 +480,12 @@ class OrchestratorCore:
             raise UserError(self.t("restart_fail", error=msg))
         return unit
 
+    def web_url(self) -> str | None:
+        """URL веб-интерфейса с токеном — если веб-адаптер поднят (ADAPTERS
+        содержит web). None, если веб не запущен."""
+        tr = self.adapters.get("web")
+        return tr.public_url() if tr is not None and hasattr(tr, "public_url") else None
+
     def wallet_command(self, args_str: str) -> str:
         """`/wallet …` — просмотр/правка policy кошелька. Ядро находит модуль
         `wallet` по имени (как прочие команды; полный реестр команд модулей —

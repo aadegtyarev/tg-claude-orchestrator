@@ -14,6 +14,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/ls [путь]</code> — показать файлы\n"
             "• <code>/wallet</code> — policy кошелька (просмотр/правка; значения скрыты)\n"
             "• <code>/orchestrator_restart</code> — перезапустить весь оркестратор (деплой)\n"
+            "• <code>/orchestrator_web</code> — ссылка на локальный веб-интерфейс с токеном\n"
             "• <code>/bash &lt;cmd&gt;</code> — терминал на ХОСТЕ (полный доступ: systemctl и т.п.)\n"
             "• <code>/skills</code> — список скиллов\n"
             "• <code>/chat_id</code> — ID чата и привязка бота\n\n"
@@ -108,6 +109,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "clear_fail": "❌ Не удалось перезапустить: {error}\nСессия остановлена — создай заново через /new.",
         "restarting": "🔄 Перезапускаю оркестратор через systemd. Активные ходы прервутся, сессии резюмнутся; история сохранится. Стартовое уведомление придёт через несколько секунд.",
         "restart_fail": "❌ Не удалось перезапустить: {error}\n(команда работает только под systemd --user)",
+        "web_url": "🌐 Локальный веб-интерфейс (с токеном):\n<code>{url}</code>",
+        "web_disabled": "🌐 Веб-интерфейс не запущен (добавь `web` в ADAPTERS).",
         "clear_done": "🧹 Контекст очищен, сессия готова.",
         "close_done": "⏸ Сессия остановлена, топик сохранён.\nНапиши сюда — продолжу диалог (resume).",
         "delete_confirm": "🗑 Удалить сессию «{title}» полностью — процесс, контекст и этот топик? Действие необратимо.",
@@ -203,6 +206,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_clear": "Очистить контекст сессии",
         "menu_close": "Остановить сессию (возобновляемо)",
         "menu_restart": "Перезапустить оркестратор (деплой)",
+        "menu_web": "Ссылка на веб-интерфейс",
         "menu_delete": "Удалить сессию и топик",
         "menu_help": "Справка",
         "menu_bash": "Выполнить bash-команду (мимо Claude)",
@@ -235,6 +239,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/ls [path]</code> — list files\n"
             "• <code>/wallet</code> — wallet policy (view/edit; values hidden)\n"
             "• <code>/orchestrator_restart</code> — restart the whole orchestrator (deploy)\n"
+            "• <code>/orchestrator_web</code> — link to the local web UI with its token\n"
             "• <code>/bash &lt;cmd&gt;</code> — terminal on the HOST (full access: systemctl etc.)\n"
             "• <code>/skills</code> — list skills\n"
             "• <code>/chat_id</code> — chat ID and bot binding\n\n"
@@ -329,6 +334,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "clear_fail": "❌ Restart failed: {error}\nSession stopped — create it again with /new.",
         "restarting": "🔄 Restarting the orchestrator via systemd. Active turns will be interrupted, sessions resume; history is saved. Startup notice arrives in a few seconds.",
         "restart_fail": "❌ Restart failed: {error}\n(command works only under systemd --user)",
+        "web_url": "🌐 Local web UI (with token):\n<code>{url}</code>",
+        "web_disabled": "🌐 Web UI is not running (add `web` to ADAPTERS).",
         "clear_done": "🧹 Context cleared, session ready.",
         "close_done": "⏸ Session stopped, topic kept.\nSend a message here to continue (resume).",
         "delete_confirm": "🗑 Delete session «{title}» entirely — process, context and this topic? This cannot be undone.",
@@ -424,6 +431,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_clear": "Clear session context",
         "menu_close": "Stop session (resumable)",
         "menu_restart": "Restart the orchestrator (deploy)",
+        "menu_web": "Web UI link",
         "menu_delete": "Delete session and topic",
         "menu_help": "Help",
         "menu_bash": "Run a bash command (bypasses Claude)",
