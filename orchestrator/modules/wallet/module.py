@@ -1,11 +1,20 @@
-"""Демон-кошелёк секретов: этап 1 дизайн-дока docs/secrets-wallet.md.
+"""Демон-кошелёк секретов: docs/secrets-wallet.md.
 
 Модель угроз: всё, что лежит внутри песочницы, модель может прочитать (Bash и
 Read работают от её имени). Поэтому секрет не появляется в песочнице вообще —
-CLI `bin/wallet` шлёт команду демону по TCP-localhost (сеть у bwrap общая с
-хостом), а демон исполняет её НА ХОСТЕ с секретом в env короткоживущего
-ребёнка. В песочницу возвращается только вывод, причём значения ВСЕХ известных
-секретов в нём заменены на плейсхолдер.
+команда исполняется демоном НА ХОСТЕ с секретом в env короткоживущего ребёнка,
+а в песочницу возвращается только вывод (значения ВСЕХ известных секретов в нём
+заменены на плейсхолдер `•••`).
+
+Прозрачный шлюз: чтобы модель не дёргала CLI вручную, при провижне сессии в её
+приватный $HOME пишется каталог обёрток .wallet-bin (SHIM_DIRNAME), который ядро
+ставит первым в PATH песочницы (SessionManager.path_hooks). Обёртка каждого
+разрешённого инструмента — крошечный скрипт `wallet exec <tool> "$@"`; демон
+подбирает секрет по команде (_resolve_secret) и исполняет. git — особый случай
+(_git_shim): сетевые подкоманды идут через кошелёк, локальные — настоящим git в
+песочнице. Inject-секреты видны как env-переменные $NAME с МАРКЕРОМ вместо
+значения (session_env) — демон разворачивает маркер в реальное значение на хосте
+(_execute). CLI `bin/wallet` остаётся ручным путём (run/exec/get/env/ls/help).
 
 Аутентификация per-session: на старте (и через core.session_hooks для новых
 сессий) в персистентный $HOME сессии кладётся ~/.wallet.json (0600) с URL
@@ -23,6 +32,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -51,22 +61,30 @@ RUN_TIMEOUT = 300.0
 STREAM_LIMIT = 200_000
 # Чем заменяем значения секретов в выводе.
 REDACTED = "•••"
-# Плейсхолдеры инъекции секрета В САМУ КОМАНДУ (только inject-секреты, со
-# значением). Нужны там, где токен должен попасть в аргумент/файл, а не в env
-# (exec без шелла — «$ENV» в аргументе не развернулся бы):
-#   {{secret}}      — значение в строку аргумента (curl -H "Authorization: Bearer {{secret}}");
-#   {{secret_file}} — путь к временному 0600-файлу со значением (ssh -i {{secret_file}},
-#                     клиентские сертификаты, JSON-креды).
-# Подстановка в демоне ПОСЛЕ проверок policy/guard, перед exec — значение в
-# контекст/песочницу модели не попадает; вывод редактируется от значения.
-PH_VALUE = "{{secret}}"
-PH_FILE = "{{secret_file}}"
+# Маркер секрета для скрытых inject-секретов. В env песочницы вместо реального
+# значения кладётся `<<wallet:имя>>`; модель пишет привычный `$ENV`, шелл
+# разворачивает его в маркер, а демон подставляет РЕАЛЬНОЕ значение на хосте
+# (в аргумент — inline, либо `:file` — во временный 0600-файл). Значение в
+# песочницу/контекст модели не попадает; из вывода редактируется.
+MARKER_RE = re.compile(r"<<wallet:([A-Za-z0-9_-]+)(:file)?>>")
+
+
+def marker(name: str, as_file: bool = False) -> str:
+    return f"<<wallet:{name}{':file' if as_file else ''}>>"
 # Дефолтный набор для host-passthrough, когда `commands` не задан: инструменты,
 # которые обычно уже авторизованы на хосте и не отдают сам секрет наружу. Смысл
 # кошелька — «используй, но не читай»: gh/git/ssh/scp применяют креды сами,
 # echo/cat/sh их бы просто распечатали, поэтому в дефолт НЕ входят. Хочешь
 # curl/kubectl/своё — допиши commands явно.
 DEFAULT_HOST_COMMANDS = ("gh", "git", "ssh", "scp")
+# Каталог per-session обёрток внутри приватного дома сессии; ставится ПЕРВЫМ в
+# PATH песочницы (SessionManager.path_hooks), поэтому завёрнутые инструменты
+# побеждают настоящие бинари. Имя знает и ядро (session_home) — держим синхронно.
+SHIM_DIRNAME = ".wallet-bin"
+# Сетевые подкоманды git заворачиваем в кошелёк (креды хоста); всё остальное
+# (status/add/commit/log/diff) бежит настоящим git прямо в песочнице — быстро и
+# без хостового раунд-трипа. Список намеренно узкий: только то, что ходит в сеть.
+GIT_NETWORK = ("push", "fetch", "pull", "clone", "ls-remote", "send-pack", "fetch-pack")
 
 
 def _always_denied(cmd: list[str]) -> str | None:
@@ -148,10 +166,10 @@ class Secret:
     confirm: bool  # спрашивать ли подтверждение кнопками перед запуском
     # shared: секрет, значение которого модель ДОЛЖНА получить (dev-ключ для её
     # сервиса, логин/пароль для ввода в браузер). Не про конфиденциальность от
-    # модели — про хранение вне чата/репо. Выдаётся `wallet get`/`wallet env`,
-    # опц. авто-инъект в env песочницы. host/inject значения НЕ выдаются никогда.
+    # модели — про хранение вне чата/репо. Выдаётся `wallet get`/`wallet env`;
+    # при заданном `env` реальное значение сразу лежит в env песочницы (в отличие
+    # от inject, где там маркер). host/inject значения НЕ выдаются никогда.
     shared: bool
-    inject_at_start: bool  # для shared: положить `env`=value в env песочницы на старте
 
     @property
     def host_passthrough(self) -> bool:
@@ -272,7 +290,6 @@ class SecretStore:
                 allow_unsafe=bool(raw.get("allow_unsafe", False)),
                 confirm=bool(raw.get("confirm", True)),
                 shared=is_shared,
-                inject_at_start=bool(raw.get("inject_at_start", False)),
             )
         return self._secrets
 
@@ -360,6 +377,7 @@ class WalletModule:
         app = web.Application()
         app.router.add_get("/secrets", self._handle_secrets)
         app.router.add_post("/run", self._handle_run)
+        app.router.add_post("/exec", self._handle_exec)
         app.router.add_post("/get", self._handle_get)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -376,7 +394,9 @@ class WalletModule:
         for session in core.manager.list_all():
             await self._provision(session)
         core.session_hooks.append(self._provision)
-        # Авто-инъект shared-секретов (inject_at_start) в env процесса claude.
+        # Прозрачный шлюз: каталог обёрток (.wallet-bin) первым в PATH песочницы.
+        core.manager.path_hooks.append(self.session_path)
+        # env для песочницы: shared → реальное значение, inject → маркер $NAME.
         core.manager.env_hooks.append(self.session_env)
         # Вымарывать значения секретов из чат-вывода (shared модель видит и может
         # случайно эхнуть — safety-net, чтобы не улетело в Telegram/историю).
@@ -394,19 +414,32 @@ class WalletModule:
         return text
 
     def session_env(self, session) -> dict[str, str]:
-        """env для авто-инъекта в песочницу сессии: shared-секреты с
-        inject_at_start и заданным env, доступные этой сессии. Значение
-        попадает в env процесса claude (его наследуют Bash-тул и сервисы)."""
+        """env для песочницы сессии — чтобы модель писала привычный `$ENV`:
+          * shared  → РЕАЛЬНОЕ значение (модель может видеть/использовать);
+          * inject  → МАРКЕР `<<wallet:имя>>` (скрыто) — обёртка развернёт его в
+            значение на хосте, в песочницу значение не попадает;
+          * host-passthrough (нет env) → ничего.
+        Плюс маркер пути к файлу `<<wallet:имя:file>>` в `$ENV_FILE` (ssh-ключ,
+        сертификат) — для inject-секретов."""
         out: dict[str, str] = {}
         for s in self.store.load().values():
-            if s.shared and s.inject_at_start and s.env and s.session_allowed(session.name):
+            if not s.env or not s.session_allowed(session.name):
+                continue
+            if s.shared:
                 out[s.env] = s.value
+            else:
+                out[s.env] = marker(s.name)
+                out[s.env + "_FILE"] = marker(s.name, as_file=True)
         return out
 
     async def stop(self) -> None:
         if self.core is not None:
             try:
                 self.core.session_hooks.remove(self._provision)
+            except ValueError:
+                pass
+            try:
+                self.core.manager.path_hooks.remove(self.session_path)
             except ValueError:
                 pass
             try:
@@ -469,6 +502,78 @@ class WalletModule:
         # Перевыдача (рестарт/повторный hook) отзывает прежний токен сессии.
         self._tokens = {t: n for t, n in self._tokens.items() if n != session.name}
         self._tokens[token] = session.name
+        self._provision_shims(session)
+
+    # ── прозрачные обёртки (шлюз в PATH) ─────────────────────────
+
+    def session_path(self, session) -> list[str]:
+        """Каталог обёрток кошелька для PATH песочницы (SessionManager.path_hooks,
+        prepend). Возвращаем всегда, даже пустой/несозданный: файлы появляются в
+        нём из session_hooks уже ПОСЛЕ старта claude, а каталог bind-смонтирован
+        живым (session_home == $HOME песочницы), поэтому обёртки подхватываются
+        без перезапуска. Пустой каталог в PATH шелл просто пропускает."""
+        return [str(self.core.manager.session_home(session) / SHIM_DIRNAME)]
+
+    def _session_tools(self, session) -> set[str]:
+        """Голые имена инструментов, которые надо завернуть для этой сессии —
+        из `commands` её НЕ-shared секретов. shared пропускаем: их значение уже
+        лежит в env песочницы (модель зовёт инструмент напрямую, хостовый
+        раунд-трип не нужен). Из шаблона берём первый токен (`curl https://a/*`
+        → curl); чистые глобы (`*`) не заворачиваем — не бинарь."""
+        tools: set[str] = set()
+        for s in self.store.load().values():
+            if s.shared or not s.session_allowed(session.name):
+                continue
+            for pat in s.effective_commands:
+                parts = pat.split()
+                tool = os.path.basename(parts[0]) if parts else ""
+                if tool and not any(c in tool for c in "*?["):
+                    tools.add(tool)
+        return tools
+
+    def _git_shim(self) -> str:
+        """Обёртка git: сетевые подкоманды → на хост через кошелёк, локальные →
+        настоящий git в песочнице. Путь настоящего git резолвим на хосте (/usr
+        у песочницы тот же RO-бинд, поэтому путь совпадает)."""
+        real = shutil.which("git") or "/usr/bin/git"
+        nets = "|".join(GIT_NETWORK)
+        return (
+            "#!/bin/sh\n"
+            "# Обёртка кошелька (генерируется): сетевые git-подкоманды идут на\n"
+            "# хост через `wallet exec` (креды хоста), локальные — настоящим git.\n"
+            f'case "${{1:-}}" in\n'
+            f'  {nets}) exec wallet exec git "$@" ;;\n'
+            "esac\n"
+            f'exec {real} "$@"\n'
+        )
+
+    def _provision_shims(self, session) -> None:
+        """Полная перегенерация обёрток в <дом-сессии>/.wallet-bin. Заворачиваем
+        gh/curl/ssh/… целиком (→ `wallet exec <tool>`), git — особо (см. _git_shim).
+        Перегенерация чистит устаревшие обёртки, если секрет/команду отозвали."""
+        shim_dir = self.core.manager.session_home(session) / SHIM_DIRNAME
+        try:
+            if shim_dir.exists():
+                for old in shim_dir.iterdir():
+                    if old.is_file() or old.is_symlink():
+                        old.unlink()
+            tools = self._session_tools(session)
+            if not tools:
+                return
+            shim_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(shim_dir, 0o700)
+            for tool in sorted(tools):
+                script = self._git_shim() if tool == "git" else (
+                    f'#!/bin/sh\nexec wallet exec {tool} "$@"\n'
+                )
+                p = shim_dir / tool
+                p.write_text(script)
+                os.chmod(p, 0o755)
+            logger.info(
+                "wallet: обёртки сессии %s: %s", session.name, ", ".join(sorted(tools))
+            )
+        except OSError as e:
+            logger.error("wallet: обёртки для %s не созданы: %s", session.name, e)
 
     # ── HTTP API ────────────────────────────────────────────────
 
@@ -559,6 +664,7 @@ class WalletModule:
         )
 
     async def _handle_run(self, request: web.Request) -> web.Response:
+        """Явный вызов: `wallet run <name> -- <cmd>` — секрет задан именем."""
         session = self._auth(request)
         if session is None:
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -570,14 +676,41 @@ class WalletModule:
                 raise ValueError("пустая команда")
         except Exception:
             return web.json_response({"error": "bad request"}, status=400)
-        cmd_str = " ".join(cmd)
+        return await self._run_secret(session, self.store.load().get(name), cmd, name)
 
+    async def _handle_exec(self, request: web.Request) -> web.Response:
+        """Прозрачный шлюз: `wallet exec <cmd>` (зовут обёртки в PATH песочницы)
+        — секрет подбирается ПО КОМАНДЕ (чей `commands` её разрешает). Модель
+        зовёт инструмент как обычно."""
+        session = self._auth(request)
+        if session is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+            cmd = [str(c) for c in body["cmd"]]
+            if not cmd:
+                raise ValueError("пустая команда")
+        except Exception:
+            return web.json_response({"error": "bad request"}, status=400)
+        secret = self._resolve_secret(session, cmd)
+        label = secret.name if secret is not None else os.path.basename(cmd[0])
+        return await self._run_secret(session, secret, cmd, label)
+
+    def _resolve_secret(self, session, cmd: list[str]):
+        """Секрет, чьи commands разрешают эту команду для сессии (авто-подбор для
+        /exec). Первый подходящий; None — если ни один не разрешает."""
+        for s in self.store.load().values():
+            if s.session_allowed(session.name) and s.command_allowed(cmd):
+                return s
+        return None
+
+    async def _run_secret(self, session, secret, cmd: list[str], label: str) -> web.Response:
+        """Общий путь /run и /exec: policy (guard/deny/confirm) + наблюдаемость +
+        выполнение на хосте + редакция вывода."""
+        cmd_str = " ".join(cmd)
         all_secrets = self.store.load()
-        secret = all_secrets.get(name)
-        # Причина отказа для прозрачности (что не так + как правильно). Порядок:
-        #   1. встроенный guard (печать токена, git-RCE) — если включён глобально
-        #      (WALLET_GUARD) и не снят на секрете (allow_unsafe);
-        #   2. точечный deny секрета — поверх commands (deny побеждает allow).
+        # Причина отказа для прозрачности: 1) встроенный guard (печать токена,
+        # git-RCE), 2) точечный deny секрета.
         reason: str | None = None
         if secret is not None:
             if self.config.wallet_guard and not secret.allow_unsafe:
@@ -591,55 +724,32 @@ class WalletModule:
             and reason is None
         )
         if allowed and secret.confirm:
-            # Вердикт остаётся в ядре (кнопки ✅/❌ во всех адаптерах),
-            # таймаут/ошибка = отказ.
             allowed = await self.core.request_confirmation(
-                session,
-                tool="wallet",
-                description=f"{name} → {cmd_str[:200]}",
-                preview=cmd_str,
+                session, tool="wallet",
+                description=f"{label} → {cmd_str[:200]}", preview=cmd_str,
             )
-
-        # Наблюдаемость: КАЖДАЯ попытка видна — в том числе отказанная
-        # (промпт-инъекция не пройдёт незамеченной). Бабл живёт только во время
-        # активного хода (append дропается вне его), а wallet может вызываться
-        # из фонового шелла между ходами — поэтому пишем И в бабл (когда есть),
-        # И служебным уведомлением через notice (доходит всегда, во все
-        # адаптеры), И в журнал.
-        # Наблюдаемость. Успешный вызов виден строкой в статус-бабле (ходовом
-        # ИЛИ фоновом — append_background сам разрулит; tool="wallet" схлопывает
-        # серию одинаковых, поллинг не спамит). Отдельное top-level уведомление
-        # шлём ТОЛЬКО на ОТКАЗ (нужно внимание, бабл может быть незаметен). Формат
-        # notice — markdown (идёт через md_to_html); бабл — HTML напрямую.
-        cmd_disp = f"{name} → {cmd_str[:120]}"
+        # Наблюдаемость: КАЖДАЯ попытка видна строкой в бабле; отдельное
+        # уведомление — только на ОТКАЗ (нужно внимание).
+        cmd_disp = f"{label} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.core.bubbles.append_background(
-            session.name, bubble_line, tool="wallet"
-        )
-        self.core._record(session, "wallet", secret=name, cmd=cmd_str, allowed=bool(allowed))
+        await self.core.bubbles.append_background(session.name, bubble_line, tool="wallet")
+        self.core._record(session, "wallet", secret=label, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
-            # Прозрачность: причина у ВСЕХ отказов. guard/deny заполнили reason
-            # выше; policy-промах и отказ кнопкой — здесь. reason доходит до
-            # терминала модели (bin/wallet печатает его), а не глухое «denied».
             if reason is None:
                 if secret is None:
-                    reason = f"нет секрета «{name}» для этой сессии (см. `wallet ls`)"
+                    reason = f"нет секрета для «{cmd_str[:80]}» (проверь `wallet ls`)"
                 elif not secret.session_allowed(session.name):
                     reason = "секрет не разрешён этой сессии (policy sessions)"
                 elif not secret.command_allowed(cmd):
                     reason = "команда не в списке разрешённых (policy commands)"
                 else:
                     reason = "отклонено кнопкой подтверждения"
-            notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"  # md code-спан
+            notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"
             await self.core.notice(
                 session,
                 self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
             )
-            return web.json_response(
-                {"error": "denied", "reason": reason},
-                status=403,
-            )
-
+            return web.json_response({"error": "denied", "reason": reason}, status=403)
         code, out, err = await self._execute(session, secret, cmd)
         values = [s.value for s in all_secrets.values()]
         return web.json_response(
@@ -672,38 +782,44 @@ class WalletModule:
         env.pop("DISPLAY", None)
         env.pop("SSH_ASKPASS", None)
 
-        # Плейсхолдеры {{secret}} / {{secret_file}} — только у inject-секретов.
-        has_val = any(PH_VALUE in a for a in cmd)
-        has_file = any(PH_FILE in a for a in cmd)
         tmpdir: str | None = None
-        if secret.host_passthrough:
-            if has_val or has_file:
-                return 2, b"", (
-                    f"{PH_VALUE}/{PH_FILE} работают только с inject-секретом "
-                    "(value+env); у host-passthrough значения нет — подставлять нечего. "
-                    "SSH/git по ключам на хосте идут host-passthrough без плейсхолдеров."
-                ).encode()
-        else:
+        # Основной секрет-inject → реальное значение в env (env-читающие
+        # инструменты, gh->GH_TOKEN, получают его на хосте).
+        if not secret.host_passthrough:
             env[secret.env] = secret.value
-            # Частичная защита git от подложенного локального конфига (только
-            # inject-режим: у host-passthrough gh credential helper в глобальном
-            # ~/.gitconfig, обнулять его нельзя — иначе push потеряет auth).
+            # Частичная защита git от подложенного локального конфига (inject).
             env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
             env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
-            if has_val:
-                cmd = [a.replace(PH_VALUE, secret.value) for a in cmd]
-            if has_file:
-                # Значение → временный 0600-файл на ХОСТЕ. Песочница видит свой
-                # tmpfs /tmp (см. runners/sandbox.py), этот файл ей недоступен;
-                # команда бежит на хосте и читает его по подставленному пути.
-                # Каталог сносим в finally. Для ssh-ключей/сертификатов/JSON-кред.
-                tmpdir = tempfile.mkdtemp(prefix="wallet-")
-                path = os.path.join(tmpdir, "secret")
-                data = secret.value if secret.value.endswith("\n") else secret.value + "\n"
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as f:
-                    f.write(data)
-                cmd = [a.replace(PH_FILE, path) for a in cmd]
+        # Развернуть маркеры <<wallet:имя>> / <<wallet:имя:file>> в аргументах в
+        # РЕАЛЬНОЕ значение на хосте (curl-заголовок, ssh-ключ): модель писала
+        # $ENV → шелл развернул в маркер → тут подставляем значение. Файл — во
+        # временный 0600 на хосте (песочнице невидим, tmpfs /tmp), сносится в
+        # finally. Маркер неизвестного/недоступного секрета → пусто (не течём).
+        all_secrets = self.store.load()
+
+        def _sub(arg: str) -> str:
+            nonlocal tmpdir
+
+            def repl(m: "re.Match") -> str:
+                nonlocal tmpdir
+                s = all_secrets.get(m.group(1))
+                if s is None or not s.session_allowed(session.name) or not s.value:
+                    return ""
+                if not m.group(2):
+                    return s.value
+                if tmpdir is None:
+                    tmpdir = tempfile.mkdtemp(prefix="wallet-")
+                path = os.path.join(tmpdir, m.group(1))
+                if not os.path.exists(path):
+                    data = s.value if s.value.endswith("\n") else s.value + "\n"
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w") as f:
+                        f.write(data)
+                return path
+
+            return MARKER_RE.sub(repl, arg)
+
+        cmd = [_sub(a) for a in cmd]
 
         try:
             try:

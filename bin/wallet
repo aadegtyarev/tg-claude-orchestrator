@@ -39,18 +39,20 @@ wallet УЖЕ в PATH — зови `wallet ...` (без полного пути)
 
 Команды:
   wallet ls                    какие секреты доступны (имя, режим, разрешённые команды)
-  wallet run <имя> -- <cmd..>  выполнить команду с секретом
+  wallet run <имя> -- <cmd..>  выполнить команду с конкретным секретом
+  wallet exec <cmd..>          выполнить команду, секрет подберётся по ней
   wallet get <имя>             значение shared-секрета (dev-ключ, логин/пароль)
   wallet env <имя>             shared-секрет как `export ENV=..` (eval / .env сервиса)
   wallet help                  эта справка
 
 Три режима (какой у секрета — видно в `wallet ls`):
   host    команда идёт с кредами хоста (gh/git/ssh и т.п.); значение тебе не нужно.
-  inject  токен кладётся в env-переменную $ENV — gh/aws/kubectl читают её сами.
-          Где значение нужно В КОМАНДЕ (curl-заголовок, ssh-ключ) — плейсхолдеры,
-          их подставляет демон (значение к тебе не попадает):
-            {{secret}}       в строку аргумента: curl -H "Authorization: Bearer {{secret}}"
-            {{secret_file}}  во временный файл:  ssh -i {{secret_file}}
+  inject  токен отдаётся env-переменной $ENV — используй её ПРИВЫЧНО:
+            - инструмент читает сам (gh→$GH_TOKEN, aws, kubectl);
+            - или вставь в команду:  curl -H "Authorization: Bearer $OPENAI_KEY"
+            - или файлом:            ssh -i $DEPLOY_KEY_FILE   (env $ENV_FILE)
+          В песочнице в $ENV лежит МАРКЕР, реальное значение подставляется на
+          хосте — ты его не видишь.
   shared  значение, которое ТЕБЕ можно получить (wallet get / wallet env).
 
 Правила:
@@ -130,11 +132,11 @@ def cmd_ls(cfg: dict) -> int:
         confirm = " [confirm]" if s.get("confirm") else ""
         print(f"{s['name']}{desc}{confirm}")
         # host — команда на хосте с его кредами (keyring/gh/git), инъекции нет.
-        # inject — значение в env-переменную $<env> (инструменты вроде gh/aws/
-        # kubectl читают её сами), а где нужно значение В КОМАНДЕ — плейсхолдеры
-        # {{secret}} (в строку, напр. curl -H '... {{secret}}') и {{secret_file}}
-        # (во временный файл, напр. ssh -i {{secret_file}}). Подставляет демон —
-        # значение к тебе не попадает.
+        # inject — значение в env-переменную $<env>; используй её привычно:
+        # инструмент читает сам (gh/aws/kubectl), либо вставь в команду
+        # (curl -H "Authorization: Bearer $ENV"), либо файлом ($ENV_FILE, напр.
+        # ssh -i $ENV_FILE). В песочнице в $ENV лежит маркер, реальное значение
+        # демон подставляет на хосте — к тебе оно не попадает.
         mode = s.get("mode")
         if mode == "shared":
             # shared — значение ВЫДАётся тебе (dev-ключ, логин/пароль): его можно
@@ -142,8 +144,8 @@ def cmd_ls(cfg: dict) -> int:
             hint = f", env ${s['env']}" if s.get("env") else ""
             print(f"    режим: shared → `wallet get {s['name']}` (значение{hint})")
         elif mode == "inject" and s.get("env"):
-            print(f"    режим: inject → env ${s['env']}; в строке — {{{{secret}}}},"
-                  " файлом — {{secret_file}}")
+            print(f"    режим: inject → ${s['env']} (в команде: ${s['env']} или"
+                  f" файлом ${s['env']}_FILE)")
         else:
             print("    режим: host (креды хоста: keyring/gh/git)")
         if mode != "shared":
@@ -152,14 +154,7 @@ def cmd_ls(cfg: dict) -> int:
     return 0
 
 
-def cmd_run(cfg: dict, argv: list) -> int:
-    if not argv or "--" not in argv:
-        die("использование: wallet run <имя> -- <команда...>")
-    sep = argv.index("--")
-    names, cmd = argv[:sep], argv[sep + 1:]
-    if len(names) != 1 or not cmd:
-        die("использование: wallet run <имя> -- <команда...>")
-    result = call(cfg, "POST", "/run", {"secret": names[0], "cmd": cmd})
+def _print_result(result: dict) -> int:
     if result.get("stdout"):
         sys.stdout.write(result["stdout"])
         if not result["stdout"].endswith("\n"):
@@ -169,6 +164,24 @@ def cmd_run(cfg: dict, argv: list) -> int:
         if not result["stderr"].endswith("\n"):
             sys.stderr.write("\n")
     return int(result.get("code", 1))
+
+
+def cmd_run(cfg: dict, argv: list) -> int:
+    if not argv or "--" not in argv:
+        die("использование: wallet run <имя> -- <команда...>")
+    sep = argv.index("--")
+    names, cmd = argv[:sep], argv[sep + 1:]
+    if len(names) != 1 or not cmd:
+        die("использование: wallet run <имя> -- <команда...>")
+    return _print_result(call(cfg, "POST", "/run", {"secret": names[0], "cmd": cmd}))
+
+
+def cmd_exec(cfg: dict, argv: list) -> int:
+    """wallet exec <cmd...> — выполнить команду, секрет подберётся ПО НЕЙ (зовут
+    обёртки в PATH; можно и вручную для отладки)."""
+    if not argv:
+        die("использование: wallet exec <команда...>")
+    return _print_result(call(cfg, "POST", "/exec", {"cmd": argv}))
 
 
 def cmd_get(cfg: dict, argv: list) -> int:
@@ -208,11 +221,13 @@ def main() -> int:
         return cmd_ls(cfg)
     if args[0] == "run":
         return cmd_run(cfg, args[1:])
+    if args[0] == "exec":
+        return cmd_exec(cfg, args[1:])
     if args[0] == "get":
         return cmd_get(cfg, args[1:])
     if args[0] == "env":
         return cmd_env(cfg, args[1:])
-    die(f"неизвестная команда {args[0]!r} (ls | run | get | env)")
+    die(f"неизвестная команда {args[0]!r} (ls | run | exec | get | env)")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-"""Инъекция секрета В КОМАНДУ: плейсхолдеры {{secret}} и {{secret_file}}.
+"""Маркеры секрета в команде: <<wallet:имя>> (inline) и <<wallet:имя:file>>.
 
-Нужно там, где токен должен попасть в аргумент (curl -H) или в файл (ssh -i),
-а не в env (exec без шелла — «$ENV» в аргументе не развернулся бы). Подстановка
-в демоне перед exec; значение к модели не попадает, временный файл 0600 на хосте
-(песочнице невидим) убирается после.
+Модель пишет привычный `$ENV`, шелл разворачивает его в маркер, а демон
+подставляет РЕАЛЬНОЕ значение на хосте (в аргумент curl или во временный файл
+для ssh-ключа). Значение к модели/в песочницу не попадает; маркер недоступного
+секрета → пусто.
 
 Запуск: .venv/bin/python tests/wallet_inject_test.py
 """
@@ -16,53 +16,55 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.modules.wallet.module import (  # noqa: E402
-    PH_FILE, PH_VALUE, Secret, WalletModule,
-)
+from orchestrator.modules.wallet.module import Secret, WalletModule, marker  # noqa: E402
 
 
 def _secret(**kw) -> Secret:
     d = dict(name="api", value="TOPSECRET-abc", env="API_TOKEN", description="",
              sessions=("*",), commands=("*",), deny=(), allow_unsafe=False, confirm=False,
-             shared=False, inject_at_start=False)
+             shared=False)
     d.update(kw)
     return Secret(**d)
 
 
-def _mod(cwd: Path) -> WalletModule:
+def _mod(cwd: Path, secret: Secret) -> WalletModule:
     m = WalletModule.__new__(WalletModule)
     m.core = SimpleNamespace(manager=SimpleNamespace(effective_cwd=lambda s: cwd))
+    m.store = SimpleNamespace(load=lambda: {secret.name: secret})
     return m
 
 
 async def run():
     cwd = Path(tempfile.mkdtemp())
-    mod = _mod(cwd)
     sess = SimpleNamespace(name="noos")
+    s = _secret()
+    mod = _mod(cwd, s)
     tmproot = tempfile.gettempdir()
 
-    # {{secret}} → значение прямо в аргумент.
-    code, out, err = await mod._execute(sess, _secret(), ["printf", "%s", PH_VALUE])
+    # <<wallet:api>> → реальное значение в аргумент.
+    code, out, err = await mod._execute(sess, s, ["printf", "%s", marker("api")])
     assert code == 0 and out == b"TOPSECRET-abc", (code, out, err)
-    print("OK {{secret}} → значение подставлено в строку аргумента")
+    print("OK <<wallet:api>> → значение подставлено в аргумент")
 
-    # {{secret_file}} → путь к 0600-файлу со значением; каталог убран после.
+    # <<wallet:api:file>> → путь к 0600-файлу; каталог убран после.
     before = {d for d in os.listdir(tmproot) if d.startswith("wallet-")}
-    code, out, err = await mod._execute(sess, _secret(), ["cat", PH_FILE])
+    code, out, err = await mod._execute(sess, s, ["cat", marker("api", as_file=True)])
     assert code == 0 and out == b"TOPSECRET-abc\n", (code, out, err)
     after = {d for d in os.listdir(tmproot) if d.startswith("wallet-")}
     assert after == before, f"временный каталог не убран: {after - before}"
-    print("OK {{secret_file}} → 0600-файл, путь подставлен, каталог убран после")
+    print("OK <<wallet:api:file>> → 0600-файл, путь подставлен, каталог убран")
 
-    # host-passthrough + плейсхолдер → понятная ошибка (значения нет).
-    code, out, err = await mod._execute(sess, _secret(value="", env=""), ["curl", PH_VALUE])
-    assert code == 2 and b"host-passthrough" in err, (code, err)
-    print("OK host-passthrough + плейсхолдер → отказ с объяснением")
-
-    # Без плейсхолдеров inject по-прежнему кладёт токен в env (gh/aws читают сами).
-    code, out, err = await mod._execute(sess, _secret(), ["sh", "-c", "printf %s \"$API_TOKEN\""])
+    # inject env: значение доступно процессу на хосте (для gh/aws/kubectl).
+    code, out, err = await mod._execute(sess, s, ["sh", "-c", "printf %s \"$API_TOKEN\""])
     assert code == 0 and out == b"TOPSECRET-abc", (code, out, err)
-    print("OK inject env $API_TOKEN доступен процессу (для gh/aws/kubectl)")
+    print("OK env $API_TOKEN доступен процессу на хосте")
+
+    # Маркер секрета БЕЗ значения (host-passthrough) → пусто, не течёт.
+    hp = _secret(value="", env="")
+    mod_hp = _mod(cwd, hp)
+    code, out, err = await mod_hp._execute(sess, hp, ["printf", "[%s]", marker("api")])
+    assert code == 0 and out == b"[]", (code, out, err)
+    print("OK маркер секрета без значения → пусто")
 
 
 def main():
