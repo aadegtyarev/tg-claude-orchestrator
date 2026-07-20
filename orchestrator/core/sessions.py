@@ -134,6 +134,13 @@ class Session:
     pty_master: int | None = None
     log_file: IO[bytes] | None = None
     watcher: asyncio.Task | None = None
+    # Снимок фоновых задач/кронов харнесса из последнего Stop-payload
+    # (авторитетно: {id,type,status,description,command}). Для прозрачности —
+    # что модель оставила крутиться в фоне; см. app.handle_stop_event / bg_text.
+    background_tasks: list = field(default_factory=list)
+    session_crons: list = field(default_factory=list)
+    # id фоновых задач, о которых оператора уже уведомили (дедуп, без спама).
+    bg_seen: set = field(default_factory=set)
     # Сериализация операций жизненного цикла этой сессии.
     ops: asyncio.Lock = field(default_factory=asyncio.Lock)
 

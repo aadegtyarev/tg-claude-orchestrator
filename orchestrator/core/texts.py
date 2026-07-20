@@ -12,6 +12,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new имя /путь</code> — то же, со своим именем\n"
             "• <code>/list</code> — сессии со статусами и кнопками\n"
             "• <code>/ls [путь]</code> — показать файлы\n"
+            "• <code>/bg</code> — фоновые процессы/кроны сессии (в топике)\n"
             "• <code>/wallet</code> — policy кошелька (просмотр/правка; значения скрыты)\n"
             "• <code>/orchestrator_restart</code> — перезапустить весь оркестратор (деплой)\n"
             "• <code>/orchestrator_web</code> — ссылка на локальный веб-интерфейс с токеном\n"
@@ -69,6 +70,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_no_access": "❌ Нет доступа: {error}",
         "ls_empty": "(пусто)",
         "ls_more": "… и ещё {n}",
+        "bg_new": "🔧 Модель запустила фоновое: {items}. Список — /bg",
+        "bg_empty": "🔧 Фоновых задач и кронов в сессии нет.",
+        "bg_header": "🔧 Фоновое в «{title}» (снимок последнего хода):",
+        "bg_tasks_n": "Задачи ({n}):",
+        "bg_no_tasks": "Задач нет.",
+        "bg_crons_n": "Кроны ({n}):",
+        "bg_no_crons": "Кроны: нет",
+        "bg_no_session": "Команда /bg — в топике сессии (фоновые процессы этой сессии).",
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
         "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n```\n{tail}\n```\n📥 Полный лог для разработчиков: /log",
@@ -139,6 +148,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bubble_backgrounded": "⏬ Задача свёрнута в фон (Ctrl+B) — ввод свободен",
         "bubble_kicked": "⏭ Ожидание фона прервано (Esc) — модель примет ввод",
         "bubble_waiting_bg": "⏳ Ждёт фоновую задачу (⏭ — разблокировать ввод)",
+        "bubble_bg_label": "{n} в фоне · /bg",
+        "tool_bg": "в фон",
         "unblock_requested": "Разблокирую ввод…",
         "esc_requested": "Прерываю ход (Esc)…",
         "esc_done": "⛔ Ход прерван (Esc в терминал). Контекст сохранён — можно писать дальше.",
@@ -197,6 +208,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_new": "Новая сессия (имя или /путь)",
         "menu_list": "Список сессий",
         "menu_ls": "Показать файлы",
+        "menu_bg": "Фоновые процессы сессии",
         "menu_wallet": "Кошелёк: policy секретов",
         "menu_stats": "Контекст и статистика сессии",
         "menu_usage": "Расходы и лимиты плана",
@@ -237,6 +249,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new name /path</code> — same, with a custom name\n"
             "• <code>/list</code> — sessions with statuses and buttons\n"
             "• <code>/ls [path]</code> — list files\n"
+            "• <code>/bg</code> — session background processes/crons (in a topic)\n"
             "• <code>/wallet</code> — wallet policy (view/edit; values hidden)\n"
             "• <code>/orchestrator_restart</code> — restart the whole orchestrator (deploy)\n"
             "• <code>/orchestrator_web</code> — link to the local web UI with its token\n"
@@ -294,6 +307,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ls_no_access": "❌ Access denied: {error}",
         "ls_empty": "(empty)",
         "ls_more": "… and {n} more",
+        "bg_new": "🔧 Model started a background task: {items}. List — /bg",
+        "bg_empty": "🔧 No background tasks or crons in this session.",
+        "bg_header": "🔧 Background in “{title}” (last-turn snapshot):",
+        "bg_tasks_n": "Tasks ({n}):",
+        "bg_no_tasks": "No tasks.",
+        "bg_crons_n": "Crons ({n}):",
+        "bg_no_crons": "Crons: none",
+        "bg_no_session": "The /bg command works in a session topic (that session's background processes).",
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
         "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n```\n{tail}\n```\n📥 Full log for developers: /log",
@@ -364,6 +385,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bubble_backgrounded": "⏬ Task backgrounded (Ctrl+B) — input is free",
         "bubble_kicked": "⏭ Background wait interrupted (Esc) — model will take input",
         "bubble_waiting_bg": "⏳ Waiting for a background task (⏭ — unblock input)",
+        "bubble_bg_label": "{n} in background · /bg",
+        "tool_bg": "background",
         "unblock_requested": "Unblocking input…",
         "esc_requested": "Interrupting the turn (Esc)…",
         "esc_done": "⛔ Turn interrupted (Esc into the terminal). Context kept — you can keep chatting.",
@@ -422,6 +445,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_new": "New session (name or /path)",
         "menu_list": "List sessions",
         "menu_ls": "List files",
+        "menu_bg": "Session background processes",
         "menu_wallet": "Wallet: secrets policy",
         "menu_stats": "Session context and stats",
         "menu_usage": "Cost and plan limits",

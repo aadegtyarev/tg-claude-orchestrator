@@ -3,7 +3,7 @@
 
 [project]
 name = "claude-orchestrator"
-version = "0.2.4"
+version = "0.2.5"
 description = "Оркестратор параллельных сессий Claude Code: ядро + адаптеры (Telegram, Web), песочница, модули"
 requires-python = ">=3.10"
 dependencies = [

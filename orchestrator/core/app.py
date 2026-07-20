@@ -886,12 +886,76 @@ class OrchestratorCore:
         session = self.manager.get(session_name)
         if session is None:
             return
+        # Прозрачность фоновых процессов: снимок из payload (авторитетно от
+        # харнесса) + уведомление о ВНОВЬ появившихся задачах. Делаем ДО фолбэка
+        # текста — снимок обновляем на каждом Stop независимо от reply-флага.
+        await self._update_background(session, payload)
         if self.turns.pop_reply_flag(session.name):
             return
         text = str(payload.get("last_assistant_message") or "").strip()
         if not text:
             return
         await self._deliver_text(session, text, None, intermediate=False)
+
+    async def _update_background(self, session: Session, payload: dict) -> None:
+        """Обновить снимок фоновых задач/кронов сессии из Stop-payload и уведомить
+        оператора о НОВЫХ задачах (id, о которых ещё не говорили) — без спама на
+        каждый ход. `/bg` показывает полный текущий список по запросу."""
+        tasks = payload.get("background_tasks")
+        crons = payload.get("session_crons")
+        session.background_tasks = tasks if isinstance(tasks, list) else []
+        session.session_crons = crons if isinstance(crons, list) else []
+        fresh = [
+            t for t in session.background_tasks
+            if isinstance(t, dict) and t.get("id") is not None
+            and str(t["id"]) not in session.bg_seen
+        ]
+        for t in session.background_tasks:
+            if isinstance(t, dict) and t.get("id") is not None:
+                session.bg_seen.add(str(t["id"]))
+        if fresh:
+            items = "; ".join(self._bg_task_brief(t) for t in fresh)
+            await self.notice(session, self.t("bg_new", items=items))
+
+    @staticmethod
+    def _bg_task_brief(task: dict) -> str:
+        """Короткое описание фоновой задачи для уведомления (HTML-контекст notify):
+        тип · команда (статус). Команда произвольная — экранируем."""
+        kind = html.escape(str(task.get("type") or "task"))
+        status = html.escape(str(task.get("status") or ""))
+        detail = " ".join(str(task.get("command") or task.get("description") or "").split())
+        if len(detail) > 80:
+            detail = detail[:80] + "…"
+        detail = html.escape(detail)
+        head = f"{kind} · {detail}" if detail else kind
+        return f"{head} ({status})" if status else head
+
+    def bg_text(self, session: Session) -> str:
+        """Текст `/bg`: фоновые задачи и кроны сессии из последнего снимка."""
+        tasks = [t for t in session.background_tasks if isinstance(t, dict)]
+        crons = [c for c in session.session_crons if isinstance(c, dict)]
+        if not tasks and not crons:
+            return self.t("bg_empty")
+        lines = [self.t("bg_header", title=html.escape(session.title))]
+        lines.append(self.t("bg_tasks_n", n=len(tasks)) if tasks else self.t("bg_no_tasks"))
+        for task in tasks:
+            tid = html.escape(str(task.get("id") or "?"))
+            kind = html.escape(str(task.get("type") or "task"))
+            status = html.escape(str(task.get("status") or ""))
+            desc = html.escape(" ".join(str(task.get("description") or "").split()))
+            cmd = html.escape(" ".join(str(task.get("command") or "").split())[:200])
+            lines.append(f" • [{tid}] {kind} · {status}")
+            if desc:
+                lines.append(f"   {desc}")
+            if cmd:
+                lines.append(f"   <code>{cmd}</code>")
+        lines.append(self.t("bg_crons_n", n=len(crons)) if crons else self.t("bg_no_crons"))
+        for cron in crons:
+            sched = html.escape(str(cron.get("schedule") or cron.get("cron") or ""))
+            raw_desc = str(cron.get("description") or cron.get("prompt") or "")
+            desc = html.escape(" ".join(raw_desc.split())[:120])
+            lines.append(f" • {sched} {desc}".rstrip())
+        return "\n".join(lines)
 
     # ── permission relay ────────────────────────────────────────
 

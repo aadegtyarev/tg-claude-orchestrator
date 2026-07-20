@@ -307,7 +307,7 @@ class BubbleManager:
                 await self.close(name)
             return
 
-    def _render_text(self, bubble: Bubble) -> str:
+    def _render_text(self, bubble: Bubble, session: "Session | None" = None) -> str:
         updated = time.strftime("%H:%M:%S", time.localtime(bubble.updated_at))
         # Заголовок: фоновая активность (между ходами) или обычный ход;
         # + реальная модель (после подмены прокси), если известна.
@@ -323,9 +323,22 @@ class BubbleManager:
             # чем занят», не путая с потоком вызовов.
             sep = "\n\n" if bubble.entries else ""
             text += f"{sep}✻ {html_escape(bubble.pulse)}"
+        # Метка фоновых задач/кронов сессии (снимок из последнего Stop-хука):
+        # видно, что модель оставила крутиться в фоне; детали — /bg.
+        n_bg = self._bg_count(session)
+        if n_bg:
+            text += f"\n🔧 {self._t('bubble_bg_label', n=n_bg)}"
         if bubble.entries or bubble.pulse or bubble.model:
             text += f"\n🕐 {updated}"
         return text
+
+    @staticmethod
+    def _bg_count(session: "Session | None") -> int:
+        """Сколько фоновых задач/кронов в снимке сессии (для метки бабла)."""
+        if session is None:
+            return 0
+        return len(getattr(session, "background_tasks", None) or ()) + \
+            len(getattr(session, "session_crons", None) or ())
 
     async def set_status(self, name: str, pulse: str = "", model: str = "") -> None:
         """Обновить живой статус сессии: спиннер-глагол (pulse) и/или реальную
@@ -358,7 +371,7 @@ class BubbleManager:
             bubble.entries or bubble.pulse or bubble.model
         ):
             return
-        text = self._render_text(bubble)
+        text = self._render_text(bubble, session)
         if text == bubble.sent_text:
             return
         unblock = self._unblock_available(name)
@@ -390,7 +403,7 @@ class BubbleManager:
         # flush (task ещё не done) — его текст уже не попал в эту отправку. Добиваем
         # последний апдейт, иначе бабл минуты показывает устаревшее (а при
         # DELETE_BUBBLE=false «журнальный» бабл навсегда без последних строк).
-        if self._bubbles.get(name) is bubble and self._render_text(bubble) != bubble.sent_text:
+        if self._bubbles.get(name) is bubble and self._render_text(bubble, session) != bubble.sent_text:
             bubble.flush_task = asyncio.create_task(self._flush(name))
 
     async def _await_flush(self, bubble: Bubble) -> None:

@@ -174,7 +174,12 @@ def tool_line(tool: str, tool_input: dict, t: Callable[..., str]) -> str:
 
     detail = html.escape(shorten(detail))
     head = f"{icon} <b>{html.escape(tool)}</b>"
-    return f"{head} <code>{detail}</code>" if detail else head
+    line = f"{head} <code>{detail}</code>" if detail else head
+    # Явно помечаем запуск в фон (Bash run_in_background) — оператор видит по
+    # ходу, что задача повисла в фоне, а не выполнилась и завершилась.
+    if tool == "Bash" and tool_input.get("run_in_background"):
+        line += f" · 🔧 <i>{t('tool_bg')}</i>"
+    return line
 
 
 # Полная команда текущего (in-flight) bash-вызова — в блок кода, чтобы было
