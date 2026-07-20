@@ -138,6 +138,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | `CLAUDE_ENV_<ИМЯ>` | — | Проброс env в процесс claude |
 | `ORCH_PORT` / `ORCH_HOST` | `18080` / `127.0.0.1` | Внутренний HTTP ядра |
 | `ORCH_TOKEN` | автогенерация | Секрет внутреннего API (зафиксируй для стабильности) |
+| `ORCH_SYSTEMD_UNIT` | автоопределение | systemd-юнит для `/orchestrator_restart` (если не определился из cgroup) |
 | `SHOW_TOOL_CALLS` | `true` | Вызовы инструментов в статус-бабле |
 | `DELETE_BUBBLE` | `true` | Удалять бабл после ответа (`false` — журнал) |
 | `SHOW_COMMAND_MENU` | `true` | Меню «/» в Telegram |

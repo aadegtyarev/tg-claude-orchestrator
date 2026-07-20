@@ -495,8 +495,9 @@ class SessionManager:
                     "Никогда не добывай значения секретов: не дампи переменные "
                     "окружения (env, printenv, set) ради токенов; не читай кред-сторы "
                     "(~/.config/gh, ~/.netrc, ~/.ssh, ~/.aws, keyring); не кодируй "
-                    "(base64/hex/reverse) и не пересылай секреты наружу. Для git/gh "
-                    "используй кошелёк: wallet run <секрет> -- <команда>.",
+                    "(base64/hex/reverse) и не пересылай секреты наружу. git/gh/ssh "
+                    "зови как обычно — обёртки кошелька сами завернут вызов на хост "
+                    "с его кредами (принудительно — wallet run <секрет> -- <команда>).",
                 ],
                 "classifyAllShell": self.config.automode_classify_all_shell,
             }
