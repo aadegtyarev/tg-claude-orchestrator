@@ -119,7 +119,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
 | `ADAPTERS` | `telegram` | Интерфейсы через запятую: `telegram`, `web` (можно оба) |
-| `MODULES` | — | Модули: `wallet` |
+| `MODULES` | `wallet` при `bwrap` | Модули: `wallet` (кошелёк). Не задано → включён при `SANDBOX=bwrap`; `MODULES=` — отключить |
 | `TELEGRAM_BOT_TOKEN` | — | Токен бота (обязателен при telegram в ADAPTERS) |
 | `TELEGRAM_CHAT_ID` | автопривязка | ID группы; узнать — `/chat_id` |
 | `ALLOWED_USER_IDS` | пусто (никто) | **Обязательно.** Белый список, через запятую |
@@ -239,7 +239,9 @@ Code (только Bash-тул), обёртка накрывает все инс
 
 - секреты и policy — `WALLET_SECRETS_FILE` (TOML, 0600, вне allowlist
   песочницы): каким сессиям (fnmatch, `*` = все) доступен, шаблоны разрешённых
-  команд, нужен ли confirm; **host-passthrough** (без `value`/`env` — команда с
+  команд, нужен ли confirm. **Файла нет → создаётся автоматически** с дефолтом
+  «из коробки» (host-passthrough gh/git/ssh/scp для всех сессий);
+  **host-passthrough** (без `value`/`env` — команда с
   кредами хоста), **inject** (`value`+`env` — свой токен) или **shared**
   (`shared=true` — значение, которое модель ВИДИТ: dev-ключ для её сервиса,
   логин/пароль; хранится вне чата/репо, выдаётся `wallet get`/`env` или готовой
