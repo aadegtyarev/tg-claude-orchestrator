@@ -947,10 +947,14 @@ class SessionManager:
                 ) as resp:
                     resp.raise_for_status()
                 return
-            except aiohttp.ClientConnectorError:
+            except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
                 # channel-сервер ещё поднимается (сессия только что resume, а это
-                # параллельное сообщение) — ретраим, пока не встанет. Дохлая
-                # сессия или таймаут → пробрасываем (не крутимся зря).
+                # параллельное сообщение) — ретраим, пока не встанет. Ловим и
+                # TimeoutError: /ping отвечает раньше, чем завершится stdio-MCP
+                # хендшейк, а /notify ждёт _initialized на сервере — при медленном
+                # хендшейке POST упирается в ClientTimeout(total=10) и без этого
+                # ретрая сообщение молча терялось бы. Дохлая сессия или выход за
+                # SEND_RETRY_TIMEOUT → пробрасываем (не крутимся зря).
                 if not session.running or loop.time() >= deadline:
                     raise
                 await asyncio.sleep(0.3)

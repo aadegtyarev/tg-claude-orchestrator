@@ -32,12 +32,13 @@ class _Resp:
 
 
 class _CM:
-    def __init__(self, fail):
+    def __init__(self, fail, exc):
         self.fail = fail
+        self.exc = exc
 
     async def __aenter__(self):
         if self.fail:
-            raise _conn_err()
+            raise self.exc()
         return _Resp()
 
     async def __aexit__(self, *a):
@@ -45,13 +46,14 @@ class _CM:
 
 
 class _Http:
-    def __init__(self, fail_times):
+    def __init__(self, fail_times, exc=_conn_err):
         self.fail_times = fail_times
+        self.exc = exc
         self.calls = 0
 
     def post(self, *a, **k):
         self.calls += 1
-        return _CM(self.calls <= self.fail_times)
+        return _CM(self.calls <= self.fail_times, self.exc)
 
 
 def _mgr(http):
@@ -62,7 +64,7 @@ def _mgr(http):
     return m
 
 
-async def run():
+async def test_send_retry():
     sessions.SEND_RETRY_TIMEOUT = 5.0  # тест не должен ждать долго
 
     # 3 отказа подряд, потом успех — ретрай доводит доставку.
@@ -85,9 +87,19 @@ async def run():
     assert http2.calls == 1, http2.calls
     print("OK send_to_claude: дохлая сессия → не ретраим, пробрасываем")
 
+    # Медленный stdio-MCP хендшейк: /ping уже отвечает, но /notify упирается в
+    # ClientTimeout → asyncio.TimeoutError. Раньше ретрай ловил только
+    # ConnectionRefused и сообщение молча терялось; теперь ретраим и таймаут.
+    http3 = _Http(fail_times=2, exc=asyncio.TimeoutError)
+    m3 = _mgr(http3)
+    sess3 = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=True)
+    await m3.send_to_claude(sess3, "hi", "ctx")
+    assert http3.calls == 3, http3.calls
+    print("OK send_to_claude: ретраит и на таймаут хендшейка (не только refused)")
+
 
 def main():
-    asyncio.run(run())
+    asyncio.run(test_send_retry())
     print("ALL SEND-RETRY OK")
 
 

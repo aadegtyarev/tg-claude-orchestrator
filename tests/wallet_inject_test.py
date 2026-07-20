@@ -34,7 +34,7 @@ def _mod(cwd: Path, secret: Secret) -> WalletModule:
     return m
 
 
-async def run():
+async def test_wallet_inject():
     cwd = Path(tempfile.mkdtemp())
     sess = SimpleNamespace(name="noos")
     s = _secret()
@@ -68,7 +68,7 @@ async def run():
 
 
 def main():
-    asyncio.run(run())
+    asyncio.run(test_wallet_inject())
     print("ALL WALLET-INJECT OK")
 
 
