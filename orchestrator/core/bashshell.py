@@ -6,11 +6,13 @@
 в тот же PTY — ответ на «y/n» интерактивной команды, которая всё ещё крутится
 в текущем /bash.
 
-Права и cwd — как у процесса бота (мимо Claude Code, без permission relay), но
-при SANDBOX=bwrap оболочка запускается в той же файловой песочнице, что и
-claude: видит только папку сессии/проекта и конфиг Claude Code, не остальную ФС
-(обёртка-префикс приходит параметром wrapper из ядра — core/app.py собирает её
-через manager.sandbox_prefix, см. runners/sandbox.py).
+Права и cwd — как у процесса бота (мимо Claude Code, без permission relay).
+Скоуп задаётся вызывающим (core/app.py run_bash) через параметр wrapper:
+  * /bash В СЕССИИ (топик) при SANDBOX=bwrap — та же файловая песочница, что и
+    claude (папка сессии/проекта, конфиг Claude Code); wrapper = sandbox_prefix;
+  * /bash СНАРУЖИ сессии (main-chat) — на ХОСТЕ, полный доступ (systemctl и т.п.),
+    wrapper = None. Это операторская команда (ALLOWED_USER_IDS), не модели.
+См. runners/sandbox.py.
 """
 
 from __future__ import annotations

@@ -447,6 +447,39 @@ class OrchestratorCore:
         await self._notify_state_changed(session)
         return resumed
 
+    def _systemd_unit(self) -> str:
+        """Юнит текущего процесса — из cgroup (надёжно для systemd-сервиса);
+        override через ORCH_SYSTEMD_UNIT, фолбэк — стандартное имя."""
+        if self.config.orch_systemd_unit:
+            return self.config.orch_systemd_unit
+        try:
+            cg = Path("/proc/self/cgroup").read_text()
+            m = re.search(r"([\w@.-]+\.service)", cg)
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+        return "claude-orchestrator.service"
+
+    async def restart_service(self) -> str:
+        """Перезапустить весь оркестратор через systemd (self-restart из бота).
+        `--no-block`: systemctl ставит задачу и сразу выходит, чтобы мы успели
+        ответить пользователю до того, как systemd остановит процесс. Возвращает
+        имя юнита; UserError, если systemctl не сработал (не под systemd?)."""
+        unit = self._systemd_unit()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", "restart", "--no-block", unit,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await proc.communicate()
+        except OSError as e:
+            raise UserError(self.t("restart_fail", error=str(e))) from e
+        if proc.returncode != 0:
+            msg = err.decode(errors="replace").strip() or f"systemctl вернул {proc.returncode}"
+            raise UserError(self.t("restart_fail", error=msg))
+        return unit
+
     def wallet_command(self, args_str: str) -> str:
         """`/wallet …` — просмотр/правка policy кошелька. Ядро находит модуль
         `wallet` по имени (как прочие команды; полный реестр команд модулей —
@@ -1178,16 +1211,21 @@ class OrchestratorCore:
         у claude). Стримит рендер (HTML) через on_update(html, done); в конце —
         код возврата. Если терминал занят — UserError.
         """
-        # agent-vm не может изолировать отдельный /bash (одна VM на cwd) —
-        # молча гнать его на хосте, пока claude в VM, нельзя (принцип «без
-        # изоляции не деградируем»). Отказываем понятной ошибкой.
-        if not self.manager.runner.supports_prefix:
-            raise UserError(self.t("bash_no_isolation", sandbox=self.config.sandbox))
         cwd = self.bash_cwd(session)
-        extra_rw = [cwd] + ([session.session_dir] if session is not None else [])
-        wrapper = self.manager.sandbox_prefix(
-            chdir=cwd, extra_rw=extra_rw, session=session
-        )
+        if session is not None:
+            # Баш В СЕССИИ → скоуп сессии: та же файловая песочница, что и claude
+            # (видит только папку сессии/проекта). agent-vm отдельный /bash не
+            # изолирует (одна VM на cwd) — не деградируем молча, отказываем.
+            if not self.manager.runner.supports_prefix:
+                raise UserError(self.t("bash_no_isolation", sandbox=self.config.sandbox))
+            wrapper = self.manager.sandbox_prefix(
+                chdir=cwd, extra_rw=[cwd, session.session_dir], session=session
+            )
+        else:
+            # Баш СНАРУЖИ сессии (main-chat) → операторский терминал на ХОСТЕ,
+            # полный скоуп, без песочницы (systemctl, управление хостом). Это
+            # команда ТОЛЬКО оператора (ALLOWED_USER_IDS), не модели.
+            wrapper = None
         shell = self.bash.get_or_create(key, cwd, wrapper)
         if shell.busy:
             raise UserError(self.t("bash_busy"))

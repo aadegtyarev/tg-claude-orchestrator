@@ -49,6 +49,9 @@ class Config:
     orch_host: str
     orch_port: int
     orch_token: str
+    # systemd-юнит для команды /restart (self-restart). Пусто → авто-детект из
+    # /proc/self/cgroup, фолбэк claude-orchestrator.service.
+    orch_systemd_unit: str
     allowed_user_ids: frozenset[int]
     show_tool_calls: bool
     delete_bubble: bool
@@ -119,6 +122,7 @@ class Config:
             orch_port=int(os.getenv("ORCH_PORT", "18080")),
             # Токен внутреннего HTTP-API (см. _auto_orch_token / REVIEW.md S1).
             orch_token=os.getenv("ORCH_TOKEN", "").strip() or _auto_orch_token(),
+            orch_systemd_unit=os.getenv("ORCH_SYSTEMD_UNIT", "").strip(),
             allowed_user_ids=cls._parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
             show_tool_calls=cls._parse_bool(os.getenv("SHOW_TOOL_CALLS", "true")),
             delete_bubble=cls._parse_bool(os.getenv("DELETE_BUBBLE", "true")),

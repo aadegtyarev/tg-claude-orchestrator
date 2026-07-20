@@ -13,6 +13,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/list</code> — сессии со статусами и кнопками\n"
             "• <code>/ls [путь]</code> — показать файлы\n"
             "• <code>/wallet</code> — policy кошелька (просмотр/правка; значения скрыты)\n"
+            "• <code>/orchestrator_restart</code> — перезапустить весь оркестратор (деплой)\n"
+            "• <code>/bash &lt;cmd&gt;</code> — терминал на ХОСТЕ (полный доступ: systemctl и т.п.)\n"
             "• <code>/skills</code> — список скиллов\n"
             "• <code>/chat_id</code> — ID чата и привязка бота\n\n"
             "В топике сессии:\n"
@@ -26,6 +28,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/clear</code> — очистить контекст (топик остаётся)\n"
             "• <code>/close_session</code> — остановить; продолжение — сообщением\n"
             "• <code>/delete_session</code> — удалить сессию вместе с топиком\n"
+            "• <code>/bash &lt;cmd&gt;</code> / <code>/bashin</code> — терминал в песочнице сессии\n"
             "• другие <code>/команды</code> — уходят в терминал Claude Code\n\n"
             "Пока Claude работает, в топике живёт статус-бабл: вызовы\n"
             "инструментов, сабагенты и промежуточные ответы, кнопки 📋 Отчёт / ⛔ Прервать.\n"
@@ -103,6 +106,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "send_fail": "❌ Не удалось отправить: {error}",
         "clear_progress": "🧹 Перезапускаю с чистым контекстом…",
         "clear_fail": "❌ Не удалось перезапустить: {error}\nСессия остановлена — создай заново через /new.",
+        "restarting": "🔄 Перезапускаю оркестратор через systemd. Активные ходы прервутся, сессии резюмнутся; история сохранится. Стартовое уведомление придёт через несколько секунд.",
+        "restart_fail": "❌ Не удалось перезапустить: {error}\n(команда работает только под systemd --user)",
         "clear_done": "🧹 Контекст очищен, сессия готова.",
         "close_done": "⏸ Сессия остановлена, топик сохранён.\nНапиши сюда — продолжу диалог (resume).",
         "delete_confirm": "🗑 Удалить сессию «{title}» полностью — процесс, контекст и этот топик? Действие необратимо.",
@@ -197,6 +202,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_compact": "Сжать контекст сессии",
         "menu_clear": "Очистить контекст сессии",
         "menu_close": "Остановить сессию (возобновляемо)",
+        "menu_restart": "Перезапустить оркестратор (деплой)",
         "menu_delete": "Удалить сессию и топик",
         "menu_help": "Справка",
         "menu_bash": "Выполнить bash-команду (мимо Claude)",
@@ -228,6 +234,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/list</code> — sessions with statuses and buttons\n"
             "• <code>/ls [path]</code> — list files\n"
             "• <code>/wallet</code> — wallet policy (view/edit; values hidden)\n"
+            "• <code>/orchestrator_restart</code> — restart the whole orchestrator (deploy)\n"
+            "• <code>/bash &lt;cmd&gt;</code> — terminal on the HOST (full access: systemctl etc.)\n"
             "• <code>/skills</code> — list skills\n"
             "• <code>/chat_id</code> — chat ID and bot binding\n\n"
             "In a session topic:\n"
@@ -241,6 +249,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/clear</code> — fresh context (topic stays)\n"
             "• <code>/close_session</code> — stop; continue by sending a message\n"
             "• <code>/delete_session</code> — delete the session and its topic\n"
+            "• <code>/bash &lt;cmd&gt;</code> / <code>/bashin</code> — terminal in the session sandbox\n"
             "• other <code>/commands</code> — typed into the Claude Code terminal\n\n"
             "While Claude works, a status bubble lives in the topic: tool calls,\n"
             "subagents, intermediate replies, and 📋 Report / ⛔ Interrupt buttons.\n"
@@ -318,6 +327,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "send_fail": "❌ Failed to send: {error}",
         "clear_progress": "🧹 Restarting with a fresh context…",
         "clear_fail": "❌ Restart failed: {error}\nSession stopped — create it again with /new.",
+        "restarting": "🔄 Restarting the orchestrator via systemd. Active turns will be interrupted, sessions resume; history is saved. Startup notice arrives in a few seconds.",
+        "restart_fail": "❌ Restart failed: {error}\n(command works only under systemd --user)",
         "clear_done": "🧹 Context cleared, session ready.",
         "close_done": "⏸ Session stopped, topic kept.\nSend a message here to continue (resume).",
         "delete_confirm": "🗑 Delete session «{title}» entirely — process, context and this topic? This cannot be undone.",
@@ -412,6 +423,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_compact": "Compact session context",
         "menu_clear": "Clear session context",
         "menu_close": "Stop session (resumable)",
+        "menu_restart": "Restart the orchestrator (deploy)",
         "menu_delete": "Delete session and topic",
         "menu_help": "Help",
         "menu_bash": "Run a bash command (bypasses Claude)",

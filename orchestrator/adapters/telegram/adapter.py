@@ -72,6 +72,7 @@ class TelegramAdapter:
             BotCommand(command="list", description=self.t("menu_list")),
             BotCommand(command="ls", description=self.t("menu_ls")),
             BotCommand(command="wallet", description=self.t("menu_wallet")),
+            BotCommand(command="orchestrator_restart", description=self.t("menu_restart")),
             BotCommand(command="stats", description=self.t("menu_stats")),
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
@@ -381,6 +382,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_list, Command("list"))
         dp.message.register(self.cmd_ls, Command("ls"))
         dp.message.register(self.cmd_wallet, Command("wallet"))
+        dp.message.register(self.cmd_restart, Command("orchestrator_restart"))
         dp.message.register(self.cmd_close, Command("close_session", "stop"))
         dp.message.register(self.cmd_delete, Command("delete_session"))
         dp.message.register(self.cmd_compact, Command("compact"))
@@ -538,6 +540,21 @@ class TelegramAdapter:
         except UserError as e:
             text = str(e)
         await message.reply(text, parse_mode="HTML")
+
+    async def cmd_restart(self, message: Message) -> None:
+        """Перезапуск всего оркестратора (self-restart через systemd) — для
+        деплоя без хостового терминала. Отвечаем ПЕРВЫМ (systemd остановит
+        процесс сразу после), затем ставим задачу рестарта."""
+        if not self._accept(message):
+            return
+        if message.message_thread_id is not None:
+            await message.reply(self.t("only_main_chat"))
+            return
+        await message.reply(self.t("restarting"))
+        try:
+            await self.core.restart_service()
+        except UserError as e:
+            await message.reply(str(e))
 
     async def cmd_skills(self, message: Message) -> None:
         if not self._accept(message):
