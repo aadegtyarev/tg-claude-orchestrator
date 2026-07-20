@@ -21,6 +21,30 @@ ReplyHandler = Callable[[dict], Awaitable[None]]
 NamedHandler = Callable[[str, dict], Awaitable[None]]
 
 
+def _make_route(handler, *, needs_name: bool, swallow_errors: bool, what: str):
+    """Собрать aiohttp-хендлер: общий json-parse (400 на битом теле) + dispatch +
+    политика ошибок в ОДНОМ месте (раньше — ×4 копии пролога).
+
+    `swallow_errors=True` — краш хендлера логируется и отдаётся 200 (хук-эндпоинты
+    /event и /stop: хук НЕ должен блокировать Claude); иначе 500 (/reply,
+    /permission). Флаг ЯВНЫЙ — это security-значимое различие политик, его видно
+    на месте регистрации роута. `needs_name` — брать ли `{name}` из пути."""
+    async def route(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            return web.Response(status=400, text="invalid json")
+        args = (request.match_info["name"], payload) if needs_name else (payload,)
+        try:
+            await handler(*args)
+        except Exception:
+            logger.exception("Ошибка обработки %s", what)
+            if not swallow_errors:
+                return web.Response(status=500, text="handler error")
+        return web.Response(text="OK")
+    return route
+
+
 async def start_reply_server(
     config: Config,
     reply_handler: ReplyHandler,
@@ -45,59 +69,27 @@ async def start_reply_server(
             return web.Response(status=401, text="unauthorized")
         return await handler(request)
 
-    async def reply(request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-        except ValueError:
-            return web.Response(status=400, text="invalid json")
-        try:
-            await reply_handler(data)
-        except Exception:
-            logger.exception("Ошибка обработки reply")
-            return web.Response(status=500, text="handler error")
-        return web.Response(text="OK")
-
-    async def tool_event(request: web.Request) -> web.Response:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return web.Response(status=400, text="invalid json")
-        try:
-            await tool_event_handler(request.match_info["name"], payload)
-        except Exception:
-            # Хук не должен мешать Claude — ошибку только логируем.
-            logger.exception("Ошибка обработки tool-события")
-        return web.Response(text="OK")
-
-    async def permission(request: web.Request) -> web.Response:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return web.Response(status=400, text="invalid json")
-        try:
-            await permission_handler(request.match_info["name"], payload)
-        except Exception:
-            logger.exception("Ошибка обработки permission_request")
-            return web.Response(status=500, text="handler error")
-        return web.Response(text="OK")
-
-    async def stop_event(request: web.Request) -> web.Response:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return web.Response(status=400, text="invalid json")
-        try:
-            await stop_handler(request.match_info["name"], payload)
-        except Exception:
-            # Хук не должен мешать Claude — ошибку только логируем (как /event).
-            logger.exception("Ошибка обработки Stop-события")
-        return web.Response(text="OK")
-
     app = web.Application(middlewares=[_auth])
-    app.router.add_post("/reply", reply)
-    app.router.add_post("/event/{name}", tool_event)
-    app.router.add_post("/permission/{name}", permission)
-    app.router.add_post("/stop/{name}", stop_event)
+    # swallow_errors=True → 200 даже при краше хендлера: /event и /stop — это хуки
+    # Claude Code, они НЕ должны блокировать модель. /reply и /permission ждут
+    # результата → 500 при краше (см. _make_route).
+    app.router.add_post(
+        "/reply", _make_route(reply_handler, needs_name=False, swallow_errors=False, what="reply")
+    )
+    app.router.add_post(
+        "/event/{name}",
+        _make_route(tool_event_handler, needs_name=True, swallow_errors=True, what="tool-события"),
+    )
+    app.router.add_post(
+        "/permission/{name}",
+        _make_route(
+            permission_handler, needs_name=True, swallow_errors=False, what="permission_request"
+        ),
+    )
+    app.router.add_post(
+        "/stop/{name}",
+        _make_route(stop_handler, needs_name=True, swallow_errors=True, what="Stop-события"),
+    )
 
     runner = web.AppRunner(app)
     await runner.setup()

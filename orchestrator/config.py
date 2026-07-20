@@ -186,13 +186,11 @@ class Config:
                     "~/.config/claude-orchestrator/secrets.toml",
                 )
             ).expanduser(),
-            wallet_guard=os.getenv("WALLET_GUARD", "1").strip().lower()
-            not in ("0", "false", "no", "off"),
-            automode_classify_all_shell=os.getenv(
-                "AUTOMODE_CLASSIFY_ALL_SHELL", "1"
-            ).strip().lower() not in ("0", "false", "no", "off"),
-            wallet_policy_edit=os.getenv("WALLET_POLICY_EDIT", "1").strip().lower()
-            not in ("0", "false", "no", "off"),
+            wallet_guard=cls._parse_bool_default_on(os.getenv("WALLET_GUARD", "1")),
+            automode_classify_all_shell=cls._parse_bool_default_on(
+                os.getenv("AUTOMODE_CLASSIFY_ALL_SHELL", "1")
+            ),
+            wallet_policy_edit=cls._parse_bool_default_on(os.getenv("WALLET_POLICY_EDIT", "1")),
         )
 
     @staticmethod
@@ -294,6 +292,16 @@ class Config:
     @staticmethod
     def _parse_bool(raw: str) -> bool:
         return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _parse_bool_default_on(raw: str) -> bool:
+        """Как `_parse_bool`, но fail-safe: ЛЮБОЕ незнакомое значение → True.
+
+        Для security-флагов (wallet_guard, automode_classify_all_shell,
+        wallet_policy_edit), где опечатка/мусор в env должны оставлять защиту
+        ВКЛючённой, а не молча снимать её (в отличие от `_parse_bool`, где
+        незнакомое = False)."""
+        return raw.strip().lower() not in ("0", "false", "no", "off")
 
     @staticmethod
     def _parse_user_ids(raw: str) -> frozenset[int]:

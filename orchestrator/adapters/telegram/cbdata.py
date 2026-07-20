@@ -12,15 +12,23 @@
 from __future__ import annotations
 
 
+def _parse_thread(data: str) -> int | None:
+    """Разбор компактного формата `<префикс>:<thread_id>` → thread_id или None.
+
+    Общий разбор для stop/esc/bg — все три однополевые и байт-в-байт совпадали.
+    Правка формата (напр. второе поле) — теперь в одном месте."""
+    try:
+        return int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def stop_cb(thread_id: int) -> str:
     return f"stop:{thread_id}"
 
 
 def parse_stop(data: str) -> int | None:
-    try:
-        return int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        return None
+    return _parse_thread(data)
 
 
 def esc_cb(thread_id: int) -> str:
@@ -28,10 +36,7 @@ def esc_cb(thread_id: int) -> str:
 
 
 def parse_esc(data: str) -> int | None:
-    try:
-        return int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        return None
+    return _parse_thread(data)
 
 
 def bg_cb(thread_id: int) -> str:
@@ -39,10 +44,7 @@ def bg_cb(thread_id: int) -> str:
 
 
 def parse_bg(data: str) -> int | None:
-    try:
-        return int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        return None
+    return _parse_thread(data)
 
 
 def model_cb(thread_id: int, alias: str) -> str:
