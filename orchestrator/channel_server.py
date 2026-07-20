@@ -154,7 +154,8 @@ def _wallet_catalog() -> str | None:
         "leading `cd`: the command runs on the host IN YOUR PROJECT DIRECTORY, so a "
         "`cd` in your shell does not affect it. One `wallet run` = one command; do "
         "NOT wrap it in a `while`/poll loop — use the tool's own watch (e.g. `gh run "
-        "watch`) inside a single `wallet run`.\n"
+        "watch`) inside a single `wallet run`. Run `wallet help` for the full "
+        "reference (modes, placeholders, rules) before doing wallet work.\n"
         + "\n".join(lines)
     )
     if any_shared:
