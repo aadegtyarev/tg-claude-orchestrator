@@ -145,6 +145,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bubble_stop": "📋 Отчёт",
         "bubble_esc": "⛔ Прервать ход",
         "bubble_unblock": "⏭ Разблокировать",
+        # Заглушка кнопки ⏭, когда сворачивать нечего: держит место в ряду
+        # (ряд не «прыгает» — иначе легко промахнуться), тап по ней — молчаливый
+        # no-op (см. TelegramAdapter.on_bg_button).
+        "bubble_unblock_idle": "—",
         "bubble_backgrounded": "⏬ Задача свёрнута в фон (Ctrl+B) — ввод свободен",
         "bubble_kicked": "⏭ Ожидание фона прервано (Esc) — модель примет ввод",
         "bubble_waiting_bg": "⏳ Ждёт фоновую задачу (⏭ — разблокировать ввод)",
@@ -382,6 +386,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bubble_stop": "📋 Report",
         "bubble_esc": "⛔ Interrupt turn",
         "bubble_unblock": "⏭ Unblock input",
+        # ⏭ placeholder when there is nothing to background: keeps its slot in the
+        # row (so the layout never shifts and you can't mistap a vanished button);
+        # tapping it is a silent no-op (see TelegramAdapter.on_bg_button).
+        "bubble_unblock_idle": "—",
         "bubble_backgrounded": "⏬ Task backgrounded (Ctrl+B) — input is free",
         "bubble_kicked": "⏭ Background wait interrupted (Esc) — model will take input",
         "bubble_waiting_bg": "⏳ Waiting for a background task (⏭ — unblock input)",

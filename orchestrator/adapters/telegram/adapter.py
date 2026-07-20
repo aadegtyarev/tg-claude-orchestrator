@@ -237,17 +237,20 @@ class TelegramAdapter:
     def _stop_markup(self, thread_id: int, unblock_active: bool = False) -> InlineKeyboardMarkup:
         # 📋 — отчёт: просим Claude дать статус-отчёт и ПРОДОЛЖИТЬ (не стоп —
         #     прежний «мягкий стоп» модель считала инъекцией; см. on_stop_button);
-        # ⏭ — разблокировать ввод (Ctrl+B/Esc): в Telegram нет «серых» кнопок,
-        #     поэтому ПОКАЗЫВАЕМ её только когда есть что разблокировать
-        #     (unblock_active) — иначе бесполезная кнопка-no-op;
+        # ⏭ — разблокировать ввод (Ctrl+B/Esc). Кнопка ВСЕГДА на своём месте
+        #     (ряд не «прыгает» — иначе легко тапнуть по исчезнувшей и попасть в
+        #     соседнюю). Когда сворачивать нечего — вместо ⏭ дефис-заглушка
+        #     (bubble_unblock_idle), а тап по ней — молчаливый no-op (on_bg_button);
         # ⛔ — жёсткое прерывание хода: Esc в PTY (ход обрывается сразу).
-        row = [InlineKeyboardButton(
-            text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id))]
-        if unblock_active:
-            row.append(InlineKeyboardButton(
-                text=self.t("bubble_unblock"), callback_data=cbdata.bg_cb(thread_id)))
-        row.append(InlineKeyboardButton(
-            text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)))
+        row = [
+            InlineKeyboardButton(
+                text=self.t("bubble_stop"), callback_data=cbdata.stop_cb(thread_id)),
+            InlineKeyboardButton(
+                text=self.t("bubble_unblock" if unblock_active else "bubble_unblock_idle"),
+                callback_data=cbdata.bg_cb(thread_id)),
+            InlineKeyboardButton(
+                text=self.t("bubble_esc"), callback_data=cbdata.esc_cb(thread_id)),
+        ]
         return InlineKeyboardMarkup(inline_keyboard=[row])
 
     async def bubble_post(
@@ -1074,6 +1077,12 @@ class TelegramAdapter:
         session = self._session_by_thread(thread_id)
         if session is None:
             await callback.answer(self.t("stop_not_active"))
+            return
+        # Кнопка ⏭ всегда в ряду (место не «прыгает»), но при простое это дефис-
+        # заглушка: сворачивать нечего → тихо гасим спиннер и НИЧЕГО не делаем
+        # (без тоста). Решаем по актуальному состоянию, а не по отрисованной иконке.
+        if self.core.unblock_action(session.name) is None:
+            await callback.answer()
             return
         try:
             await self.core.unblock(session)

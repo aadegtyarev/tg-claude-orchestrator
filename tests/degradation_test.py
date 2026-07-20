@@ -70,15 +70,18 @@ def test_telegram_unblock_button_hidden():
     from orchestrator.adapters.telegram.adapter import TelegramAdapter
     a = TelegramAdapter.__new__(TelegramAdapter)
     a.t = lambda k, **kw: k
-    # Нечего разблокировать → только ⏹ и ⛔ (2 кнопки).
+    # Всегда 3 кнопки на своих местах (ряд не «прыгает», не промахнёшься). Нечего
+    # разблокировать → средняя = дефис-заглушка.
     m = a._stop_markup(7, unblock_active=False)
     labels = [b.text for row in m.inline_keyboard for b in row]
-    assert labels == ["bubble_stop", "bubble_esc"], labels
-    # Есть что → появляется ⏭ (3 кнопки).
+    assert labels == ["bubble_stop", "bubble_unblock_idle", "bubble_esc"], labels
+    # Есть что → та же позиция становится ⏭ (место не меняется).
     m2 = a._stop_markup(7, unblock_active=True)
     labels2 = [b.text for row in m2.inline_keyboard for b in row]
     assert labels2 == ["bubble_stop", "bubble_unblock", "bubble_esc"], labels2
-    print("OK Telegram: ⏭ скрыта когда нечего разблокировать, видна когда есть")
+    # callback_data средней кнопки одинаковый в обоих состояниях (стабильный ряд).
+    assert m.inline_keyboard[0][1].callback_data == m2.inline_keyboard[0][1].callback_data
+    print("OK Telegram: ⏭ всегда на месте (дефис при простое, ⏭ когда есть что)")
 
 
 def main():
