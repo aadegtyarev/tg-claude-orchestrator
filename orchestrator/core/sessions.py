@@ -52,6 +52,11 @@ READY_TIMEOUT = 60.0
 # Пауза после resume: «claude --resume» без транскрипта умирает не сразу,
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
+# Ретрай доставки в channel-сервер, пока он ещё поднимается. Гонка: сообщение №2
+# (media group / быстрый повтор) видит session.running=True сразу после старта
+# процесса claude, но channel-сервер (MCP-подпроцесс) на порту ещё не слушает →
+# ConnectionRefused. Короткий ретрай закрывает стартовое окно (обычно 1-3с).
+SEND_RETRY_TIMEOUT = 20.0
 
 
 class SessionError(Exception):
@@ -897,12 +902,24 @@ class SessionManager:
     async def send_to_claude(self, session: Session, text: str, context_id: str) -> None:
         session.last_activity = time.time()
         http = self._http_session()
-        async with http.post(
-            f"http://127.0.0.1:{session.port}/notify",
-            json={"content": text, "context_id": context_id},
-            headers=self._channel_headers(),
-        ) as resp:
-            resp.raise_for_status()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEND_RETRY_TIMEOUT
+        while True:
+            try:
+                async with http.post(
+                    f"http://127.0.0.1:{session.port}/notify",
+                    json={"content": text, "context_id": context_id},
+                    headers=self._channel_headers(),
+                ) as resp:
+                    resp.raise_for_status()
+                return
+            except aiohttp.ClientConnectorError:
+                # channel-сервер ещё поднимается (сессия только что resume, а это
+                # параллельное сообщение) — ретраим, пока не встанет. Дохлая
+                # сессия или таймаут → пробрасываем (не крутимся зря).
+                if not session.running or loop.time() >= deadline:
+                    raise
+                await asyncio.sleep(0.3)
 
     def touch(self, session: Session) -> None:
         """Отметить активность (ответ Claude) — сброс таймера простоя."""
