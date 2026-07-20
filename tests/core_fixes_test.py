@@ -266,20 +266,38 @@ async def test_teardown_runtime_unified():
         events.append(("bubble", n))
     core.bubbles = SimpleNamespace(close=fake_bclose)
 
-    # Терминальная остановка: stop + drop + очистка _last_tool + bash + бабл.
-    core._last_tool["noos"] = "Bash"
+    # Терминальная остановка: stop + drop + сброс ВСЕГО hook-состояния хода + bash
+    # + бабл. Пришпиливаем контракт, который скоро съест HookTracker.forget():
+    # teardown обязан забыть tool-activity (last_tool/inflight/grace — иначе кнопка
+    # ⏭ и вотчдог унесли бы состояние прошлого хода в следующий) И именование
+    # сабагентов (agent_types/spawns — иначе имя чужого сабагента прилипнет к
+    # следующему). Arrange пишет в поля напрямую; при выносе состояния в HookTracker
+    # эти строки переедут на hooks.* — assert'ы поведенческие/по наблюдаемому.
+    # ВАЖНО: _inflight_cleared_at ставим на time.monotonic() (свежий grace-хвост),
+    # а не 0.0: иначе _foreground_tool_active вернул бы False и без очистки — тест
+    # был бы ложно-зелёным на регресс grace-pop.
+    core._last_tool["noos"] = "TaskOutput"                 # → был бы "kick"
+    core._inflight_tools["noos"] = {"t1"}                  # → был бы "background"
+    core._inflight_cleared_at["noos"] = time.monotonic()  # свежий grace-хвост
+    core._agent_types["noos"] = {"a1": "dev-planner"}
+    core._agent_spawns["noos"] = ["dev-builder"]
     await core._teardown_runtime(SESSION)
     assert ("stop", "noos") in events and ("drop", "noos") in events
-    assert "noos" not in core._last_tool
+    assert core.unblock_action("noos") is None, \
+        "teardown не сбросил tool-activity (last_tool/inflight/grace)"
+    assert "noos" not in core._agent_types, "teardown не сбросил _agent_types (имя сабагента протечёт)"
+    assert "noos" not in core._agent_spawns, "teardown не сбросил _agent_spawns"
     assert ("bash", "noos") in events and ("bubble", "noos") in events
 
     # Продолжение (clear/switch): forget_turn + НЕ трогаем bash.
     events.clear()
     core._last_tool["noos"] = "Read"
+    core._inflight_tools["noos"] = {"t2"}
+    core._inflight_cleared_at["noos"] = time.monotonic()
     await core._teardown_runtime(SESSION, close_bash=False, forget_turn=True)
     assert ("forget", "noos") in events
     assert not any(e[0] == "bash" for e in events), events
-    assert "noos" not in core._last_tool
+    assert core.unblock_action("noos") is None
     print("OK _teardown_runtime: единый разбор; close_bash/forget_turn ветвятся")
 
 
