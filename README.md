@@ -127,6 +127,7 @@ Actions) гоняет pytest + ruff на 3.10/3.12.
 | `WEB_TOKEN` | автогенерация | Токен доступа к вебу; пуст — печатается URL в лог |
 | `WALLET_SECRETS_FILE` | `~/.config/claude-orchestrator/secrets.toml` | Секреты кошелька (0600) |
 | `WALLET_GUARD` | `1` | Встроенный всегда-запрет опасного (печать токена, git-RCE); `0` — выключить |
+| `WALLET_POLICY_EDIT` | `1` | Правка policy кошелька из чата (`/wallet`); `0` — только просмотр |
 | `AUTOMODE_CLASSIFY_ALL_SHELL` | `1` | Судья auto-режима проверяет ВСЕ bash-команды (только связка wallet+bwrap+auto); `0` — меньше вопросов, слабее защита секретов |
 | `CHANNEL_PORT_START`/`_END` | авто | Пул портов channel-серверов |
 | `SESSIONS_DIR` | `~/tg-claude-sessions` | Директория сессий (дефолт прежний — совместимость) |

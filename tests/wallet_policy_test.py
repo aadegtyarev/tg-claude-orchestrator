@@ -48,7 +48,27 @@ def test_render_hides_values():
     assert "SUPERSECRET" not in r, "значение токена утекло в вывод!"
     assert "inject" in r and "$GH_TOKEN" in r  # тип и имя env — можно, значение — нет
     assert "host-passthrough" in r
-    print("OK render: значения скрыты, тип/env/policy видны")
+    assert "<pre>" in r and "</pre>" in r, "policy должна быть в код-блоке"
+    assert "/wallet confirm" in r, "справка по правке должна быть в ответе"
+    print("OK render: значения скрыты, код-блок + справка по правке в ответе")
+
+
+def test_policy_edit_toggle():
+    ed, p = _editor()
+    before = p.read_text()
+    # allow_edit=False: просмотр работает, но любая правка отклоняется и файл цел.
+    r = ed.apply([], allow_edit=False)
+    assert "<pre>" in r and "выключена" in r
+    try:
+        ed.apply(["confirm", "host", "on"], allow_edit=False)
+        assert False, "правка должна была отклониться"
+    except PolicyError as e:
+        assert "WALLET_POLICY_EDIT" in str(e)
+    assert p.read_text() == before, "файл не должен меняться при выключенной правке"
+    # allow_edit=True: та же правка проходит.
+    ed.apply(["confirm", "host", "on"], allow_edit=True)
+    assert p.read_text() != before
+    print("OK WALLET_POLICY_EDIT: off → просмотр да, правка нет; on → правка да")
 
 
 def test_edits_persist_and_keep_comments():
@@ -111,13 +131,18 @@ def test_module_handle_command_wraps_error():
     ed, _ = _editor()
     mod = WalletModule.__new__(WalletModule)
     mod.policy = ed
+    mod.config = SimpleNamespace(wallet_policy_edit=True)
     assert mod.handle_command("frob").startswith("⚠️")
     assert "Секреты кошелька" in mod.handle_command("")
-    print("OK module.handle_command: ошибка → текст ⚠️, не исключение")
+    # тумблер выключен → правка отклоняется текстом ⚠️
+    mod.config = SimpleNamespace(wallet_policy_edit=False)
+    assert mod.handle_command("confirm host on").startswith("⚠️")
+    print("OK module.handle_command: ошибка/выключено → текст ⚠️, не исключение")
 
 
 def main():
     test_render_hides_values()
+    test_policy_edit_toggle()
     test_edits_persist_and_keep_comments()
     test_errors_are_clear()
     test_core_wallet_command()

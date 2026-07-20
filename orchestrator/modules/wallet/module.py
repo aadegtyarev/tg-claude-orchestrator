@@ -291,7 +291,10 @@ class WalletModule:
         Ошибки policy возвращаем текстом (не исключением) — ядру не нужно знать
         внутренние типы модуля."""
         try:
-            return self.policy.apply((args_str or "").split())
+            return self.policy.apply(
+                (args_str or "").split(),
+                allow_edit=self.config.wallet_policy_edit,
+            )
         except PolicyError as e:
             return f"⚠️ {e}"
 

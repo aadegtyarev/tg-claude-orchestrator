@@ -81,6 +81,9 @@ class Config:
     # больше подтверждений на легит-но-рискованное (force-push и т.п.).
     # AUTOMODE_CLASSIFY_ALL_SHELL=0 — выключить (меньше вопросов, слабее защита).
     automode_classify_all_shell: bool
+    # Разрешить правку policy кошелька из чата (команда /wallet). По умолчанию
+    # включено. WALLET_POLICY_EDIT=0 — только просмотр, правки лишь host-файлом.
+    wallet_policy_edit: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -172,6 +175,8 @@ class Config:
             automode_classify_all_shell=os.getenv(
                 "AUTOMODE_CLASSIFY_ALL_SHELL", "1"
             ).strip().lower() not in ("0", "false", "no", "off"),
+            wallet_policy_edit=os.getenv("WALLET_POLICY_EDIT", "1").strip().lower()
+            not in ("0", "false", "no", "off"),
         )
 
     @staticmethod
