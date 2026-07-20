@@ -239,6 +239,11 @@ class PolicyEditor:
         except Exception as e:  # noqa: BLE001
             raise PolicyError(f"внутренняя ошибка: результат не валиден ({e})") from e
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        # O_CREAT с 0600 (+O_TRUNC на случай остатка от прерванной записи) — файл
+        # с реальными значениями секретов ни мгновения не живёт с широкими
+        # правами (write_text открыл бы его под umask, обычно 0644). Ср. с
+        # module.py:_provision/_write_default_secrets.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
         os.replace(tmp, self.path)  # атомарно; демон перечитает по mtime

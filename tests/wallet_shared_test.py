@@ -60,7 +60,7 @@ def _body(resp) -> dict:
     return json.loads(resp.body)
 
 
-async def run():
+async def test_wallet_shared():
     st = _store(
         '[secrets.openai]\nshared=true\nvalue="SHV-123"\nenv="OPENAI_API_KEY"\n'
         'sessions=["*"]\nconfirm=false\n\n'
@@ -128,7 +128,7 @@ async def run():
 
 
 def main():
-    asyncio.run(run())
+    asyncio.run(test_wallet_shared())
     print("ALL WALLET-SHARED OK")
 
 

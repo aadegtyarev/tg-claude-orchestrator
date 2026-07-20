@@ -286,10 +286,7 @@ class SessionManager:
                     raise SessionError(
                         f"Достигнут лимит сессий ({self.config.max_instances})."
                     )
-                port = self._find_free_port()
-                if port is None:
-                    raise SessionError("Нет свободных портов для channel-сервера.")
-                session.port = port
+                self._allocate_port(session)
                 self._by_name[slug] = session
 
             try:
@@ -297,8 +294,7 @@ class SessionManager:
                 if project_path:
                     session.linked_path = self._link_project(project_path)
                 self._guard_unique_cwd(session)
-                self._write_mcp_json(session)
-                self._write_claude_settings(session)
+                self._write_configs(session)
                 await self._start_claude(session)
                 await self._wait_ready(session)
             except Exception:
@@ -331,6 +327,22 @@ class SessionManager:
                 f"Раннер «{self.runner.name}» допускает одну сессию на каталог: "
                 f"{cwd} уже занят сессией «{clash.name}»."
             )
+
+    def _allocate_port(self, session: Session) -> None:
+        """Зарезервировать свободный порт под сессию (или отказать). ВЫЗЫВАТЬ ПОД
+        `self._lock`: `_find_free_port` помечает порт в `_inflight_ports` — только
+        под локом это атомарно относительно конкурентного старта другой сессии.
+        Единая точка для create/resume/clear (текст ошибки/логика — в одном месте)."""
+        port = self._find_free_port()
+        if port is None:
+            raise SessionError("Нет свободных портов для channel-сервера.")
+        session.port = port
+
+    def _write_configs(self, session: Session) -> None:
+        """Записать mcp.json + settings.json перед стартом Claude — общий пролог
+        provisioning для create/resume/clear."""
+        self._write_mcp_json(session)
+        self._write_claude_settings(session)
 
     def _find_free_port(self) -> int | None:
         lo, hi = self.config.channel_port_start, self.config.channel_port_end
@@ -753,12 +765,8 @@ class SessionManager:
         # на один cwd убьют VM друг друга при первом сообщении.
         self._guard_unique_cwd(session)
         async with self._lock:
-            port = self._find_free_port()
-            if port is None:
-                raise SessionError("Нет свободных портов для channel-сервера.")
-            session.port = port
-        self._write_mcp_json(session)
-        self._write_claude_settings(session)
+            self._allocate_port(session)
+        self._write_configs(session)
 
         resumed = True
         await self._start_claude(session, resume=True)
@@ -805,12 +813,8 @@ class SessionManager:
             await self._wait_port_free(session.port)
             session.claude_session_id = str(uuid.uuid4())
             async with self._lock:
-                port = self._find_free_port()
-                if port is None:
-                    raise SessionError("Нет свободных портов для channel-сервера.")
-                session.port = port
-            self._write_mcp_json(session)
-            self._write_claude_settings(session)
+                self._allocate_port(session)
+            self._write_configs(session)
             try:
                 await self._start_claude(session)
                 await self._wait_ready(session)
@@ -947,10 +951,14 @@ class SessionManager:
                 ) as resp:
                     resp.raise_for_status()
                 return
-            except aiohttp.ClientConnectorError:
+            except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
                 # channel-сервер ещё поднимается (сессия только что resume, а это
-                # параллельное сообщение) — ретраим, пока не встанет. Дохлая
-                # сессия или таймаут → пробрасываем (не крутимся зря).
+                # параллельное сообщение) — ретраим, пока не встанет. Ловим и
+                # TimeoutError: /ping отвечает раньше, чем завершится stdio-MCP
+                # хендшейк, а /notify ждёт _initialized на сервере — при медленном
+                # хендшейке POST упирается в ClientTimeout(total=10) и без этого
+                # ретрая сообщение молча терялось бы. Дохлая сессия или выход за
+                # SEND_RETRY_TIMEOUT → пробрасываем (не крутимся зря).
                 if not session.running or loop.time() >= deadline:
                     raise
                 await asyncio.sleep(0.3)

@@ -409,16 +409,18 @@ class ChannelServer:
         elif method == "tools/call" and params.get("name") == "reply_to_user":
             # В фоне: пока оркестратор отвечает, read-loop должен читать stdin
             # (иначе блокируются permission_request и следующие запросы).
+            args = params.get("arguments") or {}
             self._spawn(self._forward_to_orchestrator(msg_id, {
-                "context_id": (params.get("arguments") or {}).get("context_id", ""),
-                "text": (params.get("arguments") or {}).get("text", ""),
-                "complete": bool((params.get("arguments") or {}).get("complete", False)),
+                "context_id": args.get("context_id", ""),
+                "text": args.get("text", ""),
+                "complete": bool(args.get("complete", False)),
             }, ok_text="Reply sent"))
         elif method == "tools/call" and params.get("name") == "send_file_to_user":
+            args = params.get("arguments") or {}
             self._spawn(self._forward_to_orchestrator(msg_id, {
-                "context_id": (params.get("arguments") or {}).get("context_id", ""),
-                "file_path": (params.get("arguments") or {}).get("file_path", ""),
-                "caption": (params.get("arguments") or {}).get("caption", ""),
+                "context_id": args.get("context_id", ""),
+                "file_path": args.get("file_path", ""),
+                "caption": args.get("caption", ""),
             }, ok_text="File sent"))
         elif method == "tools/call":
             await self._write_message({

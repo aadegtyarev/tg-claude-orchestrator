@@ -61,7 +61,46 @@ def main():
     assert d.wrap(["x", "y"], chdir=Path("/p"), extra_rw=[]) == ["x", "y"]
     print("OK direct: argv как есть")
 
+    test_preflight_no_binary()
+    test_preflight_no_kvm()
+    test_preflight_ok()
+
     print("ALL RUNNER OK")
+
+
+def test_preflight_no_binary():
+    """Нет бинаря agent-vm в PATH → (False, «не установлен»), /dev/kvm не проверяется."""
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    r = AgentVmRunner(cfg(), Path("/opt/orch"))
+    with mock.patch.object(agentvm.shutil, "which", return_value=None):
+        ok, why = r.preflight()
+    assert ok is False and "не установлен" in why
+    print("OK preflight: нет agent-vm -> (False, установить)")
+
+
+def test_preflight_no_kvm():
+    """Бинарь есть, но нет /dev/kvm → (False, «нет /dev/kvm»)."""
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    r = AgentVmRunner(cfg(), Path("/opt/orch"))
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=False):
+        ok, why = r.preflight()
+    assert ok is False and "/dev/kvm" in why
+    print("OK preflight: нет KVM -> (False, нет /dev/kvm)")
+
+
+def test_preflight_ok():
+    """Бинарь + /dev/kvm на месте → (True, ok)."""
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    r = AgentVmRunner(cfg(), Path("/opt/orch"))
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True):
+        ok, why = r.preflight()
+    assert ok is True and why == "ok"
+    print("OK preflight: agent-vm+KVM -> (True, ok)")
 
 
 def test_runner_agentvm():

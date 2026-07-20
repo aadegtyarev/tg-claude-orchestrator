@@ -112,7 +112,8 @@ journalctl --user -u claude-orchestrator -f
 Тесты офлайновые (без Telegram и Claude): `.venv/bin/python -m pytest`
 (или `tests/run_all.sh` — те же файлы как отдельные скрипты; каждый тест
 запускается обоими способами). Линт: `.venv/bin/ruff check .` CI (GitHub
-Actions) гоняет pytest + ruff на 3.10/3.12.
+Actions) гоняет ruff + оба раннера (pytest И `tests/run_all.sh`) на 3.10/3.12 —
+файл-скрипт без `test_*`-функции больше не проходит незамеченным.
 
 ## Конфигурация (.env)
 

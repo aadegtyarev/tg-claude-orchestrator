@@ -501,12 +501,13 @@ class TelegramAdapter:
             await message.reply(self.t("list_empty"))
             return
         lines, rows = [], []
+        status_labels = {
+            "stopped": self.t("st_stopped"),
+            "working": self.t("st_working"),
+            "waiting": self.t("st_waiting"),
+        }
         for s in sessions:
-            status = {
-                "stopped": self.t("st_stopped"),
-                "working": self.t("st_working"),
-                "waiting": self.t("st_waiting"),
-            }[self.core.session_status(s)]
+            status = status_labels[self.core.session_status(s)]
             line = f"{status} — {s.title}"
             if s.model:
                 line += f" [{s.model}]"
@@ -1022,7 +1023,7 @@ class TelegramAdapter:
             await callback.answer()
             return
         thread_id = cbdata.parse_stop(callback.data or "")
-        session = self._session_by_thread(thread_id) if thread_id is not None else None
+        session = self._session_by_thread(thread_id)
         if session is None:
             await callback.answer(self.t("stop_not_active"))
             return
@@ -1051,7 +1052,7 @@ class TelegramAdapter:
             await callback.answer()
             return
         thread_id = cbdata.parse_esc(callback.data or "")
-        session = self._session_by_thread(thread_id) if thread_id is not None else None
+        session = self._session_by_thread(thread_id)
         if session is None:
             await callback.answer(self.t("stop_not_active"))
             return
@@ -1070,7 +1071,7 @@ class TelegramAdapter:
             await callback.answer()
             return
         thread_id = cbdata.parse_bg(callback.data or "")
-        session = self._session_by_thread(thread_id) if thread_id is not None else None
+        session = self._session_by_thread(thread_id)
         if session is None:
             await callback.answer(self.t("stop_not_active"))
             return

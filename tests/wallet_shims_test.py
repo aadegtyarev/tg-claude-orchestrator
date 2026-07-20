@@ -39,7 +39,7 @@ def _mod(store: SecretStore, home: Path) -> WalletModule:
     return m
 
 
-def main():
+def test_wallet_shims():
     home = Path(tempfile.mkdtemp())
     st = _store(
         # host-passthrough без commands → дефолт gh/git/ssh/scp
@@ -109,4 +109,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test_wallet_shims()

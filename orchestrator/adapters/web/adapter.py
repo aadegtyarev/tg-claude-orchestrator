@@ -14,6 +14,7 @@ REST API (/api/*). Статика (SPA на vanilla JS) отдаётся без 
 from __future__ import annotations
 
 import asyncio
+import functools
 import itertools
 import logging
 import secrets
@@ -32,6 +33,20 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "orch_web_token"
+
+
+def with_session(handler):
+    """Декоратор для h_*-хендлеров с адресацией по {name}: резолвит сессию через
+    `_session_of`, отдаёт 404 «session not found» если её нет, иначе зовёт
+    хендлер с готовым `session`. Убирает ~19 копий guard-пролога — правка текста
+    ошибки/кода статуса теперь в одном месте."""
+    @functools.wraps(handler)
+    async def wrapper(self, request: web.Request):
+        session = self._session_of(request)
+        if session is None:
+            return self._err("session not found", 404)
+        return await handler(self, request, session)
+    return wrapper
 
 
 class WebAdapter:
@@ -372,10 +387,8 @@ class WebAdapter:
         await self._sessions_changed()
         return web.json_response(self._session_info(session))
 
-    async def h_message(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_message(self, request: web.Request, session: Session) -> web.Response:
         data = await self._json_body(request)
         text = str(data.get("text", ""))
         if not text.strip():
@@ -400,18 +413,14 @@ class WebAdapter:
             await self._sessions_changed()  # resume — статус в списке поменялся
         return web.json_response({"ok": True, "slash": is_slash})
 
-    async def h_close(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_close(self, request: web.Request, session: Session) -> web.Response:
         await self.core.close_session(session)
         await self._sessions_changed()
         return web.json_response({"ok": True})
 
-    async def h_clear(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_clear(self, request: web.Request, session: Session) -> web.Response:
         try:
             await self.core.clear_session(session)
         except UserError as e:
@@ -419,28 +428,22 @@ class WebAdapter:
         await self._sessions_changed()
         return web.json_response({"ok": True})
 
-    async def h_delete(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_delete(self, request: web.Request, session: Session) -> web.Response:
         await self.core.delete_session(session)
         await self._sessions_changed()
         return web.json_response({"ok": True})
 
-    async def h_compact(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_compact(self, request: web.Request, session: Session) -> web.Response:
         try:
             await self.core.compact(session)
         except UserError as e:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_stop(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_stop(self, request: web.Request, session: Session) -> web.Response:
         try:
             await self.core.request_report(session, self._origin())
         except Exception as e:
@@ -448,30 +451,24 @@ class WebAdapter:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_interrupt(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_interrupt(self, request: web.Request, session: Session) -> web.Response:
         try:
             await self.core.hard_stop(session)
         except UserError as e:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_unblock(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_unblock(self, request: web.Request, session: Session) -> web.Response:
         try:
             await self.core.unblock(session)
         except UserError as e:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_model(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_model(self, request: web.Request, session: Session) -> web.Response:
         data = await self._json_body(request)
         model = str(data.get("model", "")).strip()
         if not model:
@@ -483,38 +480,29 @@ class WebAdapter:
         await self._sessions_changed()
         return web.json_response({"resumed": resumed})
 
-    async def h_stats(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_stats(self, request: web.Request, session: Session) -> web.Response:
         # Блокирующее чтение транскрипта — в поток, event loop не стопорим.
         text = await asyncio.to_thread(self.core.stats_text, session)
         return web.json_response({"text": text})
 
-    async def h_usage(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_usage(self, request: web.Request, session: Session) -> web.Response:
         try:
             text = await self.core.usage_text(session)
         except UserError as e:
             return self._err(str(e))  # остановленная сессия и т.п.
         return web.json_response({"text": text})  # null — распарсить не удалось
 
-    async def h_bubble(self, request: web.Request) -> web.Response:
+    @with_session
+    async def h_bubble(self, request: web.Request, session: Session) -> web.Response:
         """Снапшот активного статус-бабла (или null) — клиент запрашивает при
         переключении/реконнекте, иначе бабл и кнопки ⏹/⛔ невидимы до
         следующего события."""
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
         return web.json_response(self._bubble_state.get(session.name))
 
-    async def h_history(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
-
+    @with_session
+    async def h_history(self, request: web.Request, session: Session) -> web.Response:
         def _render() -> list[dict]:
             items = []
             for ev in self.core.history(session.name):
@@ -528,10 +516,8 @@ class WebAdapter:
         # стопорил event loop (regex-рендер каждого блока).
         return web.json_response(await asyncio.to_thread(_render))
 
-    async def h_permission(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_permission(self, request: web.Request, session: Session) -> web.Response:
         data = await self._json_body(request)
         request_id = str(data.get("request_id", ""))
         behavior = str(data.get("behavior", ""))
@@ -547,10 +533,8 @@ class WebAdapter:
 
     # ── HTTP: файлы ─────────────────────────────────────────────
 
-    async def h_upload(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_upload(self, request: web.Request, session: Session) -> web.Response:
         try:
             reader = await request.multipart()
         except Exception:
@@ -593,10 +577,8 @@ class WebAdapter:
             return self._err(str(e))
         return web.json_response({"ok": True, "path": str(dest)})
 
-    async def h_file(self, request: web.Request) -> web.StreamResponse:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_file(self, request: web.Request, session: Session) -> web.StreamResponse:
         raw = request.query.get("path", "")
         if not raw:
             return self._err("path required")
@@ -615,13 +597,11 @@ class WebAdapter:
             "X-Content-Type-Options": "nosniff",
         })
 
-    async def h_log(self, request: web.Request) -> web.StreamResponse:
+    @with_session
+    async def h_log(self, request: web.Request, session: Session) -> web.StreamResponse:
         """Скачать полный claude.log сессии (для отладки формата Claude Code).
         Отдаём как вложение с осмысленным именем; путь фиксирован (session_dir),
         поэтому jail не нужен."""
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
         log = session.session_dir / "claude.log"
         if not log.is_file():
             return self._err("log not found", 404)
@@ -632,10 +612,8 @@ class WebAdapter:
 
     # ── HTTP: bash-терминал ─────────────────────────────────────
 
-    async def h_bash(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_bash(self, request: web.Request, session: Session) -> web.Response:
         data = await self._json_body(request)
         cmd = str(data.get("cmd", "")).strip()
         if not cmd:
@@ -656,10 +634,8 @@ class WebAdapter:
             return self._err(str(e))
         return web.json_response({"ok": True})
 
-    async def h_bash_input(self, request: web.Request) -> web.Response:
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
+    @with_session
+    async def h_bash_input(self, request: web.Request, session: Session) -> web.Response:
         data = await self._json_body(request)
         text = str(data.get("text", ""))
         key = self.core.bash_key(session, "web")
@@ -673,11 +649,9 @@ class WebAdapter:
         path = request.query.get("path") or None
         return web.json_response({"text": self.core.ls_text(path)})
 
-    async def h_bg(self, request: web.Request) -> web.Response:
+    @with_session
+    async def h_bg(self, request: web.Request, session: Session) -> web.Response:
         """Фоновые процессы/кроны сессии (снимок из последнего Stop-хука)."""
-        session = self._session_of(request)
-        if session is None:
-            return self._err("session not found", 404)
         return web.json_response({
             "text": self.core.bg_text(session),
             "background_tasks": session.background_tasks,

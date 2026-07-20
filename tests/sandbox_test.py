@@ -9,6 +9,7 @@
 Запуск: .venv/bin/python tests/sandbox_test.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -171,6 +172,50 @@ def test_real_isolation():
         (home / "leaktest.txt").unlink(missing_ok=True)
 
 
+def test_available_no_bwrap():
+    """Нет bwrap в PATH → (False, «не установлен»), probe не запускается."""
+    from unittest import mock
+    with mock.patch.object(sandbox.shutil, "which", return_value=None), \
+         mock.patch.object(sandbox.subprocess, "run") as run:
+        ok, why = sandbox.available()
+    assert ok is False and "не установлен" in why
+    run.assert_not_called()  # без bwrap probe даже не пробуем
+    print("OK available: нет bwrap -> (False, установить)")
+
+
+def test_available_probe_raises():
+    """bwrap есть, но probe-subprocess падает (exec/таймаут) → (False, «не запускается»)."""
+    from unittest import mock
+    with mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"), \
+         mock.patch.object(sandbox.subprocess, "run", side_effect=OSError("boom")):
+        ok, why = sandbox.available()
+    assert ok is False and "не запускается" in why and "boom" in why
+    print("OK available: probe бросил -> (False, не запускается)")
+
+
+def test_available_userns_rejected():
+    """Ядро отвергает unpriv userns (Ubuntu 24.04+ AppArmor): probe returncode!=0
+    → (False, «ядро отклонило …»), stderr прокидывается в причину."""
+    from unittest import mock
+    probe = subprocess.CompletedProcess([], returncode=1, stdout=b"", stderr=b"bwrap: setting up uid map: Permission denied")
+    with mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"), \
+         mock.patch.object(sandbox.subprocess, "run", return_value=probe):
+        ok, why = sandbox.available()
+    assert ok is False and "ядро отклонило" in why and "uid map" in why
+    print("OK available: userns отвергнут -> (False, ядро отклонило)")
+
+
+def test_available_ok():
+    """bwrap есть и probe returncode=0 → (True, ok)."""
+    from unittest import mock
+    probe = subprocess.CompletedProcess([], returncode=0, stdout=b"", stderr=b"")
+    with mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"), \
+         mock.patch.object(sandbox.subprocess, "run", return_value=probe):
+        ok, why = sandbox.available()
+    assert ok is True and why == "ok"
+    print("OK available: bwrap+userns -> (True, ok)")
+
+
 def main():
     test_build_argv_order()
     test_build_argv_dbus_off()
@@ -178,6 +223,10 @@ def main():
     test_prefix_off_empty()
     test_prefix_allowlist()
     test_real_isolation()
+    test_available_no_bwrap()
+    test_available_probe_raises()
+    test_available_userns_rejected()
+    test_available_ok()
     print("ALL SANDBOX OK")
 
 

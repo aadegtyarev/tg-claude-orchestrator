@@ -58,7 +58,29 @@ def main():
     assert mgr.is_busy(sess) is False
     print("OK is_busy: нет процесса -> False")
 
+    test_proctree_dead_root()
+    test_proctree_listdir_oserror()
+
     print("ALL WATCHDOG OK")
+
+
+def test_proctree_dead_root():
+    """Наблюдаемый pid уже вышел (root not in ticks) — самый частый реальный
+    кейс на завершении/краше сессии, кормит hang-watchdog. Должно быть (0, False),
+    не исключение. pid=2**31-1 заведомо отсутствует в /proc."""
+    total, kids = _proc_tree_signals(2**31 - 1)
+    assert total == 0 and kids is False
+    print("OK _proc_tree_signals: мёртвый root -> (0, False)")
+
+
+def test_proctree_listdir_oserror():
+    """os.listdir('/proc') бросает OSError (гипотетика, но ветка есть) -> (0, False)."""
+    from unittest import mock
+    from orchestrator.core import proctree
+    with mock.patch.object(proctree.os, "listdir", side_effect=OSError("no /proc")):
+        total, kids = _proc_tree_signals(os.getpid())
+    assert total == 0 and kids is False
+    print("OK _proc_tree_signals: listdir OSError -> (0, False)")
 
 
 def test_watchdog():

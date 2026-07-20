@@ -48,7 +48,31 @@ class FakeTransport:
 
 
 SESSIONS = {n: SimpleNamespace(name=n)
-            for n in ("s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14")}
+            for n in ("s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15")}
+
+
+class FailingTransport:
+    """Всегда отвергает доставку — модель устойчиво-битого бабла (Telegram 400
+    «can't parse entities» / нередактируемое сообщение / длительный 5xx)."""
+
+    name = "failing"
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def bubble_post(self, session, html, *, stop_button, unblock_active=False):
+        self.attempts += 1
+        raise RuntimeError("post rejected")
+
+    async def bubble_edit(self, session, ref, html, *, stop_button, unblock_active=False):
+        self.attempts += 1
+        raise RuntimeError("edit rejected")
+
+    async def bubble_finish(self, session, ref, *, delete):
+        pass
+
+    async def bubble_freeze(self, session, ref):
+        pass
 
 
 def _ref(bm: BubbleManager, name: str) -> int | None:
@@ -321,6 +345,32 @@ async def main():
     assert "✓ · 99мс" not in tf and "⚠ · 1мс" not in tf, tf
     print("OK фикс: статус не прилипает к чужой строке (freeze/фолбэк)")
     await bm.close("s14")
+
+    # ── backoff: устойчиво-недоставляемый бабл не крутит _flush вечно ──
+    import orchestrator.core.bubble as _bm
+    fail = FailingTransport()
+    bmf = BubbleManager(
+        lambda: [fail], SESSIONS.get, lambda k, **kw: _TEXTS[k], delete_after=True
+    )
+    bmf.open("s15")
+    await bmf.append("s15", "⚡ <b>Bash</b> <code>ls</code>", tool="Bash")
+    # дождаться, пока цепочка само-респинов исчерпается (EDIT_INTERVAL=0.05 к этому
+    # моменту): MAX_FLUSH_FAILS попыток * интервал + запас.
+    await asyncio.sleep(_bm.MAX_FLUSH_FAILS * _bm.EDIT_INTERVAL + 0.5)
+    b15 = bmf._bubbles["s15"]
+    assert fail.attempts == _bm.MAX_FLUSH_FAILS, fail.attempts
+    assert b15.fail_streak == _bm.MAX_FLUSH_FAILS
+    assert b15.flush_task is None or b15.flush_task.done()
+    # текст всё ещё «не доставлен» (sent_text не двигался), но респина больше нет
+    assert b15.sent_text == ""
+    print(f"OK backoff: устойчивый сбой доставки → ровно {_bm.MAX_FLUSH_FAILS} попыток, респин остановлен")
+
+    # новое реальное событие поднимает свежий flush (доставка возобновляется)
+    await bmf.append("s15", "📖 <b>Read</b> <code>x.py</code>", tool="Read")
+    await asyncio.sleep(_bm.EDIT_INTERVAL + 0.3)
+    assert fail.attempts == _bm.MAX_FLUSH_FAILS + 1, fail.attempts
+    print("OK backoff: новое событие поднимает ровно один свежий flush (не спам)")
+    await bmf.close("s15")
 
     print("ALL BUBBLE OK")
 
