@@ -82,9 +82,11 @@ def main():
     assert "status" not in git and "commit" not in git  # локальные не перечислены
     print("OK git-обёртка: сетевые через кошелёк, локальные напрямую")
 
+    # session_path — путь, ВИДИМЫЙ в песочнице ($HOME/.wallet-bin), а не хостовый
+    # session_home/.wallet-bin (под bwrap session_home смонтирован как $HOME).
     session_path = m.session_path(SESSION)
-    assert session_path == [str(shim_dir)], session_path
-    print("OK session_path → каталог обёрток для PATH")
+    assert session_path == [str(Path.home() / SHIM_DIRNAME)], session_path
+    print("OK session_path → $HOME/.wallet-bin (путь внутри песочницы)")
 
     # Перегенерация: секрет api отозвали → curl-обёртка исчезает, gh остаётся.
     st2 = _store('[secrets.host]\nsessions=["*"]\n')

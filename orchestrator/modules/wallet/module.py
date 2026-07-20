@@ -512,11 +512,13 @@ class WalletModule:
 
     def session_path(self, session) -> list[str]:
         """Каталог обёрток кошелька для PATH песочницы (SessionManager.path_hooks,
-        prepend). Возвращаем всегда, даже пустой/несозданный: файлы появляются в
-        нём из session_hooks уже ПОСЛЕ старта claude, а каталог bind-смонтирован
-        живым (session_home == $HOME песочницы), поэтому обёртки подхватываются
-        без перезапуска. Пустой каталог в PATH шелл просто пропускает."""
-        return [str(self.core.manager.session_home(session) / SHIM_DIRNAME)]
+        prepend). ВАЖНО: путь должен быть таким, как его видит процесс в песочнице.
+        Под bwrap session_home смонтирован как $HOME, поэтому обёртки, записанные
+        на хосте в session_home/.wallet-bin, видны изнутри по $HOME/.wallet-bin —
+        именно этот путь и кладём в PATH (хостовый .homes/<имя>/.wallet-bin внутри
+        песочницы не существует). Возвращаем всегда: файлы наполняются из
+        session_hooks уже после старта, а каталог bind-смонтирован живым."""
+        return [str(Path.home() / SHIM_DIRNAME)]
 
     def _session_tools(self, session) -> set[str]:
         """Голые имена инструментов, которые надо завернуть для этой сессии —
