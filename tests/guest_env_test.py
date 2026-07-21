@@ -22,7 +22,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 
 from orchestrator.config import Config  # noqa: E402
 from orchestrator.core.sessions import SessionManager  # noqa: E402
-from orchestrator.runners.agentvm import AgentVmRunner, egress_hosts  # noqa: E402
+from orchestrator.runners.agentvm import auth_problem, egress_hosts  # noqa: E402
 
 
 def _manager(sandbox: str, claude_env: dict) -> SessionManager:
@@ -65,26 +65,23 @@ def test_egress_allowed_for_host_proxy():
     print("OK --allow-egress выдаётся только под хостовый прокси")
 
 
-def test_preflight_requires_token_for_own_proxy():
-    """Свой base_url без токена → отказ на старте, а не «Execution error».
+def test_own_proxy_requires_token():
+    """Свой base_url без токена → внятный отказ, а не «Execution error».
 
     Замерено живьём: в госте у claude своих кред нет — их подставляет прокси
     agent-vm и только для СВОЕГО эндпоинта. При своём base_url без токена
     claude падает до запроса; с токеном тот же путь работает (запросы дошли
-    до хостового прокси).
+    до хостового прокси). Проверяем чистую функцию, а не preflight целиком:
+    тот сперва смотрит наличие бинаря/KVM и в CI отвечал бы «не установлен».
     """
     base = {"ANTHROPIC_BASE_URL": "http://192.168.1.44:8787"}
-    cfg = replace(Config.from_env(), sandbox="agent-vm", claude_env=base,
-                  agent_vm_host_ip="192.168.1.44")
-    ok, msg = AgentVmRunner(cfg, Path(".")).preflight()
-    if Path("/dev/kvm").exists():
-        assert not ok, "должен отказать без токена"
-        assert "ANTHROPIC_AUTH_TOKEN" in msg, msg
-    # С токеном претензий нет (проверяем саму ветку, не наличие KVM).
-    cfg2 = replace(cfg, claude_env={**base, "ANTHROPIC_AUTH_TOKEN": "t"})
-    ok2, msg2 = AgentVmRunner(cfg2, Path(".")).preflight()
-    assert "ANTHROPIC_AUTH_TOKEN" not in msg2, msg2
-    print("OK свой base_url без токена — честный отказ на старте")
+    msg = auth_problem(base)
+    assert msg and "ANTHROPIC_AUTH_TOKEN" in msg, msg
+    assert auth_problem({**base, "ANTHROPIC_AUTH_TOKEN": "t"}) is None
+    assert auth_problem({**base, "ANTHROPIC_API_KEY": "k"}) is None
+    # Без своего base_url претензий нет — трафик ведёт сам agent-vm.
+    assert auth_problem({"ANTHROPIC_MODEL": "opus"}) is None
+    print("OK свой base_url без токена — внятный отказ")
 
 
 def _write_settings(mgr, tmp: Path, session_name="s1"):
@@ -124,7 +121,7 @@ def test_bwrap_settings_have_no_env_block(tmp_path=None):
 def main():
     test_rewrite_loopback_to_host_lan_ip()
     test_egress_allowed_for_host_proxy()
-    test_preflight_requires_token_for_own_proxy()
+    test_own_proxy_requires_token()
     test_agentvm_puts_claude_env_into_settings()
     test_bwrap_settings_have_no_env_block()
     print("ALL GUEST-ENV OK")
