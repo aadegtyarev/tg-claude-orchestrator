@@ -32,6 +32,7 @@ from .bubble import BubbleManager
 from .errors import UserError
 from .history import HistoryLog
 from .permission import PermissionRelay
+from .reports import parse_cost
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
 from .subagentnaming import SubagentNaming
@@ -1004,7 +1005,7 @@ class OrchestratorCore:
             delta = await self.manager.run_and_capture(session, "/cost")
         except SessionError as e:
             raise UserError(self.t("send_fail", error=e)) from e
-        data = self._parse_cost(delta)
+        data = parse_cost(delta)
         if not data:
             return None
         lines = [self.t("usage_title", name=session.title)]
@@ -1021,27 +1022,6 @@ class OrchestratorCore:
         for name, pct in data.get("models", []):
             lines.append(self.t("usage_model", model=name, pct=pct))
         return "\n".join(lines)
-
-    @staticmethod
-    def _parse_cost(text: str) -> dict:
-        """Выдрать цифры из TUI-каши /cost (наложенные кадры, рамки)."""
-        t = re.sub(r"[│▏▐▔▕█▌▊▋▉▛▜✶✢·…✻✽✼✾*]+", " ", text)
-        t = re.sub(r"\s+", " ", t)
-        out: dict = {}
-        if m := re.search(r"cost:\s*\$([\d.]+)", t):
-            out["cost"] = m.group(1)
-        if m := re.search(r"Current session.*?(\d+)%\s*used", t):
-            out["session_pct"] = m.group(1)
-        if m := re.search(r"Current week \(all models\).*?(\d+)%\s*used", t):
-            out["week_pct"] = m.group(1)
-        for mm in re.finditer(r"Current week \((?!all models)([^)]+)\).*?(\d+)%\s*used", t):
-            out.setdefault("models", []).append((mm.group(1).strip(), mm.group(2)))
-        resets = re.findall(r"Resets? ([A-Za-z0-9:, ]+?\([^)]+\))", t)
-        if resets:
-            out["session_reset"] = resets[0].strip()
-            if len(resets) > 1:
-                out["week_reset"] = resets[1].strip()
-        return out
 
     def collect_skills(self) -> list[tuple[str, str]]:
         """Скиллы профиля Claude Code (глобальные + плагины). Блокирующее I/O."""

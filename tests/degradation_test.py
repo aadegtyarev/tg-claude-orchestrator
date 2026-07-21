@@ -5,8 +5,9 @@
   * read_stats на «чужом» транскрипте (валидный JSONL, но неизвестная схема) →
     stale_schema=True, а не тихие нули;
   * read_stats не падает на битых строках/несуществующем файле;
-  * _parse_cost на мусоре → пусто (адаптер покажет usage_failed);
   * Telegram: кнопка ⏭ показывается только когда есть что разблокировать.
+
+(Разбор /cost — parse_cost — переехал в tests/reports_test.py.)
 
 Запуск: .venv/bin/python tests/degradation_test.py
 """
@@ -16,7 +17,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.core.app import OrchestratorCore  # noqa: E402
 from orchestrator.core.transcript import read_stats  # noqa: E402
 
 
@@ -57,13 +57,6 @@ def test_read_stats_stale_schema():
     print("OK read_stats: нет файла → None")
 
 
-def test_parse_cost_garbage():
-    # Мусор вместо /cost-вывода → пустой dict (адаптер → usage_failed).
-    assert OrchestratorCore._parse_cost("случайный текст без цифр") == {}
-    assert OrchestratorCore._parse_cost("") == {}
-    print("OK _parse_cost: мусор → {} (деградация в usage_failed)")
-
-
 def test_telegram_unblock_button_hidden():
     import os
     os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
@@ -86,7 +79,6 @@ def test_telegram_unblock_button_hidden():
 
 def main():
     test_read_stats_stale_schema()
-    test_parse_cost_garbage()
     test_telegram_unblock_button_hidden()
     print("ALL DEGRADATION OK")
 

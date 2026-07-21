@@ -48,13 +48,18 @@
 - Поглощает: `_record`, `history`, `_load_history`, `save_history`.
 - Персист (`.history.json`) инкапсулируется здесь.
 
-### Этап 4 — `core/reports.py` (статы/отчёты — чистые функции)
-- Выносим `stats_text`, `usage_text`, `model_display`, `_parse_cost` в модуль
-  чистых функций (мало состояния, низкий риск). `OrchestratorCore` тонко зовёт.
+### Этап 4 — `core/reports.py` (чистые парсеры/форматтеры)
+- Вынесен ТОЛЬКО `parse_cost` (чистая regex-логика). `stats_text`/`usage_text`/
+  `model_display` ОСТАВЛЕНЫ в OrchestratorCore: они stateless-оркестрация над
+  ядром (нужны manager/тексты/fmt-хелперы), состояния не держат — не они источник
+  god-object-проблемы; вынос дал бы функции с 5-6 аргументами (индирекция без
+  выгоды). Изначальный план пересмотрен по факту чтения кода.
 
-### Этап 5 (опционально) — глушь вокруг `/bash`
-- `bash_*`-обвязка уже делегирует в `BashShellManager`; орг-glue можно собрать в
-  тонкий фасад, если после 1–4 это ещё будет мозолить.
+### Этап 5 (опционально) — глушь вокруг `/bash` — НЕ делаем
+- `bash_*`-обвязка уже делегирует в `BashShellManager`; отдельного состояния в
+  app.py она не держит. Выделять фасад ради сокращения строк — низкая ценность;
+  после Этапов 1–4 god-object-проблема (per-session state + teardown-дрейф) снята.
+  Оставляем как есть.
 
 ## Не входит (осознанно)
 - Смена слоистости adapters→Transport→core→sessions→runners (она чистая — храним).
@@ -68,7 +73,14 @@
   HookTracker): `ToolActivity` (PR #29) + `SubagentNaming` (PR #30). Event-хендлеры
   остались тонкой оркестрацией в app.py — они законно нуждаются в bubbles/turns.
 - ✅ Этап 2 — `UserError`→`core/errors.py` (PR #31) + `PermissionRelay` (PR #32).
-- ✅ Этап 3 — `HistoryLog` (этот PR). app.py держит тонкие делегаторы
+- ✅ Этап 3 — `HistoryLog` (PR #33). app.py держит тонкие делегаторы
   `_record`/`history`/`save_history` (стабильный API для wallet-модуля/веба/__main__).
-- ⬜ Этап 4 — reports.py
-- ⬜ Этап 5 — bash-фасад (опц.)
+- ✅ Этап 4 — `core/reports.py::parse_cost` (этот PR). Форматтеры оставлены в ядре.
+- ⛔ Этап 5 — bash-фасад: НЕ делаем (состояния нет, ценность низкая).
+
+**Итог:** god-object-проблема снята — OrchestratorCore больше не владеет сырым
+per-session состоянием (tool-activity, subagent-naming, permission, history).
+Teardown = несколько `forget()` вместо ручного перебора словарей. Каждая
+подсистема — свой файл со своим контрактом и юнит-тестами. Остаток app.py —
+координатор (lifecycle сессий, доставка, hook-glue, bash, stateless-форматтеры),
+что и есть его роль.
