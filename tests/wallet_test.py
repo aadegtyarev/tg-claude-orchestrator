@@ -212,7 +212,10 @@ async def main():
                 assert r.status == 403
                 body = await r.json()
             assert "reason" in body and "токен" in body["reason"], body
-            print("OK guard: gh auth token → 403 с прозрачным объяснением")
+            # reason уводит модель к обычному git push (HTTPS auth на хосте),
+            # а не к SSH-костылю через печать токена (кейс noos).
+            assert "git push" in body["reason"], body
+            print("OK guard: gh auth token → 403 с прозрачным объяснением (→ git push)")
 
         # редакция: вложенные значения, длинные первыми
         out = _redact(b"a=S3CR3T-DEPLOY b=S3CR3T-OTHER", ["S3CR3T-DEPLOY", "S3CR3T-OTHER"])

@@ -133,8 +133,12 @@ def _always_denied(cmd: list[str]) -> str | None:
         subs = [a for a in cmd[1:] if not a.startswith("-")]
         if subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd):
             return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
-                    "секретов. Используй gh для операций (gh pr …, gh api …, gh release …), "
-                    "а не для печати токена.")
+                    "секретов. Токен и НЕ нужен: `git push`/`fetch`/`pull`/`clone` по "
+                    "HTTPS авторизуются на хосте через кошелёк (gh credential helper "
+                    "выдаёт токен внутри себя, НЕ печатая его) — делай обычный "
+                    "`git push`, HTTPS-remote работает из коробки, SSH-костыль не "
+                    "нужен. Для GitHub-операций — gh напрямую (gh pr …, gh api …, "
+                    "gh release …). Печатать токен незачем.")
     # 2. git → произвольное исполнение на хосте через конфиг/транспорт/флаги.
     if binary == "git":
         toks = cmd[1:]
