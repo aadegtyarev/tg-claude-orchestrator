@@ -21,17 +21,16 @@ import asyncio
 import html
 import json
 import logging
-import os
 import re
 import time
 import uuid
-from collections import deque
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
 from .errors import UserError
+from .history import HistoryLog
 from .permission import PermissionRelay
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
@@ -59,9 +58,6 @@ CONTEXT_WINDOW = 200_000
 # Синонимы моделей для кнопок /model. Маппинг на конкретные версии делает
 # сам Claude Code — мы не дублируем его каталог и не отстаём от переименований.
 MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
-
-# Сколько последних событий сессии держать в журнале (история веб-интерфейса).
-HISTORY_LIMIT = 300
 
 # UserError импортируется выше из .errors и реэкспортируется здесь: адаптеры и
 # тесты берут его как `from ...core.app import UserError` (обратная совместимость).
@@ -107,9 +103,8 @@ class OrchestratorCore:
         # перезагрузки страницы. Персистится через graceful-рестарт (иначе
         # пропадала при каждом рестарте — «история потерялась»); полная — в
         # транскрипте CC.
-        self._history: dict[str, deque] = {}
-        self._history_path = config.sessions_dir / ".history.json"
-        self._load_history()
+        self.journal = HistoryLog(config.sessions_dir / ".history.json")
+        self.journal.load()
         # Permission relay (кнопки «разрешить?» + сбор первого ответа) — см.
         # core/permission.py. Владеет ожидающими запросами; коллабораторы (бродкаст
         # в адаптеры, журнал) инъектируются.
@@ -200,35 +195,17 @@ class OrchestratorCore:
             except Exception:
                 logger.exception("Адаптер %s: ошибка остановки", tr.name)
 
-    # ── журнал событий (история веб-интерфейса) ─────────────────
+    # ── журнал событий (история веб-интерфейса) — фасад над HistoryLog ──
 
     def _record(self, session: Session, kind: str, **payload) -> None:
-        log = self._history.setdefault(session.name, deque(maxlen=HISTORY_LIMIT))
-        log.append({"ts": time.time(), "kind": kind, **payload})
+        # Стабильный API для модулей (wallet зовёт core._record) и PermissionRelay.
+        self.journal.record(session.name, kind, **payload)
 
     def history(self, name: str) -> list[dict]:
-        return list(self._history.get(name, ()))
-
-    def _load_history(self) -> None:
-        """Восстановить журнал событий с прошлого запуска (веб-история переживает
-        graceful-рестарт). Битый/отсутствующий файл — просто пустая история."""
-        try:
-            data = json.loads(self._history_path.read_text())
-        except (OSError, ValueError):
-            return
-        for name, events in (data or {}).items():
-            if isinstance(events, list):
-                self._history[name] = deque(events, maxlen=HISTORY_LIMIT)
+        return self.journal.events(name)
 
     def save_history(self) -> None:
-        """Сохранить журнал на диск (вызывать при graceful-остановке). Атомарно."""
-        try:
-            data = {name: list(dq) for name, dq in self._history.items() if dq}
-            tmp = self._history_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False))
-            os.replace(tmp, self._history_path)
-        except OSError as e:
-            logger.debug("save_history: %s", e)
+        self.journal.save()
 
     # ── доставка во все адаптеры ────────────────────────────────
 
@@ -412,7 +389,7 @@ class OrchestratorCore:
         await self._teardown_runtime(session, forget_turn=True)
         bindings = dict(session.bindings)
         await self.manager.delete(session)
-        self._history.pop(session.name, None)
+        self.journal.forget(session.name)
         for tr in self._transports():
             address = bindings.get(tr.name)
             if address is None:

@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core import toolactivity  # noqa: E402
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.history import HistoryLog  # noqa: E402
 from orchestrator.core.permission import PermissionRelay  # noqa: E402
 from orchestrator.core.subagentnaming import SubagentNaming  # noqa: E402
 from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
@@ -47,7 +48,7 @@ def make_core():
     core.manager = FakeMgr()
     core._texts = get_texts("ru")
     core.config = SimpleNamespace(max_instances=5)
-    core._history = {}
+    core.journal = HistoryLog(Path("unused-in-tests.json"))
     core.tools = ToolActivity()
     core.naming = SubagentNaming()
     core.adapters = {}
@@ -344,8 +345,21 @@ def test_parse_cost_resets_regex():
     print("OK _parse_cost: Resets? тянет reset/cost/%, мусор не матчится")
 
 
+def test_record_delegates_to_journal():
+    """core._record (API для wallet/PermissionRelay) и core.history проходят
+    через HistoryLog — сквозной smoke делегации."""
+    core = make_core()
+    core._record(SESSION, "reply", text="привет")
+    core._record(SESSION, "status", status="stopped")
+    ev = core.history("noos")
+    assert [e["kind"] for e in ev] == ["reply", "status"]
+    assert ev[0]["text"] == "привет" and core.history("ghost") == []
+    print("OK _record/history делегируют в journal (сквозь HistoryLog)")
+
+
 async def main():
     test_parse_cost_resets_regex()
+    test_record_delegates_to_journal()
     await test_teardown_runtime_unified()
     await test_notify_state_changed_broadcasts()
     await test_exact_tool_name()
