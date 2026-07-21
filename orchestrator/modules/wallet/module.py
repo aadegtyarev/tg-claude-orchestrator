@@ -48,11 +48,12 @@ from vault.secret import (
     DEFAULT_HOST_COMMANDS,  # noqa: F401 — ре-экспорт для тестов/обратной совместимости
     GIT_NETWORK,
     Secret,
-    _always_denied,
+    _always_denied,  # noqa: F401 — ре-экспорт для тестов (движок решения — vault.verdict)
     _prints_token,
     marker,
 )
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore
+from vault.verdict import evaluate
 
 from .policy import PolicyEditor, PolicyError
 
@@ -473,21 +474,11 @@ class WalletModule:
         выполнение на хосте + редакция вывода."""
         cmd_str = " ".join(cmd)
         all_secrets = self.store.load()
-        # Причина отказа для прозрачности: 1) встроенный guard (печать токена,
-        # git-RCE), 2) точечный deny секрета.
-        reason: str | None = None
-        if secret is not None:
-            if self.config.wallet_guard and not secret.allow_unsafe:
-                reason = _always_denied(cmd)
-            if reason is None and (pat := secret.denied_by(cmd)) is not None:
-                reason = f"заблокировано policy этого секрета (deny: {pat})"
-        allowed = (
-            secret is not None
-            and secret.session_allowed(session.name)
-            and secret.command_allowed(cmd)
-            and reason is None
-        )
-        if allowed and secret.confirm:
+        # Решение policy (guard/deny/sessions/commands) — чистый движок vault.
+        # Подтверждение кнопкой — side-effect здесь (движок лишь помечает needs_confirm).
+        verdict = evaluate(secret, cmd, session.name, guard_on=self.config.wallet_guard)
+        allowed = verdict.allowed
+        if verdict.needs_confirm:
             allowed = await self.core.request_confirmation(
                 session, tool="wallet",
                 description=f"{label} → {cmd_str[:200]}", preview=cmd_str,
@@ -499,15 +490,9 @@ class WalletModule:
         await self.core.bubbles.append_background(session.name, bubble_line, tool="wallet")
         self.core._record(session, "wallet", secret=label, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
-            if reason is None:
-                if secret is None:
-                    reason = f"нет секрета для «{cmd_str[:80]}» (проверь `wallet ls`)"
-                elif not secret.session_allowed(session.name):
-                    reason = "секрет не разрешён этой сессии (policy sessions)"
-                elif not secret.command_allowed(cmd):
-                    reason = "команда не в списке разрешённых (policy commands)"
-                else:
-                    reason = "отклонено кнопкой подтверждения"
+            # verdict.reason покрывает policy-отказ; None → отказ пришёл от
+            # confirm-кнопки (движок пропустил policy, но оператор нажал ✗).
+            reason = verdict.reason if verdict.reason is not None else "отклонено кнопкой подтверждения"
             # Operator-notice — только для отказов, требующих его внимания.
             # `gh auth token`/`--show-token` (печать токена) НЕ шлём: отказ
             # самокорректирующийся (reason ушёл в stderr модели, аудит — в бабле),
