@@ -419,16 +419,23 @@ class SessionManager:
                 project_dir, ", ".join(concerns),
             )
 
+    def _guest_python(self) -> str:
+        """python для channel_server и хук-диспетчера ВНУТРИ песочницы. Под
+        agent-vm — системный `python3` гостя (хостового venv там нет; наш код на
+        stdlib, зависимостей не требует), иначе — `sys.executable` (хостовый venv)."""
+        return "python3" if self.config.sandbox == "agent-vm" else sys.executable
+
     def _write_mcp_json(self, session: Session) -> None:
         """Конфиг, по которому Claude Code сам запустит channel_server.py.
 
-        Интерпретатор — sys.executable (venv), иначе channel_server
-        не найдёт свои зависимости.
+        Интерпретатор — `_guest_python()` (под agent-vm системный python3 гостя).
+        Путь к channel_server.py монтируется в гостя (раннер биндит корень репо
+        тем же путём).
         """
         mcp = {
             "mcpServers": {
                 f"channel-{session.name}": {
-                    "command": sys.executable,
+                    "command": self._guest_python(),
                     "args": [str(PKG_DIR / "channel_server.py")],
                     "env": {
                         "CHANNEL_PORT": str(session.port),
@@ -539,7 +546,7 @@ class SessionManager:
             )
         )
         os.chmod(hook_script, 0o600)
-        hook_cmd = {"type": "command", "command": f'"{sys.executable}" "{hook_script}"'}
+        hook_cmd = {"type": "command", "command": f'"{self._guest_python()}" "{hook_script}"'}
         hooks: dict = {"Stop": [{"hooks": [hook_cmd]}]}  # Stop не поддерживает matcher
         if self.config.show_tool_calls:
             hooks["PreToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
