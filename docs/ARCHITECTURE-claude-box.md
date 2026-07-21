@@ -5,9 +5,10 @@
 предысторию. Ветка работ — `redesign/claude-box` (см. «Регламент работ» внизу).
 
 Сопутствующие документы (контекст, не задание):
-- `docs/VISION-standalone-launcher.md` — как родилось это видение, UX-сценарии;
-- `docs/agent-vm-extension-options.md` — исследование agent-vm, отклонённые пути;
-- `docs/agent-vm-integration.md` — журнал живых экспериментов с agent-vm;
+- `docs/DECISIONS-claude-box.md` — принятые решения Р1–Р11 с обоснованиями и
+  отклонёнными альтернативами; не пересматривать без оператора;
+- `docs/agent-vm-integration.md` — журнал живых экспериментов с agent-vm
+  (runbook'и для smoke-проверок фаз);
 - `docs/secrets-wallet.md` — сегодняшний кошелёк (его код переезжает в Vault).
 
 ---
@@ -127,7 +128,7 @@ class Connector(Protocol):
     #   подставить кред (заголовок/query/подпись — знает коннектор)
     def in_scope(self, req: HttpReq, scope: dict) -> Verdict: ...
     #   ALLOW | DENY(reason) | ASK(descr)  — ASK поднимает хук «спроса»
-    def oauth_flow(self) -> OAuthFlow | None: ...       # S0: подключение сервиса
+    def oauth_flow(self) -> OAuthFlow | None: ...       # `vault connect <svc>`
     def resolve_scope(self, human: dict) -> dict: ...    # "Team/X" → folder id
     def mint(self, scope: dict) -> Secret | None: ...    # тир 3, если умеет
     def refresh(self, secret: Secret) -> Secret | None: ...  # свой сервисный OAuth
