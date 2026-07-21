@@ -32,6 +32,27 @@ AGENT_VM_BIN = "agent-vm"
 AUTH_KEYS = {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}
 
 
+def auth_problem(claude_env: dict[str, str]) -> str | None:
+    """Почему свой ANTHROPIC_BASE_URL не заработает под agent-vm (или None).
+
+    Замерено живьём: в госте у claude СВОИХ кред нет — их подставляет прокси
+    agent-vm на проводе, и только для СВОЕГО эндпоинта. При своём base_url
+    подстановки нет, и claude падает «Execution error» ещё до запроса. С явным
+    токеном тот же путь работает (запросы дошли до хостового прокси). Молчать
+    нельзя — оператор получил бы нерабочие сессии без объяснения.
+    """
+    if "ANTHROPIC_BASE_URL" not in claude_env or (AUTH_KEYS & claude_env.keys()):
+        return None
+    keys = " или ".join(f"CLAUDE_ENV_{k}" for k in sorted(AUTH_KEYS))
+    return (
+        f"CLAUDE_ENV_ANTHROPIC_BASE_URL задан, но нет токена ({keys}). "
+        "Под SANDBOX=agent-vm кред-прокси agent-vm подставляет токен только "
+        "для своего эндпоинта — для своего прокси нужен свой токен, иначе "
+        "сессии падают без внятной ошибки. Добавь токен или убери свой "
+        "base_url (в VM трафик к Anthropic ведёт сам agent-vm)."
+    )
+
+
 def egress_hosts(claude_env: dict[str, str], host_ip: str | None) -> list[str]:
     """Хостовые адреса из CLAUDE_ENV_*, которым нужен `--allow-egress`.
 
@@ -62,23 +83,9 @@ class AgentVmRunner:
             )
         if not Path("/dev/kvm").exists():
             return False, "нет /dev/kvm — agent-vm требует KVM"
-        env = self.config.claude_env
-        if "ANTHROPIC_BASE_URL" in env and not (AUTH_KEYS & env.keys()):
-            # Замерено живьём: в госте у claude СВОИХ кред нет — их подставляет
-            # прокси agent-vm на проводе, и только для СВОЕГО эндпоинта. При
-            # своём base_url подстановки нет, и claude падает «Execution error»
-            # ещё до запроса. С явным токеном тот же путь работает (проверено:
-            # запросы дошли до хостового прокси). Молчать нельзя — оператор
-            # получил бы нерабочие сессии без объяснения.
-            keys = " или ".join(f"CLAUDE_ENV_{k}" for k in sorted(AUTH_KEYS))
-            return False, (
-                "CLAUDE_ENV_ANTHROPIC_BASE_URL задан, но нет токена "
-                f"({keys}). Под SANDBOX=agent-vm кред-прокси agent-vm "
-                "подставляет токен только для своего эндпоинта — для своего "
-                "прокси нужен свой токен, иначе сессии падают без внятной "
-                "ошибки. Добавь токен или убери свой base_url (в VM трафик к "
-                "Anthropic ведёт сам agent-vm)."
-            )
+        problem = auth_problem(self.config.claude_env)
+        if problem:
+            return False, problem
         return True, "ok"
 
     def wrap(
