@@ -35,6 +35,12 @@ class SubagentNaming:
     def __init__(self) -> None:
         self._types: dict[str, dict[str, str]] = {}
         self._spawns: dict[str, list[str]] = {}
+        # agent_id завершившихся сабагентов (закрыты SubagentStop). Хуки шлются
+        # независимыми async-POST'ами, порядок не гарантирован — запоздалый
+        # тул-хук сабагента может обогнать доставку его же SubagentStop и
+        # прилететь ПОСЛЕ строки «завершил». Такие события рендерим верхним
+        # уровнем (без отступа под уже завершённого агента) — см. is_closed.
+        self._closed: dict[str, set[str]] = {}
 
     # ── запись (из hook-хендлеров) ──────────────────────────────
 
@@ -60,9 +66,20 @@ class SubagentNaming:
             return spawns.pop(0)
         return ""
 
+    def close(self, name: str, agent_id: str) -> None:
+        """Отметить сабагента завершённым (из SubagentStop): его запоздалые
+        тул-хуки больше НЕ нестить под ним. Пустой agent_id игнорируем."""
+        if agent_id:
+            self._closed.setdefault(name, set()).add(agent_id)
+
+    def is_closed(self, name: str, agent_id: str) -> bool:
+        """Завершился ли сабагент с этим agent_id (SubagentStop уже пришёл)."""
+        return agent_id in self._closed.get(name, ())
+
     # ── жизненный цикл ──────────────────────────────────────────
 
     def forget(self, name: str) -> None:
         """Забыть всё состояние именования сессии — на границе хода и при teardown."""
         self._types.pop(name, None)
         self._spawns.pop(name, None)
+        self._closed.pop(name, None)

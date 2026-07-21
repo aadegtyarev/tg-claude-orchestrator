@@ -50,16 +50,31 @@ def test_unknown_degrades_to_empty():
     print("OK неизвестный сабагент → '' (мягкая деградация)")
 
 
+def test_close_marks_agent_finished():
+    """close помечает agent_id завершённым; is_closed это видит, пустой — нет."""
+    sn = SubagentNaming()
+    assert not sn.is_closed("s", "a1")
+    sn.close("s", "a1")
+    assert sn.is_closed("s", "a1")          # завершён
+    assert not sn.is_closed("s", "a2")      # другой — нет
+    assert not sn.is_closed("other", "a1")  # другая сессия — нет
+    sn.close("s", "")                        # пустой agent_id игнорируется
+    assert not sn.is_closed("s", "")
+    print("OK close/is_closed: завершённый агент виден, пустой/чужой — нет")
+
+
 def test_forget_and_isolation():
-    """forget снимает всё состояние сессии; сессии изолированы."""
+    """forget снимает всё состояние сессии (типы, спавны, closed); сессии изолированы."""
     sn = SubagentNaming()
     sn.note_child("a", "a1", "dev-planner")
     sn.note_spawn("a", "dev-builder")
+    sn.close("a", "a1")
     sn.note_child("b", "b1", "dev-reviewer")
     sn.forget("a")
     assert sn.pop("a", "a1") == "" and sn.pop("a", "zz") == ""  # и _types, и _spawns
+    assert not sn.is_closed("a", "a1")                          # closed тоже очищен
     assert sn.pop("b", "b1") == "dev-reviewer"                  # чужая сессия цела
-    print("OK forget чистит сессию, сессии изолированы")
+    print("OK forget чистит сессию (вкл. closed), сессии изолированы")
 
 
 def main():
@@ -67,6 +82,7 @@ def main():
     test_spawn_fallback_in_order()
     test_child_wins_over_spawn()
     test_unknown_degrades_to_empty()
+    test_close_marks_agent_finished()
     test_forget_and_isolation()
     print("ALL SUBAGENTNAMING OK")
 
