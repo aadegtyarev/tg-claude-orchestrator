@@ -433,7 +433,9 @@ class SessionManager:
                     "env": {
                         "CHANNEL_PORT": str(session.port),
                         "SESSION_NAME": session.name,
-                        "ORCH_HOST": self.config.orch_host,
+                        # guest-facing: под agent-vm — host-gateway имя (см.
+                        # Config.guest_orch_host); под bwrap/off — orch_host.
+                        "ORCH_HOST": self.config.guest_orch_host,
                         "ORCH_PORT": str(self.config.orch_port),
                         "ORCH_TOKEN": self.config.orch_token,
                     },
@@ -532,7 +534,7 @@ class SessionManager:
         hook_script = settings_dir / "hook_dispatch.py"
         hook_script.write_text(
             hookscript.render(
-                self.config.orch_host, self.config.orch_port,
+                self.config.guest_orch_host, self.config.orch_port,
                 session.name, self.config.orch_token,
             )
         )

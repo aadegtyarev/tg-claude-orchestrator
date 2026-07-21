@@ -31,6 +31,15 @@ def _auto_orch_token() -> str:
     return tok
 
 
+# Имя, по которому ГОСТЬ microVM (SANDBOX=agent-vm) видит хост: microsandbox
+# мапит его на хостовый 127.0.0.1 (аналог host.docker.internal), при условии
+# --allow-host (его даёт AgentVmRunner). На самом ХОСТЕ это имя НЕ резолвится —
+# поэтому оно только guest-facing (см. Config.guest_orch_host), а reply-сервер
+# биндится на orch_host (host-side loopback). Подтверждено живым экспериментом,
+# docs/agent-vm-integration.md.
+AGENT_VM_GUEST_HOST = "host.microsandbox.internal"
+
+
 @dataclass(frozen=True)
 class Config:
     # Активные транспорт-адаптеры (ADAPTERS=telegram,web) и модули (MODULES=…).
@@ -93,6 +102,17 @@ class Config:
     # Разрешить правку policy кошелька из чата (команда /wallet). По умолчанию
     # включено. WALLET_POLICY_EDIT=0 — только просмотр, правки лишь host-файлом.
     wallet_policy_edit: bool
+
+    @property
+    def guest_orch_host(self) -> str:
+        """Адрес оркестратора С ТОЧКИ ЗРЕНИЯ СЕССИИ (гостя) — для `.mcp.json`
+        (channel_server) и хук-диспетчера. Выводится из `sandbox`, поэтому
+        переключение движка = ОДНО действие (SANDBOX в .env), без ручной правки
+        адресов. Под agent-vm гость VM не видит хостовый loopback → имя
+        host-gateway (`AGENT_VM_GUEST_HOST`); под bwrap/off — общий loopback
+        `orch_host`. reply-сервер биндится на `orch_host` (host-side) — оно
+        host-resolvable, а guest-facing имя резолвится только внутри гостя."""
+        return AGENT_VM_GUEST_HOST if self.sandbox == "agent-vm" else self.orch_host
 
     @classmethod
     def from_env(cls) -> "Config":
