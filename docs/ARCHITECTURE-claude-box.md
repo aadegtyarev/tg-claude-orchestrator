@@ -127,7 +127,11 @@ class Connector(Protocol):
     def authorize(self, req: HttpReq, secret: Secret) -> HttpReq: ...
     #   подставить кред (заголовок/query/подпись — знает коннектор)
     def in_scope(self, req: HttpReq, scope: dict) -> Verdict: ...
-    #   ALLOW | DENY(reason) | ASK(descr)  — ASK поднимает хук «спроса»
+    #   ALLOW | DENY(reason, remedy) | ASK(descr) — ASK поднимает хук «спроса».
+    #   DENY.remedy ОБЯЗАТЕЛЕН и ПРЕДПИСЫВАЮЩИЙ (см. Р0): что не так + что
+    #   делать вместо + что доступно (напр. «док вне скоупа; в скоупе папка
+    #   Team/X (3 дока: …); нужен именно этот — попроси оператора»). Ведёт
+    #   модель по единственному верному пути, гасит поиск обходов.
     def oauth_flow(self) -> OAuthFlow | None: ...       # `vault connect <svc>`
     def resolve_scope(self, human: dict) -> dict: ...    # "Team/X" → folder id
     def mint(self, scope: dict) -> Secret | None: ...    # тир 3, если умеет
