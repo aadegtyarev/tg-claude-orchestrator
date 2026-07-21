@@ -353,7 +353,14 @@ class WebAdapter:
         await ws.prepare(request)
         self._ws_clients.add(ws)
         try:
-            await ws.send_json({"type": "hello", "sessions": self._sessions_info()})
+            await ws.send_json({
+                "type": "hello",
+                "sessions": self._sessions_info(),
+                # Что реально работает при этой конфигурации (решает ядро):
+                # выключенная фича не должна оставлять артефактов в UI —
+                # кнопка, ведущая к отказу, это ложное обещание.
+                "features": self.core.features(),
+            })
             async for msg in ws:
                 if msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                     break

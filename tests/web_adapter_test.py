@@ -42,6 +42,11 @@ def make_env(tmp: Path):
         def t(self, k, **kw):
             return k
 
+        def features(self):
+            # Единый источник правды о доступных фичах живёт в ядре; адаптеры
+            # только транслируют его в свой UI.
+            return {"wallet": True, "stats": True}
+
         def session_status(self, s):
             return "waiting"
 

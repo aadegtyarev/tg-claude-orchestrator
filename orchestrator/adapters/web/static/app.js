@@ -321,6 +321,7 @@ function handleEvent(ev) {
   switch (ev.type) {
     case "hello":
       sessions = ev.sessions || [];
+      applyFeatures(ev.features);
       renderSessions();
       // После реконнекта часть событий потеряна — история и бабл переигрываются.
       if (current) {
@@ -454,6 +455,15 @@ document.addEventListener("drop", (e) => {
 
 function sesUrl(suffix) {
   return "/api/sessions/" + encodeURIComponent(current) + suffix;
+}
+
+// Выключенная фича не должна оставлять артефактов в UI: кнопку, которая всегда
+// упрётся в отказ, просто убираем (напр. Stats под SANDBOX=agent-vm — транскрипт
+// лежит внутри microVM и на хосте не появится).
+function applyFeatures(features) {
+  if (!features) return;
+  const btn = $("btn-stats");
+  if (btn) btn.hidden = features.stats === false;
 }
 
 $("btn-stats").onclick = async () => {

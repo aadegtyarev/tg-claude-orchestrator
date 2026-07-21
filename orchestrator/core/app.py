@@ -60,6 +60,19 @@ CONTEXT_WINDOW = 200_000
 # сам Claude Code — мы не дублируем его каталог и не отстаём от переименований.
 MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 
+# Команда → фича из OrchestratorCore.features(), без которой она не работает.
+# Команды, которых здесь нет, доступны всегда. Адаптеры обязаны спрашивать
+# core.command_available() при построении меню/справки — так выключенная фича
+# не оставляет следов ни в одном интерфейсе.
+#
+# `bash` СПЕЦИАЛЬНО не гейтим: в топике сессии под agent-vm он отказывает
+# (одна VM на каталог), но в главном чате это операторский терминал на хосте —
+# он работает, и прятать его нельзя.
+COMMAND_FEATURE = {
+    "wallet": "wallet",
+    "stats": "stats",
+}
+
 # UserError импортируется выше из .errors и реэкспортируется здесь: адаптеры и
 # тесты берут его как `from ...core.app import UserError` (обратная совместимость).
 
@@ -467,6 +480,43 @@ class OrchestratorCore:
         содержит web). None, если веб не запущен."""
         tr = self.adapters.get("web")
         return tr.public_url() if tr is not None and hasattr(tr, "public_url") else None
+
+    def features(self) -> dict[str, bool]:
+        """Что РЕАЛЬНО работает при текущей конфигурации — единый источник
+        правды для всех интерфейсов (Telegram, веб, будущие).
+
+        Правило: выключенная или неработающая фича не оставляет артефактов в
+        рантайме — ни команды в меню, ни строки в справке, ни кнопки в UI, ни
+        упоминания в промте модели. Артефакт = ложное обещание: оператор решит,
+        что оно есть, а модель попробует этим воспользоваться и упрётся в отказ.
+
+        Новая фича под условием = одна запись здесь (+ в COMMAND_FEATURE, если
+        у неё есть команда), а не правки в каждом адаптере.
+        """
+        return {
+            # Кошелёк подключается только под bwrap (см. MODULE_REQUIRES_SANDBOX).
+            "wallet": "wallet" in self.config.modules,
+            # Транскрипт Claude под agent-vm лежит ВНУТРИ гостя — на хосте его
+            # не прочитать, статистики не будет никогда.
+            "stats": self.config.sandbox != "agent-vm",
+        }
+
+    def command_available(self, command: str) -> bool:
+        """Доступна ли команда при этой конфигурации (нет в карте = всегда)."""
+        feature = COMMAND_FEATURE.get(command)
+        return feature is None or self.features().get(feature, True)
+
+    def help_text(self) -> str:
+        """Справка без строк про недоступные команды (см. features)."""
+        hidden = [
+            f"<code>/{cmd}</code>"
+            for cmd in COMMAND_FEATURE
+            if not self.command_available(cmd)
+        ]
+        return "\n".join(
+            ln for ln in self.t("help").split("\n")
+            if not any(marker in ln for marker in hidden)
+        )
 
     def wallet_command(self, args_str: str) -> str:
         """`/wallet …` — просмотр/правка policy кошелька. Ядро находит модуль
@@ -974,7 +1024,15 @@ class OrchestratorCore:
             "" if session.running else self.t("stats_stopped_suffix")
         )
         if stats is None:
-            return self.t("stats_no_transcript", header=header, uptime=uptime)
+            # Под agent-vm транскрипт живёт в госте, а мы читаем его на хосте —
+            # он не появится НИКОГДА. Не тянем оператора ждать «ещё не создан»,
+            # а честно называем ограничение режима.
+            key = (
+                "stats_no_transcript_vm"
+                if self.config.sandbox == "agent-vm"
+                else "stats_no_transcript"
+            )
+            return self.t(key, header=header, uptime=uptime)
         if stats.get("stale_schema"):
             # Транскрипт есть и валиден, но ни одного ожидаемого поля не
             # извлекли — вероятно, поменялась схема Claude Code. Показываем хвост
