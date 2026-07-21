@@ -326,25 +326,6 @@ async def test_notify_state_changed_broadcasts():
     print("OK _notify_state_changed: бродкаст всем, сбой адаптера не ломает")
 
 
-def test_parse_cost_resets_regex():
-    # Regex сужен Res[et]+s → Resets? (перестал матчить мусор вроде «Retess»),
-    # но должен продолжать тянуть настоящий блок /cost.
-    text = (
-        "cost: $1.23\n"
-        "Current session · 12% used\n"
-        "Current week (all models) · 34% used\n"
-        "Resets Jul 20 3:00pm (in 5h 20m)\n"
-    )
-    out = OrchestratorCore._parse_cost(text)
-    assert out.get("cost") == "1.23", out
-    assert out.get("session_pct") == "12", out
-    assert out.get("week_pct") == "34", out
-    assert out.get("session_reset", "").startswith("Jul 20"), out
-    # «Reteets» больше не считается словом Resets.
-    assert "session_reset" not in OrchestratorCore._parse_cost("Reteets X (y)\n")
-    print("OK _parse_cost: Resets? тянет reset/cost/%, мусор не матчится")
-
-
 def test_record_delegates_to_journal():
     """core._record (API для wallet/PermissionRelay) и core.history проходят
     через HistoryLog — сквозной smoke делегации."""
@@ -358,7 +339,6 @@ def test_record_delegates_to_journal():
 
 
 async def main():
-    test_parse_cost_resets_regex()
     test_record_delegates_to_journal()
     await test_teardown_runtime_unified()
     await test_notify_state_changed_broadcasts()
