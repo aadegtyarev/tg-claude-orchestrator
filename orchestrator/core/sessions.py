@@ -16,13 +16,16 @@ set_model) сериализованы её локом `Session.ops` — пара
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import pty
 import shutil
 import socket
+import struct
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -643,6 +646,15 @@ class SessionManager:
         self._rotate_log(session.session_dir / "claude.log")
         session.log_file = open(session.session_dir / "claude.log", "ab")
         master, slave = pty.openpty()
+        # Задать размер терминала. Без него winsize = 0×0, и Claude Code
+        # агрессивно зондирует размер через CPR (\x1b[6n); под agent-vm (двойной
+        # PTY через attach) ответы на зонды текут одиночными цифрами в stdin —
+        # мусор в экране, а изредка (если следом CR) уходит спурьёзным
+        # сообщением («your message was just 2»). Фиксированный размер это гасит.
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        except OSError:
+            pass
         try:
             # cwd = папка проекта (если задан линк): натуральное поведение —
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
