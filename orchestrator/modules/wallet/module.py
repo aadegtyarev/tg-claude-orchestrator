@@ -112,6 +112,22 @@ confirm = false                           # без кнопок подтверж
 """
 
 
+def _prints_token(cmd: list[str]) -> bool:
+    """gh-команда, печатающая сам токен: `gh auth token` или `… --show-token`.
+
+    Guard её и так режет (см. `_always_denied`). Выделено отдельно, чтобы НЕ
+    поднимать operator-notice на этот отказ: он самокорректирующийся (модель
+    получает предписывающий reason в stderr), а фоновый поллер Claude Code
+    («PR status» в футере) зовёт ровно `gh auth token --hostname github.com`
+    периодически — с notice это спамило бы чат на каждый опрос. Первая
+    не-флаговая подкоманда, как в guard: `gh --флаг auth token` не проскочит,
+    `gh pr create --title "auth token"` не ложно-сработает."""
+    if not cmd or os.path.basename(cmd[0]) != "gh":
+        return False
+    subs = [a for a in cmd[1:] if not a.startswith("-")]
+    return subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd)
+
+
 def _always_denied(cmd: list[str]) -> str | None:
     """Опасные вызовы, запрещённые guard'ом — при любой policy, даже `commands=["gh"]`.
 
@@ -130,8 +146,7 @@ def _always_denied(cmd: list[str]) -> str | None:
     # `gh pr create --title "auth token"` не ложно-сработал: там первая подкоманда
     # «pr», а не «auth»).
     if binary == "gh":
-        subs = [a for a in cmd[1:] if not a.startswith("-")]
-        if subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd):
+        if _prints_token(cmd):
             return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
                     "секретов. Токен и НЕ нужен: `git push`/`fetch`/`pull`/`clone` по "
                     "HTTPS авторизуются на хосте через кошелёк (gh credential helper "
@@ -796,11 +811,17 @@ class WalletModule:
                     reason = "команда не в списке разрешённых (policy commands)"
                 else:
                     reason = "отклонено кнопкой подтверждения"
-            notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"
-            await self.core.notice(
-                session,
-                self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
-            )
+            # Operator-notice — только для отказов, требующих его внимания.
+            # `gh auth token`/`--show-token` (печать токена) НЕ шлём: отказ
+            # самокорректирующийся (reason ушёл в stderr модели, аудит — в бабле),
+            # а фоновый поллер Claude Code («PR status») зовёт её периодически —
+            # иначе спам в чат на каждый опрос. git-RCE и policy-отказы — шлём.
+            if not _prints_token(cmd):
+                notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"
+                await self.core.notice(
+                    session,
+                    self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
+                )
             return web.json_response({"error": "denied", "reason": reason}, status=403)
         code, out, err = await self._execute(session, secret, cmd)
         values = [s.value for s in all_secrets.values()]

@@ -795,6 +795,12 @@ class OrchestratorCore:
         self.tools.start(session.name, str(payload.get("tool_use_id") or ""))
         # agent_id/agent_type — на каждом тул-вызове ВНУТРИ сабагента.
         agent_id = payload.get("agent_id")
+        # Сабагент уже завершился (SubagentStop пришёл), а этот его тул-хук
+        # прилетел позже из-за гонки доставки async-хуков — не нестим строку под
+        # «завершил» (иначе визуально «сабагент закончил, но работа идёт»).
+        # Рендерим верхним уровнем: agent_id → None (и note_child не тронем).
+        if agent_id and self.naming.is_closed(session.name, str(agent_id)):
+            agent_id = None
         # Запоминаем тип сабагента для будущей строки «✅ … завершил»:
         #  • дочерний тул несёт agent_id + agent_type — самый надёжный источник;
         #  • спавн (Agent/Task) несёт subagent_type, но agent_id ещё нет —
@@ -849,6 +855,9 @@ class OrchestratorCore:
         путь `<session-transcript-dir>/<uuid>/subagents/agent-<id>.jsonl` сами)."""
         agent_id = str(payload.get("agent_id") or "")
         agent = self.naming.pop(session.name, agent_id)
+        # Сабагент закрыт: его запоздалые тул-хуки (гонка доставки) больше не
+        # нестить под ним (см. handle_tool_event / naming.is_closed).
+        self.naming.close(session.name, agent_id)
         model = await self._read_subagent_model(session, agent_id, payload)
         if agent and model:
             line = self.t("subagent_done_named", agent=agent, model=model)
@@ -866,17 +875,28 @@ class OrchestratorCore:
         self, session: Session, agent_id: str, payload: dict
     ) -> str:
         """Модель сабагента: сперва по agent_transcript_path из payload, затем
-        фолбэк — собранный путь subagents/agent-<id>.jsonl рядом с транскриптом
-        сессии. '' — не удалось."""
+        собранный путь subagents/agent-<id>.jsonl, затем фолбэк — новейший
+        agent-*.jsonl в subagents/. '' — не удалось.
+
+        Фолбэк на новейший нужен, когда в payload НЕТ agent_transcript_path И
+        agent_id пуст/не совпал (тогда имя резолвится по спавну, а модель
+        терялась → строка «завершил» без модели). Сабагент только что завершил
+        — его транскрипт дописан последним, поэтому обычно он и есть новейший."""
         candidates: list[Path] = []
         tpath = payload.get("agent_transcript_path")
         if tpath:
             candidates.append(Path(tpath))
+        subdir: Path | None = None
         if agent_id:
             sess_tr = self.manager.transcript_path(session)
             # subagents/ лежит в подпапке-uuid сессии рядом с её .jsonl.
-            sub = sess_tr.with_suffix("") / "subagents" / f"agent-{agent_id}.jsonl"
-            candidates.append(sub)
+            subdir = sess_tr.with_suffix("") / "subagents"
+            candidates.append(subdir / f"agent-{agent_id}.jsonl")
+        else:
+            subdir = self.manager.transcript_path(session).with_suffix("") / "subagents"
+        newest = await asyncio.to_thread(self._newest_subagent_transcript, subdir)
+        if newest is not None and newest not in candidates:
+            candidates.append(newest)
         for path in candidates:
             try:
                 model = await asyncio.to_thread(read_last_model, path)
@@ -885,6 +905,20 @@ class OrchestratorCore:
             if model:
                 return model
         return ""
+
+    @staticmethod
+    def _newest_subagent_transcript(subdir: "Path | None") -> "Path | None":
+        """Новейший (по mtime) agent-*.jsonl в subagents/ или None. Блокирующий
+        stat — звать через to_thread. Тихо переносит отсутствие каталога."""
+        if subdir is None:
+            return None
+        try:
+            files = [p for p in subdir.glob("agent-*.jsonl") if p.is_file()]
+        except OSError:
+            return None
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
 
     def _unblock_available(self, name: str) -> bool:
         """Есть ли что разблокировать (для активности кнопки ⏭): ждёт фон

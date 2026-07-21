@@ -40,7 +40,7 @@ def make_env(tmp: Path):
         'env = "GITHUB_TOKEN"\n'
         'description = "deploy token"\n'
         'sessions = ["de*"]\n'
-        'commands = ["sh -c *", "gh *"]\n'
+        'commands = ["sh -c *", "gh *", "git *"]\n'
         'confirm = false\n'
         '\n'
         '[secrets.other]\n'
@@ -97,6 +97,7 @@ def make_env(tmp: Path):
         _record=lambda *a, **kw: None,
         request_confirmation=request_confirmation,
     )
+    core.sent_notices = notices  # интроспекция для тестов notice-поведения
     config = SimpleNamespace(
         wallet_secrets_file=secrets_file, sandbox="bwrap", sessions_dir=tmp,
         wallet_guard=True,
@@ -206,6 +207,7 @@ async def main():
 
             # guard прозрачен: gh auth token разрешён commands (gh *), но guard
             # рубит его 403 с ОБЪЯСНЯЮЩИМ reason (доходит до терминала модели)
+            n_before = len(core.sent_notices)
             async with http.post(f"{url}/run", headers=good,
                                  json={"secret": "deploy",
                                        "cmd": ["gh", "auth", "token"]}) as r:
@@ -215,7 +217,21 @@ async def main():
             # reason уводит модель к обычному git push (HTTPS auth на хосте),
             # а не к SSH-костылю через печать токена (кейс noos).
             assert "git push" in body["reason"], body
-            print("OK guard: gh auth token → 403 с прозрачным объяснением (→ git push)")
+            # notice НЕ шлётся: `gh auth token` — самокорректирующийся отказ,
+            # который поллер Claude Code («PR status») дёргает периодически;
+            # operator-notice спамил бы чат. Аудит-строка в бабл — отдельно.
+            assert len(core.sent_notices) == n_before, core.sent_notices
+            print("OK guard: gh auth token → 403 с объяснением, БЕЗ operator-notice")
+
+            # guard git-RCE (`git -c`) — тоже 403, НО notice ШЛЁТСЯ: это реальный
+            # сигнал оператору, не безобидный фоновый опрос.
+            n_before = len(core.sent_notices)
+            async with http.post(f"{url}/run", headers=good,
+                                 json={"secret": "deploy",
+                                       "cmd": ["git", "-c", "core.sshCommand=evil", "push"]}) as r:
+                assert r.status == 403
+            assert len(core.sent_notices) == n_before + 1, core.sent_notices
+            print("OK guard: git -c push → 403 С operator-notice (сигнал оператору)")
 
         # редакция: вложенные значения, длинные первыми
         out = _redact(b"a=S3CR3T-DEPLOY b=S3CR3T-OTHER", ["S3CR3T-DEPLOY", "S3CR3T-OTHER"])
