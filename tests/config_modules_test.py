@@ -1,7 +1,14 @@
-"""Дефолт модулей: кошелёк включён по умолчанию при песочнице bwrap.
+"""Набор модулей: кошелёк требует песочницу bwrap и вне её НЕ включается.
 
-MODULES не задан → wallet при bwrap (host-like работа с секретами без выдачи их
-модели), пусто при off/agent-vm. Явный MODULES (в т.ч. пустой) уважается.
+MODULES — реестр расширений (кошелёк — первый из них, не единственный
+возможный). Модуль может требовать конкретную песочницу: кошелёк работает
+ТОЛЬКО под bwrap, потому что его провода (шимы в PATH, env-маркеры) — это
+окружение процесса claude на ХОСТЕ. Под agent-vm claude живёт в госте, env
+туда не течёт и домашний каталог сессии не монтируется, поэтому включённый
+кошелёк был бы тихим no-op: демон поднят, а в сессии его нет.
+
+Поэтому wallet отфильтровывается вне bwrap ДАЖЕ при явном MODULES=wallet —
+но громко (WARNING в лог), а не молча.
 
 Запуск: .venv/bin/python tests/config_modules_test.py
 """
@@ -18,15 +25,38 @@ def test_default_modules():
     assert Config._default_modules(None, "bwrap") == ("wallet",)
     assert Config._default_modules(None, "off") == ()
     assert Config._default_modules(None, "agent-vm") == ()
-    # явный MODULES уважаем как есть (в т.ч. пустой — осознанное отключение)
+    # явный пустой MODULES — осознанное отключение, уважаем
     assert Config._default_modules("", "bwrap") == ()
-    assert Config._default_modules("wallet", "off") == ("wallet",)
     assert Config._default_modules("wallet", "bwrap") == ("wallet",)
-    print("OK _default_modules: bwrap+не задан→wallet; off→пусто; явный уважается")
+    print("OK _default_modules: bwrap+не задан→wallet; off/agent-vm→пусто")
+
+
+def test_wallet_requires_bwrap_even_if_explicit():
+    """Явный MODULES=wallet вне bwrap НЕ включает кошелёк (был тихий no-op).
+
+    Под agent-vm: демон поднимался на хосте, шимы и .wallet.json ложились в
+    домашний каталог сессии, но в гостя не попадали ни они, ни env-маркеры —
+    кошелёк «включён» и бесполезен. Теперь он просто не включается.
+    """
+    assert Config._default_modules("wallet", "agent-vm") == ()
+    assert Config._default_modules("wallet", "off") == ()
+    print("OK явный MODULES=wallet вне bwrap отфильтрован (не тихий no-op)")
+
+
+def test_unknown_module_still_rejected():
+    """Неизвестное имя модуля — по-прежнему ошибка запуска, а не тихий пропуск."""
+    try:
+        Config._default_modules("nosuchmodule", "bwrap")
+    except SystemExit:
+        print("OK неизвестный модуль → SystemExit")
+        return
+    raise AssertionError("неизвестный модуль должен падать SystemExit")
 
 
 def main():
     test_default_modules()
+    test_wallet_requires_bwrap_even_if_explicit()
+    test_unknown_module_still_rejected()
     print("ALL CONFIG-MODULES OK")
 
 
