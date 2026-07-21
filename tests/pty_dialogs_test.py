@@ -1,6 +1,13 @@
 """_pty_driver диалоги: маркеры авто-ответа матчат ДИАЛОГИ, но НЕ постоянную
-строку статуса. Регресс: маркер «bypasspermissions» ложно совпадал с плашкой
-«⏵⏵ bypass permissions on» и слал «2» как сообщение (замечено под agent-vm).
+строку статуса и НЕ обычный текст беседы.
+
+Два регресса, которые закрывают эти тесты:
+  1. маркер «bypasspermissions» ложно совпадал с плашкой «⏵⏵ bypass permissions
+     on» и слал «2» как сообщение (замечено под agent-vm);
+  2. матчер работал ВСЮ жизнь сессии по скользящему окну вывода, поэтому текст
+     самой беседы («yes, I accept») впечатывал «2\r» в stdin Claude — цифра
+     уходила спурьёзным сообщением («your message was just 2»). Все маркеры —
+     СТАРТОВЫЕ диалоги, поэтому матчер живёт только стартовое окно.
 
 Запуск: .venv/bin/python tests/pty_dialogs_test.py
 """
@@ -9,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.core.sessions import _DIALOGS  # noqa: E402
+from orchestrator.core.sessions import _DIALOGS, _DialogAnswerer  # noqa: E402
 
 
 def _screen(text: str) -> str:
@@ -61,11 +68,103 @@ def test_managed_settings_matches_with_enter():
     print("OK managed-settings диалог → Enter")
 
 
+# ── _DialogAnswerer: работает только до готовности сессии ─────────────────
+
+
+def test_answerer_replies_before_ready():
+    a = _DialogAnswerer()
+    assert a.feed(DIALOG_BYPASS.encode()) == [b"2\r"]
+    print("OK до готовности сессии диалог получает ответ")
+
+
+def test_answerer_answers_each_marker_once():
+    """Повторный показ того же диалога не шлёт клавиши второй раз."""
+    a = _DialogAnswerer()
+    assert a.feed(DIALOG_BYPASS.encode()) == [b"2\r"]
+    assert a.feed(DIALOG_BYPASS.encode()) == []
+    print("OK один маркер — один ответ")
+
+
+def test_answerer_silent_after_stop():
+    """После stop() (канал ответил на /ping) текст беседы НЕ пишется в stdin.
+
+    Это и есть баг «your message was just 2»: модель пишет в чат «yes, I
+    accept», матчер видит маркер и шлёт «2\\r» в сессию.
+    """
+    a = _DialogAnswerer()
+    a.stop()
+    assert a.feed(DIALOG_BYPASS.encode()) == []
+    assert a.feed(_screen("sure, yes, I accept that plan").encode()) == []
+    print("OK после stop() клавиши в stdin не пишутся")
+
+
+def test_answerer_no_deadline_survives_slow_boot():
+    """Матчер НЕ выключается по времени: под agent-vm первая загрузка образа
+    занимает минуты, и диалог приходит сильно позже старта процесса."""
+    a = _DialogAnswerer()
+    a.feed(b"pulling image layer 21/22 ...")
+    assert a.active, "матчер не должен гаснуть сам по себе"
+    assert a.feed(DIALOG_TRUST.encode()) == [b"\r"], "диалог после долгого старта"
+    print("OK долгий старт (загрузка образа) не оставляет диалог без ответа")
+
+
+def test_answerer_multiple_dialogs_in_one_chunk():
+    """Несколько диалогов, склеенных в один чанк, отвечаются все.
+
+    Под agent-vm вывод идёт через проброшенный PTY, и перерисовки экрана
+    реалистично склеиваются в один os.read() — раньше отвечался только
+    первый маркер, буфер обнулялся, и сессия вешалась на втором диалоге.
+    """
+    a = _DialogAnswerer()
+    keys = a.feed((DIALOG_TRUST + DIALOG_MANAGED).encode())
+    assert len(keys) == 2, keys
+    print("OK два диалога в одном чанке — два ответа")
+
+
+def test_answerer_stops_when_all_answered():
+    """Когда все диалоги отвечены, матчер выключается досрочно (не жжёт CPU)."""
+    a = _DialogAnswerer()
+    a.feed(
+        (
+            DIALOG_TRUST
+            + DIALOG_BYPASS
+            + DIALOG_MANAGED
+            + _screen("I am using this for local development")
+        ).encode()
+    )
+    assert not a.active, "матчер должен выключиться после всех диалогов"
+    print("OK матчер выключается, когда все диалоги отвечены")
+
+
+def test_answerer_strips_ansi_and_spaces():
+    """Матч идёт по экрану без ANSI и пробелов (реальный вывод раскрашен)."""
+    a = _DialogAnswerer()
+    raw = b"\x1b[1m\x1b[32m  2. Yes,   I accept\x1b[0m\r\n"
+    assert a.feed(raw) == [b"2\r"]
+    print("OK ANSI и пробелы не мешают матчу")
+
+
+def test_answerer_marker_split_across_chunks():
+    """Маркер, разорванный между чанками, всё равно матчится (скользящее окно)."""
+    a = _DialogAnswerer()
+    assert a.feed(b"  2. Yes, I ac") == []
+    assert a.feed(b"cept\r\n") == [b"2\r"]
+    print("OK маркер на границе чанков матчится")
+
+
 def main():
     test_no_marker_matches_status_bar()
     test_bypass_marker_matches_dialog()
     test_trust_dialog_matches()
     test_managed_settings_matches_with_enter()
+    test_answerer_replies_before_ready()
+    test_answerer_answers_each_marker_once()
+    test_answerer_silent_after_stop()
+    test_answerer_no_deadline_survives_slow_boot()
+    test_answerer_multiple_dialogs_in_one_chunk()
+    test_answerer_stops_when_all_answered()
+    test_answerer_strips_ansi_and_spaces()
+    test_answerer_marker_split_across_chunks()
     print("ALL PTY-DIALOGS OK")
 
 
