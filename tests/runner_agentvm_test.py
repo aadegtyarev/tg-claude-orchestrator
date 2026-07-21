@@ -16,7 +16,12 @@ from orchestrator.runners.direct import DirectRunner  # noqa: E402
 
 
 def cfg(**kw):
-    base = dict(agent_vm_memory_gib=None, agent_vm_cpus=None, agent_vm_image=None)
+    # claude_env: раннер смотрит его, чтобы открыть гостю egress к хостовому
+    # прокси оператора (--allow-egress); по умолчанию его нет.
+    base = dict(
+        agent_vm_memory_gib=None, agent_vm_cpus=None, agent_vm_image=None,
+        claude_env={}, agent_vm_host_ip=None,
+    )
     base.update(kw)
     return SimpleNamespace(**base)
 

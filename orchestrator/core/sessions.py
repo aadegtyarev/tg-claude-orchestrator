@@ -684,7 +684,25 @@ class SessionManager:
             hooks["PostToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
             hooks["SubagentStop"] = [{"matcher": "", "hooks": [hook_cmd]}]
         settings["hooks"] = hooks
-        (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
+
+        # CLAUDE_ENV_* под agent-vm иначе ПРОПАДАЮТ: мы задаём их в env процесса,
+        # а claude живёт в госте, куда env не течёт (замерено: в госте
+        # ANTHROPIC_BASE_URL=unset). Оператор при этом уверен, что его настройка
+        # в деле. Файл настроек в гостя монтируется, а блок `env` читает САМ
+        # клиент (проверено живьём), поэтому доставляем их так. Под bwrap/off
+        # оставляем env процесса — проверенный путь, не трогаем.
+        if self.config.sandbox == "agent-vm" and self.config.claude_env:
+            settings["env"] = dict(self.config.claude_env)
+        settings_file = settings_dir / "settings.local.json"
+        # 0600: в env-блоке может лежать токен прокси оператора. От МОДЕЛИ он
+        # этим не закрыт (в госте она root и читает свой каталог — ровно как
+        # под bwrap читает env процесса; для секретов, которые модель видеть не
+        # должна, есть кошелёк), но от других пользователей хоста — да, и файл
+        # не должен быть group/other-readable, как соседний hook_dispatch.py.
+        fd = os.open(settings_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(settings, indent=2))
+        os.chmod(settings_file, 0o600)
 
     async def _start_claude(self, session: Session, resume: bool = False) -> None:
         """Запустить интерактивный claude под PTY.

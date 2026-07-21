@@ -131,6 +131,7 @@ Actions) гоняет ruff + оба раннера (pytest И `tests/run_all.sh`
 | `WALLET_GUARD` | `1` | Встроенный всегда-запрет опасного (печать токена, git-RCE); `0` — выключить |
 | `WALLET_POLICY_EDIT` | `1` | Правка policy кошелька из чата (`/wallet`); `0` — только просмотр |
 | `AUTOMODE_CLASSIFY_ALL_SHELL` | `1` | Судья auto-режима проверяет ВСЕ bash-команды (только связка wallet+bwrap+auto); `0` — меньше вопросов, слабее защита секретов |
+| `AGENT_VM_HOST_IP` | авто | LAN-адрес хоста для гостя microVM (`SANDBOX=agent-vm`): по нему сессия видит прокси оператора. Авто = `src` дефолтного маршрута; задай явно, если авто-выбор промахнулся (VPN, IPv6-only) |
 | `CHANNEL_PORT_START`/`_END` | авто | Пул портов channel-серверов |
 | `SESSIONS_DIR` | `~/tg-claude-sessions` | Директория сессий (дефолт прежний — совместимость) |
 | `MAX_INSTANCES` | 5 | Лимит одновременных сессий |

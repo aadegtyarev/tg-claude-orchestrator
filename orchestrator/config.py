@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,52 @@ def _auto_orch_token() -> str:
 # биндится на orch_host (host-side loopback). Подтверждено живым экспериментом,
 # docs/agent-vm-integration.md.
 AGENT_VM_GUEST_HOST = "host.microsandbox.internal"
+
+# Хостовый loopback в значении CLAUDE_ENV_* (напр. ANTHROPIC_BASE_URL прокси).
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")
+# То же, но как их отдаёт urlsplit().hostname (без скобок у IPv6, в нижнем).
+LOOPBACK_HOSTS_PLAIN = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def host_lan_ip() -> str | None:
+    """LAN-адрес хоста, по которому его видит гость microVM.
+
+    Зачем не `host.microsandbox.internal`: замерено живьём — agent-vm гонит
+    egress гостя через свой HTTP-CONNECT прокси, и хостовое gateway-имя он не
+    маршрутизирует (запрос к сервису на хосте не доходит). А вот LAN-адрес
+    хоста прокси обходит (он сам кладёт его в `no_proxy` гостя), и с
+    `--allow-egress <этот адрес>` сервис на хосте из гостя ДОСТУПЕН —
+    проверено: гость получил ответ от хостового сервиса.
+
+    Берём `src` ДЕФОЛТНОГО маршрута с наименьшей метрикой — ровно тот адрес,
+    что выбирает сам agent-vm (сверено: он положил его в `no_proxy` гостя).
+    Трюк «UDP-сокет на 8.8.8.8» здесь НЕ годится: при поднятом VPN он вернёт
+    адрес туннеля (более специфичный маршрут), а гость ходит не туда.
+
+    Переопределяется явно — `AGENT_VM_HOST_IP` (если авто-выбор промахнулся).
+    """
+    override = os.getenv("AGENT_VM_HOST_IP", "").strip()
+    if override:
+        return override
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ip", "-o", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    best: tuple[int, str] | None = None
+    for line in out.splitlines():
+        m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
+        if not m:
+            continue
+        metric = int(mm.group(1)) if (mm := re.search(r"\bmetric\s+(\d+)", line)) else 0
+        if best is None or metric < best[0]:
+            best = (metric, m.group(1))
+    return best[1] if best else None
 
 
 @dataclass(frozen=True)
@@ -98,6 +145,11 @@ class Config:
     agent_vm_memory_gib: float | None
     agent_vm_cpus: int | None
     agent_vm_image: str | None
+    # LAN-адрес хоста для гостя (см. host_lan_ip). Фиксируется ОДИН раз на
+    # старте: раннер должен открывать egress ровно к тому адресу, что уже
+    # записан в claude_env, иначе при смене маршрута (VPN/DHCP) URL и
+    # --allow-egress разъедутся и гость молча не достучится.
+    agent_vm_host_ip: str | None
     # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
     # allowlist песочницы).
     wallet_secrets_file: Path
@@ -140,9 +192,50 @@ class Config:
         chat_id_raw = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
         sandbox = cls._parse_sandbox(os.getenv("SANDBOX", "bwrap"))
+        # CLAUDE_ENV_ANTHROPIC_BASE_URL=... → в процесс claude уйдёт
+        # ANTHROPIC_BASE_URL=... (префикс снимается).
+        claude_env = {
+            k[len("CLAUDE_ENV_"):]: v
+            for k, v in os.environ.items()
+            if k.startswith("CLAUDE_ENV_") and k != "CLAUDE_ENV_"
+        }
         modules = cls._default_modules(
             os.getenv("MODULES"), sandbox, os.getenv("SANDBOX_BWRAP_WALLET")
         )
+        # CLAUDE_ENV_* с адресом на хостовом loopback (типовой случай —
+        # ANTHROPIC_BASE_URL локального прокси) под agent-vm переписываем на
+        # LAN-адрес хоста: изнутри VM «127.0.0.1» указывал бы на сам гость.
+        # Раннер к такому адресу добавляет `--allow-egress` (иначе RFC1918
+        # запрещён политикой public_only). См. host_lan_ip.
+        agent_vm_host_ip = host_lan_ip() if sandbox == "agent-vm" else None
+        if sandbox == "agent-vm":
+            claude_env, unreachable = cls._rewrite_env_for_guest(
+                claude_env, agent_vm_host_ip
+            )
+            if unreachable:
+                logger.warning(
+                    "%s: адрес на loopback хоста, а LAN-адрес хоста определить "
+                    "не удалось — из microVM сервис недостижим, переменная "
+                    "останется как есть и, скорее всего, сломает сессию. "
+                    "Используй SANDBOX=bwrap или укажи внешний адрес.",
+                    ", ".join(sorted(unreachable)),
+                )
+
+        # CLAUDE_CONFIG_DIR под agent-vm не применяется и применён быть НЕ может:
+        # это хостовый путь с кредами, а claude живёт в госте. Смонтировать его
+        # внутрь значит занести хостовые креды в VM и подраться с кред-прокси
+        # agent-vm (он сам держит ~/.claude/.credentials.json на хосте и отдаёт
+        # в гостя плейсхолдеры). Молчать нельзя — оператор считал бы, что его
+        # профиль в деле. CLAUDE_ENV_* при этом доезжают (через env-блок
+        # settings.local.json, см. sessions._write_claude_settings).
+        if sandbox == "agent-vm" and os.getenv("CLAUDE_CONFIG_DIR", "").strip():
+            logger.warning(
+                "CLAUDE_CONFIG_DIR ИГНОРИРУЕТСЯ при SANDBOX=agent-vm: claude "
+                "работает внутри microVM со своим ~/.claude, а профиль хоста "
+                "туда не пробросить (это внесло бы хостовые креды в гостя). "
+                "Профиль/креды Claude в VM держит сам agent-vm. Нужен свой "
+                "профиль — используй SANDBOX=bwrap."
+            )
 
         return cls(
             adapters=adapters,
@@ -186,13 +279,7 @@ class Config:
             default_effort=(
                 (raw.strip() or None) if (raw := os.getenv("DEFAULT_EFFORT", "")).strip() else None
             ),
-            # CLAUDE_ENV_ANTHROPIC_BASE_URL=... → в процесс claude уйдёт
-            # ANTHROPIC_BASE_URL=... (префикс снимается).
-            claude_env={
-                k[len("CLAUDE_ENV_"):]: v
-                for k, v in os.environ.items()
-                if k.startswith("CLAUDE_ENV_") and k != "CLAUDE_ENV_"
-            },
+            claude_env=claude_env,
             # Файловая песочница (bubblewrap). По умолчанию включена: процесс
             # claude и /bash видят только папку сессии/проекта и конфиг Claude
             # Code, всё остальное в $HOME и системе — недоступно. SANDBOX=off
@@ -213,6 +300,7 @@ class Config:
                 int(raw) if (raw := os.getenv("AGENT_VM_CPUS", "").strip()) else None
             ),
             agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),
+            agent_vm_host_ip=agent_vm_host_ip,
             wallet_secrets_file=Path(
                 os.getenv(
                     "WALLET_SECRETS_FILE",
@@ -261,6 +349,39 @@ class Config:
                 f"допустимо: {', '.join(sorted(valid))}"
             )
         return tuple(dict.fromkeys(names))
+
+    @classmethod
+    def _rewrite_env_for_guest(
+        cls, claude_env: dict[str, str], ip: str | None = None
+    ) -> tuple[dict[str, str], list[str]]:
+        """Переписать loopback-адреса в CLAUDE_ENV_* на LAN-адрес хоста.
+
+        Возвращает (новый словарь, имена переменных, которые переписать не
+        удалось). Внутри microVM «127.0.0.1» — это сам гость, поэтому прокси
+        оператора надо адресовать LAN-адресом хоста (см. host_lan_ip).
+        """
+        if ip is None:
+            ip = host_lan_ip()
+        out, unreachable = {}, []
+        for name, value in claude_env.items():
+            # Разбираем URL, а не ищем подстроку: «http://127.0.0.1/v1» (без
+            # порта) прежде проскакивал как «внешний», а внутри VM это сам
+            # гость; и наоборот, loopback внутри query-параметра портился.
+            try:
+                parts = urlsplit(value)
+            except ValueError:
+                parts = None
+            host = (parts.hostname if parts and parts.scheme else None)
+            if host is None or host not in LOOPBACK_HOSTS_PLAIN:
+                out[name] = value
+                continue
+            if ip is None:
+                out[name] = value
+                unreachable.append(name)
+                continue
+            netloc = parts.netloc.replace(parts.hostname, ip, 1)
+            out[name] = urlunsplit(parts._replace(netloc=netloc))
+        return out, unreachable
 
     @classmethod
     def _default_modules(
