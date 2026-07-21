@@ -140,7 +140,9 @@ class Config:
         chat_id_raw = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
         sandbox = cls._parse_sandbox(os.getenv("SANDBOX", "bwrap"))
-        modules = cls._default_modules(os.getenv("MODULES"), sandbox)
+        modules = cls._default_modules(
+            os.getenv("MODULES"), sandbox, os.getenv("SANDBOX_BWRAP_WALLET")
+        )
 
         return cls(
             adapters=adapters,
@@ -261,19 +263,42 @@ class Config:
         return tuple(dict.fromkeys(names))
 
     @classmethod
-    def _default_modules(cls, raw: str | None, sandbox: str) -> tuple[str, ...]:
-        """Набор модулей. MODULES не задан (`None`) → кошелёк включён по умолчанию
-        при песочнице bwrap: работа с хостовыми секретами (gh/git/ssh как на
-        хосте) без выдачи их значений модели — безопасно.
+    def _default_modules(
+        cls, raw: str | None, sandbox: str, wallet_raw: str | None = None
+    ) -> tuple[str, ...]:
+        """Набор модулей.
 
-        Явный MODULES уважаем, НО модуль, которому нужна другая песочница, не
-        включаем даже по явной просьбе (MODULE_REQUIRES_SANDBOX) — он всё равно
-        не заработал бы, а «включён и молча ничего не делает» хуже, чем «не
-        включён»: оператор считает, что секреты защищены. Отказ — громкий."""
+        Кошелёк включается СВОЕЙ настройкой `SANDBOX_BWRAP_WALLET` (bool) —
+        она же неявно объявляет модуль, писать `MODULES=wallet` не нужно. Имя
+        отражает суть: кошелёк работает только в песочнице bwrap (его провода —
+        окружение процесса claude на хосте), поэтому вне bwrap настройка
+        игнорируется, а не спорит с реальностью.
+
+        `MODULES` остаётся реестром модулей вообще (для будущих). Legacy
+        `MODULES=wallet` продолжает работать; при конфликте с явной
+        `SANDBOX_BWRAP_WALLET` побеждает последняя — с предупреждением, чтобы
+        расхождение не пришлось искать глазами.
+
+        Модуль, которому нужна другая песочница, не включаем даже по явной
+        просьбе (MODULE_REQUIRES_SANDBOX): он всё равно не заработал бы, а
+        «включён и молча ничего не делает» хуже, чем «не включён» — оператор
+        считает, что секреты защищены. Отказ — громкий."""
         if raw is None:
             names = ("wallet",) if sandbox == "bwrap" else ()
         else:
             names = cls._parse_modules(raw)
+        if wallet_raw is not None:
+            want = cls._parse_bool(wallet_raw)
+            if want and "wallet" not in names:
+                names = (*names, "wallet")
+            elif not want and "wallet" in names:
+                if raw is not None and "wallet" in cls._parse_modules(raw):
+                    logger.warning(
+                        "MODULES содержит 'wallet', но SANDBOX_BWRAP_WALLET=%s — "
+                        "кошелёк ВЫКЛЮЧЕН (явная настройка сильнее). Убери "
+                        "'wallet' из MODULES, чтобы не путать.", wallet_raw,
+                    )
+                names = tuple(n for n in names if n != "wallet")
         out = []
         for name in names:
             need = cls.MODULE_REQUIRES_SANDBOX.get(name)
