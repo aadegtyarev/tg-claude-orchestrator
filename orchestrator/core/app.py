@@ -33,6 +33,7 @@ from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
+from .subagentnaming import SubagentNaming
 from .texts import get_texts
 from .toolactivity import ToolActivity
 from .toolline import AGENT_SPAWN_TOOLS, shorten, tool_line, tool_line_full
@@ -90,16 +91,10 @@ class OrchestratorCore:
         # см. core/toolactivity.py. Кормится из hook-хендлеров, читается кнопкой/
         # вотчдогом, снимается одним forget(name) на границе хода/teardown.
         self.tools = ToolActivity()
-        # agent_id → тип сабагента (dev-planner/…), на сессию. Наполняется из
-        # дочерних тул-событий (в payload есть agent_id+agent_type) и из спавн-
-        # строки (subagent_type). Нужно, чтобы «✅ Сабагент завершил» назвал
-        # ИМЕННО того, кто закончил: при последовательных сабагентах (planner→
-        # builder→reviewer) безымянная строка читалась как «завершил, но идёт
-        # дальше» — на деле это уже следующий агент. Ключ — имя сессии.
-        self._agent_types: dict[str, dict[str, str]] = {}
-        # Порядок субтипов из спавн-строк (agent_id там ещё нет) — фолбэк, чтобы
-        # сматчить завершение по очереди, если дочерние события не дали agent_id.
-        self._agent_spawns: dict[str, list[str]] = {}
+        # Именование завершившихся сабагентов (agent_id → тип) — см.
+        # core/subagentnaming.py. Кормится из hook-хендлеров, снимается pop при
+        # SubagentStop и forget(name) на границе хода/teardown.
+        self.naming = SubagentNaming()
         # Фоновые задачи хода (typing/watchdog/error-relay) и Stop-гейт —
         # единым владельцем (turn.py). Доставка — колбэками в адаптеры.
         self.turns = TurnSupervisor(
@@ -384,7 +379,7 @@ class OrchestratorCore:
         Единая точка вместо дублирования в 5+ местах (close/delete/clear/
         switch_model/dead/idle), которое раньше уже разъезжалось (часть очисток
         забывалась). Per-session состояние снимается через владельцев: активность
-        тула — `tools.forget`, именование сабагентов — `_agent_types/_agent_spawns`.
+        тула — `tools.forget`, именование сабагентов — `naming.forget`.
 
         close_bash=False — сессия продолжится (clear/switch_model перезапускают
         Claude в той же папке), терминалы /bash не трогаем. forget_turn=True —
@@ -395,8 +390,7 @@ class OrchestratorCore:
             self.turns.stop(session.name)
         await self._drop_pending_perms(session)
         self.tools.forget(session.name)
-        self._agent_types.pop(session.name, None)
-        self._agent_spawns.pop(session.name, None)
+        self.naming.forget(session.name)
         if close_bash:
             await asyncio.to_thread(self.bash.close_for_session, session.name)
         await self.bubbles.close(session.name)
@@ -781,9 +775,9 @@ class OrchestratorCore:
         #  • спавн (Agent/Task) несёт subagent_type, но agent_id ещё нет —
         #    копим по порядку как фолбэк (сматчим при SubagentStop по очереди).
         if agent_id and (atype := payload.get("agent_type")):
-            self._agent_types.setdefault(session.name, {})[str(agent_id)] = str(atype)
+            self.naming.note_child(session.name, str(agent_id), str(atype))
         elif tool in AGENT_SPAWN_TOOLS and (st := (tool_input.get("subagent_type"))):
-            self._agent_spawns.setdefault(session.name, []).append(str(st))
+            self.naming.note_spawn(session.name, str(st))
         # Спавн сабагента (описание всегда разное) и TodoWrite (состояние
         # тудушки) не схлопываем; остальные — по (tool, agent_id).
         collapsible = tool not in AGENT_SPAWN_TOOLS and tool != "TodoWrite"
@@ -824,15 +818,12 @@ class OrchestratorCore:
         """SubagentStop: сабагент завершился — ИМЕНОВАННОЙ строкой в бабл (с
         отступом под его agent_id).
 
-        Имя субагента (dev-planner/…) обязательно: при последовательных
-        сабагентах безымянная строка «✅ Сабагент завершил» + начало ходов
-        СЛЕДУЮЩЕГО агента читались как «завершил, но идёт дальше». Тип берём из
-        _agent_types (наполнен дочерними тул-событиями), фолбэк — по порядку
-        спавнов (_agent_spawns). Модель в payload НЕТ — читаем из транскрипта
+        Имя (dev-planner/…) снимаем из SubagentNaming (точный матч по agent_id →
+        фолбэк по порядку спавнов). Модель в payload НЕТ — читаем из транскрипта
         сабагента (agent_transcript_path, а если его нет/не прочёлся — собираем
         путь `<session-transcript-dir>/<uuid>/subagents/agent-<id>.jsonl` сами)."""
         agent_id = str(payload.get("agent_id") or "")
-        agent = self._pop_agent_type(session.name, agent_id)
+        agent = self.naming.pop(session.name, agent_id)
         model = await self._read_subagent_model(session, agent_id, payload)
         if agent and model:
             line = self.t("subagent_done_named", agent=agent, model=model)
@@ -845,18 +836,6 @@ class OrchestratorCore:
         await self.bubbles.append(
             session.name, line, agent_id=agent_id or None,
         )
-
-    def _pop_agent_type(self, session_name: str, agent_id: str) -> str:
-        """Тип сабагента (dev-planner/…) по agent_id, снимая его с учёта.
-        Точное совпадение по agent_id → фолбэк на самый ранний неиспользованный
-        спавн (сабагенты завершаются в порядке запуска). '' — не нашли."""
-        types = self._agent_types.get(session_name)
-        if types and agent_id in types:
-            return types.pop(agent_id)
-        spawns = self._agent_spawns.get(session_name)
-        if spawns:
-            return spawns.pop(0)
-        return ""
 
     async def _read_subagent_model(
         self, session: Session, agent_id: str, payload: dict
