@@ -93,9 +93,11 @@ async def start_reply_server(
 
     runner = web.AppRunner(app)
     await runner.setup()
-    # Слушаем на ORCH_HOST, а не хардкод 127.0.0.1: под agent-vm канал/хуки
-    # из гостя достучатся до хоста только если сервер слушает на адресе
-    # host-gateway (для bwrap/локального режима ORCH_HOST=127.0.0.1 как раньше).
+    # Bind на orch_host (host-side, дефолт 127.0.0.1) — оно ДОЛЖНО быть
+    # host-resolvable. Под agent-vm гость достучится сюда через host-gateway имя
+    # (guest_orch_host в .mcp.json/хуках), которое microsandbox+--allow-host мапят
+    # на этот хостовый loopback. Т.е. bind тут НЕ гостевое имя (оно бы упало
+    # gaierror), а guest-facing адрес выводится отдельно — см. Config.guest_orch_host.
     site = web.TCPSite(runner, host=config.orch_host, port=config.orch_port)
     await site.start()
     logger.info("Reply-сервер слушает %s:%d", config.orch_host, config.orch_port)
