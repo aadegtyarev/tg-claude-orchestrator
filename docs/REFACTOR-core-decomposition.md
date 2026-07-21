@@ -63,8 +63,11 @@
 - Функциональные правки, новые фичи.
 
 ## Статус
-- ⬜ Этап 1 — HookTracker
-- ⬜ Этап 2 — PermissionRelay
+- ✅ Этап 0 — характеризационная сетка teardown-forget (PR #28)
+- ✅ Этап 1 — по SRP разбит на два ЧИСТЫХ объекта состояния (вместо монолитного
+  HookTracker): `ToolActivity` (PR #29) + `SubagentNaming` (PR #30). Event-хендлеры
+  остались тонкой оркестрацией в app.py — они законно нуждаются в bubbles/turns.
+- ✅ Этап 2 — `UserError`→`core/errors.py` (PR #31) + `PermissionRelay` (этот PR).
 - ⬜ Этап 3 — HistoryLog
 - ⬜ Этап 4 — reports.py
 - ⬜ Этап 5 — bash-фасад (опц.)
