@@ -66,7 +66,18 @@ class TelegramAdapter:
     # ── Transport: жизненный цикл ───────────────────────────────
 
     async def start(self) -> None:
+        await self._set_command_menu()
+        # Поллинг — своей задачей; сигналы обрабатывает __main__ (адаптеров
+        # может быть несколько, aiogram не владеет процессом).
+        self._poll_task = asyncio.create_task(
+            self.dp.start_polling(self.bot, handle_signals=False),
+            name="tg-polling",
+        )
+
+    async def _set_command_menu(self) -> None:
         # Меню команд в интерфейсе Telegram (кнопка «/» у поля ввода).
+        # Недоступные при этой конфигурации команды отсеиваем ниже одним
+        # фильтром — решает ядро (core.command_available), не адаптер.
         commands = [
             BotCommand(command="new", description=self.t("menu_new")),
             BotCommand(command="list", description=self.t("menu_list")),
@@ -88,6 +99,7 @@ class TelegramAdapter:
             BotCommand(command="chat_id", description=self.t("menu_chat_id")),
             BotCommand(command="help", description=self.t("menu_help")),
         ]
+        commands = [c for c in commands if self.core.command_available(c.command)]
         # Бот работает в группах — меню «/» там берёт команды из группового
         # scope; без него список часто пуст. Ставим и default, и для групп.
         if self.config.show_command_menu:
@@ -98,12 +110,6 @@ class TelegramAdapter:
                 await self.bot.delete_my_commands()
             except Exception as e:
                 logger.warning("Не удалось очистить меню команд: %s", e)
-        # Поллинг — своей задачей; сигналы обрабатывает __main__ (адаптеров
-        # может быть несколько, aiogram не владеет процессом).
-        self._poll_task = asyncio.create_task(
-            self.dp.start_polling(self.bot, handle_signals=False),
-            name="tg-polling",
-        )
 
     async def stop(self) -> None:
         if self._poll_task is not None and not self._poll_task.done():
@@ -471,7 +477,7 @@ class TelegramAdapter:
     async def cmd_help(self, message: Message) -> None:
         if not self._accept(message):
             return
-        await message.reply(self.t("help"), parse_mode="HTML")
+        await message.reply(self.core.help_text(), parse_mode="HTML")
 
     async def cmd_new(self, message: Message, command: CommandObject) -> None:
         if not self._accept(message):

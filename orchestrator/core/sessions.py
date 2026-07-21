@@ -50,8 +50,15 @@ logger = logging.getLogger(__name__)
 PKG_DIR = Path(__file__).resolve().parent.parent
 ROOT = PKG_DIR.parent
 
-# Сколько ждать, пока Claude стартует и поднимет channel-сервер.
-READY_TIMEOUT = 60.0
+# Готовность сессии ждём по ТИШИНЕ, а не по общему времени: сколько секунд
+# терпим отсутствие признаков жизни (claude.log не растёт). Холодный старт
+# agent-vm тянет OCI-образ минутами, и фиксированный общий таймаут убивал бы
+# сессию до старта Claude; при этом реально зависший процесс должен падать
+# быстро, а не через потолок.
+READY_SILENCE_SEC = 60.0
+# Абсолютный потолок ожидания — чтобы бесконечно «прогрессирующий» процесс
+# (напр. бесконечная перекачка образа по битой сети) не висел вечно.
+READY_TIMEOUT_MAX = 900.0
 # Пауза после resume: «claude --resume» без транскрипта умирает не сразу,
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
@@ -81,6 +88,48 @@ _DIALOGS = [
     # sandbox-инструмента, benign retry-конфиг): пункт 1 «Yes, I trust» по умолч.
     ("managedsettingsrequireapproval", b"\r"),
 ]
+
+
+class _ReadyDeadline:
+    """Дедлайн готовности, который продлевается признаками жизни.
+
+    Признак жизни — рост `claude.log`: под agent-vm туда льётся прогресс
+    загрузки образа и бута VM, под bwrap — вывод самого Claude. Пока лог
+    растёт, ждём дальше; замолчал дольше READY_SILENCE_SEC — сдаёмся. Сверху
+    абсолютный потолок READY_TIMEOUT_MAX.
+    """
+
+    def __init__(
+        self,
+        started_at: float,
+        silence: float = READY_SILENCE_SEC,
+        cap: float = READY_SILENCE_SEC,
+    ):
+        # cap по умолчанию = окно тишины: без явного запаса ведём себя ровно как
+        # прежний фиксированный таймаут. Запас даём только там, где он оправдан
+        # (agent-vm с загрузкой образа) — иначе «живой» спиннер зависшего Claude
+        # растил бы лог и держал нас до потолка на самом частом пути (bwrap).
+        self._silence = silence
+        self._cap = started_at + max(cap, silence)
+        self._last_alive = started_at
+        self._last_size = -1
+
+    def note_progress(self, size: int, now: float) -> None:
+        """Сообщить текущий размер лога. Рост = признак жизни."""
+        if size > self._last_size:
+            self._last_size = size
+            self._last_alive = now
+
+    def expired(self, now: float) -> str | None:
+        """None — ждём дальше; 'silence' | 'cap' — причина сдаться."""
+        # Тишина важнее потолка: она точнее описывает, что произошло. При
+        # cap == silence (дефолт, без запаса) обе причины наступают разом —
+        # сообщать надо «молчит», а не «упёрся в потолок».
+        if now - self._last_alive > self._silence:
+            return "silence"
+        if now > self._cap:
+            return "cap"
+        return None
 
 
 class _DialogAnswerer:
@@ -793,7 +842,12 @@ class SessionManager:
 
     async def _wait_ready(self, session: Session) -> None:
         """Готовность = channel-сервер отвечает на /ping (его поднял Claude)."""
-        deadline = asyncio.get_running_loop().time() + READY_TIMEOUT
+        loop = asyncio.get_running_loop()
+        # Запас сверх окна тишины нужен только agent-vm: там первый запуск
+        # тянет OCI-образ минутами. Под bwrap/off — как раньше, без запаса.
+        cap = READY_TIMEOUT_MAX if self.config.sandbox == "agent-vm" else READY_SILENCE_SEC
+        deadline = _ReadyDeadline(started_at=loop.time(), cap=cap)
+        log_path = session.session_dir / "claude.log"
         http = self._http_session()
         ping_timeout = aiohttp.ClientTimeout(total=2)
         while True:
@@ -820,15 +874,33 @@ class SessionManager:
                         return
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
-            if asyncio.get_running_loop().time() > deadline:
+            # Признак жизни: лог растёт (под agent-vm — прогресс загрузки
+            # образа и бута VM, под bwrap — вывод Claude). Пока растёт, ждём.
+            try:
+                deadline.note_progress(log_path.stat().st_size, loop.time())
+            except OSError:
+                pass
+            reason = deadline.expired(loop.time())
+            if reason is not None:
                 # Частая причина при обновлении Claude Code: channels —
                 # research preview, флаги/протокол могут поменяться, и тогда
                 # claude не спавнит channel_server или не отвечает handshake.
+                why = (
+                    f"молчит {READY_SILENCE_SEC:.0f} с (лог не растёт)"
+                    if reason == "silence"
+                    else f"не уложился в потолок {READY_TIMEOUT_MAX / 60:.0f} мин"
+                )
+                extra = ""
+                if self.config.sandbox == "agent-vm":
+                    extra = (
+                        " Под agent-vm первый запуск ещё и тянет OCI-образ "
+                        "(минуты) — прогрей заранее: `agent-vm setup`."
+                    )
                 raise SessionError(
-                    f"Claude не поднял channel-сервер за {READY_TIMEOUT:.0f} с. "
+                    f"Claude не поднял channel-сервер: {why}. "
                     "Возможно, обновилась версия Claude Code и изменился протокол "
-                    "каналов (research preview) — проверь лог и совместимость. "
-                    f"Лог: {session.session_dir / 'claude.log'}"
+                    f"каналов (research preview) — проверь лог и совместимость.{extra} "
+                    f"Лог: {log_path}"
                 )
             await asyncio.sleep(1)
 
