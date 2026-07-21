@@ -531,7 +531,10 @@ class SessionManager:
         # /proc/<pid>/cmdline и в самом settings.local.json не остаётся.
         hook_script = settings_dir / "hook_dispatch.py"
         hook_script.write_text(
-            hookscript.render(self.config.orch_port, session.name, self.config.orch_token)
+            hookscript.render(
+                self.config.orch_host, self.config.orch_port,
+                session.name, self.config.orch_token,
+            )
         )
         os.chmod(hook_script, 0o600)
         hook_cmd = {"type": "command", "command": f'"{sys.executable}" "{hook_script}"'}
