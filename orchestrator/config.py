@@ -12,6 +12,17 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+# Что сказать оператору, когда модуль пропущен из-за несовпадения песочницы:
+# не просто «выключен», а чем это грозит и что делать.
+_MODULE_SKIP_HINT = {
+    "wallet": (
+        "Секреты кошелька (ssh/scp, токены для curl и любых CLI, inject-секреты) "
+        "в этой сессии НЕДОСТУПНЫ. Под agent-vm креды git/gh и Claude держит его "
+        "собственный прокси (значения модели не выдаются) — этого хватает для "
+        "git/gh; для остальных секретов запускай с SANDBOX=bwrap."
+    ),
+}
+
 
 def _auto_orch_token() -> str:
     """Разовый токен внутреннего HTTP-API, если ORCH_TOKEN не задан явно.
@@ -227,6 +238,16 @@ class Config:
             raise SystemExit("ADAPTERS пуст — нужен хотя бы один адаптер (telegram, web)")
         return tuple(dict.fromkeys(names))  # без дублей, порядок сохранён
 
+    # Модуль → песочница, без которой он не работает (None = работает при любой).
+    # Кошелёк подключается к сессии через окружение процесса claude (шимы первыми
+    # в PATH + env-маркеры секретов), а это возможно, только когда claude —
+    # процесс на ХОСТЕ, т.е. под bwrap. Под agent-vm claude живёт в госте: env
+    # туда не течёт (замерено) и домашний каталог сессии не монтируется, так что
+    # включённый кошелёк был бы тихим no-op — демон поднят, а в сессии его нет.
+    # Под sandbox=off кошелёк бессмыслен иначе: модель и так видит хостовые креды
+    # напрямую (см. комментарий про «театр» в core/sessions.py).
+    MODULE_REQUIRES_SANDBOX = {"wallet": "bwrap"}
+
     @staticmethod
     def _parse_modules(raw: str) -> tuple[str, ...]:
         valid = {"wallet"}
@@ -243,11 +264,29 @@ class Config:
     def _default_modules(cls, raw: str | None, sandbox: str) -> tuple[str, ...]:
         """Набор модулей. MODULES не задан (`None`) → кошелёк включён по умолчанию
         при песочнице bwrap: работа с хостовыми секретами (gh/git/ssh как на
-        хосте) без выдачи их значений модели — безопасно. Без bwrap кошелёк не
-        страхует, поэтому не тащим. Явный MODULES (в т.ч. пустой) уважаем как есть."""
+        хосте) без выдачи их значений модели — безопасно.
+
+        Явный MODULES уважаем, НО модуль, которому нужна другая песочница, не
+        включаем даже по явной просьбе (MODULE_REQUIRES_SANDBOX) — он всё равно
+        не заработал бы, а «включён и молча ничего не делает» хуже, чем «не
+        включён»: оператор считает, что секреты защищены. Отказ — громкий."""
         if raw is None:
-            return ("wallet",) if sandbox == "bwrap" else ()
-        return cls._parse_modules(raw)
+            names = ("wallet",) if sandbox == "bwrap" else ()
+        else:
+            names = cls._parse_modules(raw)
+        out = []
+        for name in names:
+            need = cls.MODULE_REQUIRES_SANDBOX.get(name)
+            if need is not None and sandbox != need:
+                logger.warning(
+                    "Модуль '%s' НЕ включён: он требует SANDBOX=%s, а сейчас "
+                    "SANDBOX=%s. %s",
+                    name, need, sandbox,
+                    _MODULE_SKIP_HINT.get(name, ""),
+                )
+                continue
+            out.append(name)
+        return tuple(out)
 
     @staticmethod
     def _parse_sandbox(raw: str) -> str:
