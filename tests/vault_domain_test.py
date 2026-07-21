@@ -6,6 +6,7 @@ Secret/guard/redact/store/policy.
 Запуск: .venv/bin/python tests/vault_domain_test.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -34,10 +35,26 @@ def _secret(**kw) -> Secret:
 
 
 def test_no_orchestrator_dependency():
-    """vault импортируется, НЕ затягивая orchestrator — пакет автономен."""
-    leaked = [m for m in sys.modules if m == "orchestrator" or m.startswith("orchestrator.")]
-    assert not leaked, f"vault затянул orchestrator: {leaked}"
-    print("OK vault автономен: orchestrator не в sys.modules")
+    """vault импортируется в СВЕЖЕМ интерпретаторе, НЕ затягивая orchestrator.
+
+    Проверка в отдельном процессе, а НЕ по sys.modules текущего: под `pytest`
+    все тест-модули делят один процесс, и orchestrator там уже загружен
+    соседними тестами (wallet_test и др.) — sys.modules текущего процесса не
+    показатель. Свежий интерпретатор — честная проверка автономности пакета
+    (ловится и через run_all.sh, и через pytest)."""
+    root = str(Path(__file__).parent.parent)
+    code = (
+        f"import sys; sys.path.insert(0, {root!r});"
+        "import vault.secret, vault.store, vault.redact, vault.policy;"
+        "leaked=[m for m in sys.modules if m=='orchestrator' or m.startswith('orchestrator.')];"
+        "sys.exit(1 if leaked else 0)"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, (
+        "vault затянул orchestrator в свежем процессе:\n"
+        f"stdout={r.stdout}\nstderr={r.stderr}"
+    )
+    print("OK vault автономен: свежий процесс импортит vault без orchestrator")
 
 
 def test_secret_modes_and_commands():
