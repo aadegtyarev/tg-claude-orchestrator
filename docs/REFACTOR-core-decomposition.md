@@ -67,7 +67,8 @@
 - ✅ Этап 1 — по SRP разбит на два ЧИСТЫХ объекта состояния (вместо монолитного
   HookTracker): `ToolActivity` (PR #29) + `SubagentNaming` (PR #30). Event-хендлеры
   остались тонкой оркестрацией в app.py — они законно нуждаются в bubbles/turns.
-- ✅ Этап 2 — `UserError`→`core/errors.py` (PR #31) + `PermissionRelay` (этот PR).
-- ⬜ Этап 3 — HistoryLog
+- ✅ Этап 2 — `UserError`→`core/errors.py` (PR #31) + `PermissionRelay` (PR #32).
+- ✅ Этап 3 — `HistoryLog` (этот PR). app.py держит тонкие делегаторы
+  `_record`/`history`/`save_history` (стабильный API для wallet-модуля/веба/__main__).
 - ⬜ Этап 4 — reports.py
 - ⬜ Этап 5 — bash-фасад (опц.)
