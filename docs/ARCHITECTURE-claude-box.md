@@ -7,6 +7,8 @@
 Сопутствующие документы (контекст, не задание):
 - `docs/DECISIONS-claude-box.md` — принятые решения Р1–Р11 с обоснованиями и
   отклонёнными альтернативами; не пересматривать без оператора;
+- `docs/FORK-agent-vm-egress-proxy.md` — набросок upstream-PR флага `--egress-proxy`
+  (паритет движков по инъекции секретов; Р3);
 - `docs/agent-vm-integration.md` — журнал живых экспериментов с agent-vm
   (runbook'и для smoke-проверок фаз);
 - `docs/secrets-wallet.md` — сегодняшний кошелёк (его код переезжает в Vault).
