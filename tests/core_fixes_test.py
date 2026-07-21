@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core import toolactivity  # noqa: E402
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.permission import PermissionRelay  # noqa: E402
 from orchestrator.core.subagentnaming import SubagentNaming  # noqa: E402
 from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
@@ -50,8 +51,9 @@ def make_core():
     core.tools = ToolActivity()
     core.naming = SubagentNaming()
     core.adapters = {}
-    core._pending_perms = set()
-    core._local_perms = {}
+    core.perms = PermissionRelay(
+        core.manager, core.t, core._each_transport, core._record
+    )
     core.turns = TurnSupervisor(
         core.manager, core.t,
         lambda session, text: asyncio.sleep(0),
@@ -140,10 +142,10 @@ async def test_pending_perms_cleanup():
 
     core.adapters = {"tg": FakeTr()}
     await core.handle_permission_request("noos", {"request_id": "r1", "tool": "Bash"})
-    assert ("noos", "r1") in core._pending_perms
+    assert ("noos", "r1") in core.perms._pending
     # close чистит — старая кнопка потом не пройдёт гейт + гасится в адаптере.
-    await core._drop_pending_perms(SESSION)
-    assert ("noos", "r1") not in core._pending_perms
+    await core.perms.forget(SESSION)
+    assert ("noos", "r1") not in core.perms._pending
     assert ("r1", "deny", "cancelled") in resolved  # кнопка погашена
     handled = await core.permission_verdict(SESSION, "r1", "allow", via="tg")
     assert handled is False and core.manager.perm_calls == []
@@ -256,7 +258,7 @@ async def test_teardown_runtime_unified():
 
     async def fake_drop(s):
         events.append(("drop", s.name))
-    core._drop_pending_perms = fake_drop
+    core.perms = SimpleNamespace(forget=fake_drop)
     core.bash = SimpleNamespace(
         close_for_session=lambda n: events.append(("bash", n))
     )
