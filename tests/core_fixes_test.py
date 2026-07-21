@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core import toolactivity  # noqa: E402
 from orchestrator.core.app import OrchestratorCore  # noqa: E402
+from orchestrator.core.subagentnaming import SubagentNaming  # noqa: E402
 from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
@@ -47,8 +48,7 @@ def make_core():
     core.config = SimpleNamespace(max_instances=5)
     core._history = {}
     core.tools = ToolActivity()
-    core._agent_types = {}
-    core._agent_spawns = {}
+    core.naming = SubagentNaming()
     core.adapters = {}
     core._pending_perms = set()
     core._local_perms = {}
@@ -278,14 +278,15 @@ async def test_teardown_runtime_unified():
     core.tools.note_tool("noos", "TaskOutput")  # → был бы "kick"
     core.tools.start("noos", "t1")
     core.tools.finish("noos", "t1")             # inflight пуст, _cleared_at=now (grace)
-    core._agent_types["noos"] = {"a1": "dev-planner"}
-    core._agent_spawns["noos"] = ["dev-builder"]
+    core.naming.note_child("noos", "a1", "dev-planner")
+    core.naming.note_spawn("noos", "dev-builder")
     await core._teardown_runtime(SESSION)
     assert ("stop", "noos") in events and ("drop", "noos") in events
     assert core.unblock_action("noos") is None, \
         "teardown не сбросил tool-activity (last_tool/inflight/grace)"
-    assert "noos" not in core._agent_types, "teardown не сбросил _agent_types (имя сабагента протечёт)"
-    assert "noos" not in core._agent_spawns, "teardown не сбросил _agent_spawns"
+    # naming.pop → "" значит и _types, и _spawns очищены (иначе фолбэк вернул бы
+    # 'dev-builder' — имя чужого сабагента протекло бы в следующий ход).
+    assert core.naming.pop("noos", "a1") == "", "teardown не сбросил именование сабагентов"
     assert ("bash", "noos") in events and ("bubble", "noos") in events
 
     # Продолжение (clear/switch): forget_turn + НЕ трогаем bash.
