@@ -83,15 +83,75 @@ _DIALOGS = [
 ]
 
 
-def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
+class _DialogAnswerer:
+    """Матчер стартовых диалогов: экран → клавиши-ответы.
+
+    Работает ТОЛЬКО до готовности сессии и выключается досрочно, когда все
+    диалоги отвечены. Это принципиально: маркеры ищутся в скользящем окне
+    вывода, а вывод после старта — это уже беседа. Матчер «на всю жизнь сессии»
+    впечатывал клавиши в stdin Claude, когда текст беседы случайно содержал
+    маркер (модель пишет «yes, I accept» → в сессию уходит «2\\r» и вылезает
+    спурьёзным сообщением «your message was just 2»).
+
+    Выключение — по событию, а не по таймеру: `stop()` зовётся, когда
+    channel-сервер ответил на /ping. Это ТОЧНЫЙ признак, что Claude полностью
+    поднялся и стартовые диалоги позади, и он не зависит от того, сколько
+    длился старт (под agent-vm первая загрузка OCI-образа занимает минуты —
+    любое фиксированное окно там оставило бы диалог без ответа).
+
+    Живёт в потоке _pty_driver; `stop()` зовётся из event loop — поэтому
+    флаг проверяется/ставится под локом.
+    """
+
+    def __init__(self) -> None:
+        self._answered: set[str] = set()
+        self._buf = b""
+        self._lock = threading.Lock()
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def stop(self) -> None:
+        """Сессия готова — больше не трогаем stdin (весь вывод дальше — беседа)."""
+        with self._lock:
+            self._active = False
+            self._buf = b""
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Скормить кусок вывода. Вернуть клавиши, которые надо послать."""
+        with self._lock:
+            if not self._active:
+                return []
+            self._buf = (self._buf + chunk)[-16384:]
+            screen = strip_ansi(self._buf).replace(b" ", b"")
+            screen_text = screen.decode(errors="replace").lower()
+            out: list[bytes] = []
+            # Один чанк может принести несколько диалогов сразу (под agent-vm
+            # вывод идёт через проброшенный PTY и перерисовки склеиваются) —
+            # отвечаем на все, а не только на первый.
+            for marker, keys in _DIALOGS:
+                if marker in screen_text and marker not in self._answered:
+                    self._answered.add(marker)
+                    out.append(keys)
+            if out:
+                self._buf = b""
+            if len(self._answered) == len(_DIALOGS):
+                self._active = False
+            return out
+
+
+def _pty_driver(
+    master: int, log_file: IO[bytes], name: str, answerer: _DialogAnswerer
+) -> None:
     """Поток при PTY: дренирует вывод claude (иначе буфер pty переполнится
     и процесс встанет), пишет его в лог и отвечает на стартовые диалоги.
 
     Поток владеет master-fd и сам закрывает его на выходе — закрытие из
     event loop могло бы освободить номер fd, пока поток блокирован в read.
     """
-    buf = b""
-    answered: set[str] = set()
     try:
         while True:
             try:
@@ -105,21 +165,14 @@ def _pty_driver(master: int, log_file: IO[bytes], name: str) -> None:
                 log_file.flush()
             except ValueError:  # лог уже закрыт при остановке сессии
                 pass
-            buf = (buf + chunk)[-16384:]
-            screen = strip_ansi(buf).replace(b" ", b"")
-            screen_text = screen.decode(errors="replace").lower()
-            for marker, keys in _DIALOGS:
-                if marker in screen_text and marker not in answered:
-                    answered.add(marker)
-                    logger.info("Сессия %s: отвечаю на диалог '%s'", name, marker)
-                    for key in keys:
-                        try:
-                            os.write(master, bytes([key]))
-                        except OSError:
-                            return
-                        time.sleep(0.3)
-                    buf = b""
-                    break
+            for keys in answerer.feed(chunk):
+                logger.info("Сессия %s: отвечаю на стартовый диалог", name)
+                for key in keys:
+                    try:
+                        os.write(master, bytes([key]))
+                    except OSError:
+                        return
+                    time.sleep(0.3)
     finally:
         try:
             os.close(master)
@@ -145,6 +198,9 @@ class Session:
     pty_master: int | None = None
     log_file: IO[bytes] | None = None
     watcher: asyncio.Task | None = None
+    # Авто-ответчик стартовых диалогов; глушится, как только канал ответил
+    # на /ping (дальше вывод — беседа, писать в stdin нельзя).
+    dialog_answerer: "_DialogAnswerer | None" = None
     # Снимок фоновых задач/кронов харнесса из последнего Stop-payload
     # (авторитетно: {id,type,status,description,command}). Для прозрачности —
     # что модель оставила крутиться в фоне; см. app.handle_stop_event / bg_text.
@@ -712,9 +768,10 @@ class SessionManager:
         finally:
             os.close(slave)
         session.pty_master = master
+        session.dialog_answerer = _DialogAnswerer()
         threading.Thread(
             target=_pty_driver,
-            args=(master, session.log_file, session.name),
+            args=(master, session.log_file, session.name, session.dialog_answerer),
             name=f"pty-{session.name}",
             daemon=True,
         ).start()
@@ -748,6 +805,12 @@ class SessionManager:
                     headers=self._channel_headers(),
                 ) as resp:
                     if resp.status == 200:
+                        # Канал поднят ⇒ Claude стартовал, стартовые диалоги
+                        # позади. Глушим авто-ответчик: дальше любой матч
+                        # маркера — это уже текст беседы, и нажатие клавиши
+                        # ушло бы спурьёзным сообщением от лица пользователя.
+                        if session.dialog_answerer is not None:
+                            session.dialog_answerer.stop()
                         return
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass

@@ -434,12 +434,36 @@ class ChannelServer:
                 "jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS},
             })
         elif method == "tools/call" and params.get("name") == "reply_to_user":
+            args = params.get("arguments") or {}
+            text = args.get("text") or ""
+            if not text.strip():
+                # Пустой text = молчаливая потеря ответа: пользователь получал
+                # пустое сообщение, хотя модель ответ нарратила (наблюдалось под
+                # agent-vm, «reply len=0»). Первопричина не установлена, но
+                # пересылать пустоту бессмысленно при любой из них — просим
+                # прислать текст и логируем сырые arguments для диагностики
+                # (лог доезжает до хоста, в отличие от stderr гостя).
+                logger.warning(
+                    "reply_to_user с пустым text — отклоняю. Сырые arguments: %s",
+                    json.dumps(args, ensure_ascii=False)[:2000],
+                )
+                await self._write_message({
+                    "jsonrpc": "2.0", "id": msg_id,
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": (
+                            "Empty text — nothing was delivered to the user. "
+                            "Call reply_to_user again with the actual message "
+                            "text in the 'text' argument."
+                        )}],
+                    },
+                })
+                return
             # В фоне: пока оркестратор отвечает, read-loop должен читать stdin
             # (иначе блокируются permission_request и следующие запросы).
-            args = params.get("arguments") or {}
             self._spawn(self._forward_to_orchestrator(msg_id, {
                 "context_id": args.get("context_id", ""),
-                "text": args.get("text", ""),
+                "text": text,
                 "complete": bool(args.get("complete", False)),
             }, ok_text="Reply sent"))
         elif method == "tools/call" and params.get("name") == "send_file_to_user":
