@@ -31,6 +31,7 @@ from typing import Awaitable, Callable
 
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
+from .errors import UserError
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
 from .subagentnaming import SubagentNaming
@@ -65,9 +66,8 @@ MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Сколько последних событий сессии держать в журнале (история веб-интерфейса).
 HISTORY_LIMIT = 300
 
-
-class UserError(Exception):
-    """Ошибка с готовым текстом для пользователя (адаптер показывает как есть)."""
+# UserError импортируется выше из .errors и реэкспортируется здесь: адаптеры и
+# тесты берут его как `from ...core.app import UserError` (обратная совместимость).
 
 
 class OrchestratorCore:
