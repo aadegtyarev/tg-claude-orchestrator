@@ -34,6 +34,11 @@ import urllib.request
 _HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 CHANNEL_PORT = int(os.environ.get("CHANNEL_PORT", "18761"))
+# Интерфейс bind push-сервера. bwrap: 127.0.0.1 (общий loopback с хостом).
+# agent-vm: 0.0.0.0 — docker-style `--publish` форвардит на сетевой интерфейс
+# гостя, а не на loopback, поэтому канал на 127.0.0.1 в госте недостижим с хоста.
+# Гость сетево-изолирован (public_only) + токен ORCH_TOKEN, так что 0.0.0.0 ок.
+CHANNEL_HOST = os.environ.get("CHANNEL_HOST", "127.0.0.1")
 SESSION_NAME = os.environ.get("SESSION_NAME", "default")
 ORCH_HOST = os.environ.get("ORCH_HOST", "127.0.0.1")
 ORCH_PORT = int(os.environ.get("ORCH_PORT", "18080"))
@@ -493,7 +498,7 @@ class ChannelServer:
                 "ORCH_TOKEN пуст — channel-сервер в ОТКРЫТОМ режиме (любой "
                 "локальный процесс может /notify//permission). Только для тестов!"
             )
-        httpd = _PushHTTPServer(("127.0.0.1", CHANNEL_PORT), _PushHandler)
+        httpd = _PushHTTPServer((CHANNEL_HOST, CHANNEL_PORT), _PushHandler)
         httpd.channel = self
         httpd.loop = self._loop
         httpd.expected = expected

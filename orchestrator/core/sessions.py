@@ -67,8 +67,16 @@ class SessionError(Exception):
 # Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
 _DIALOGS = [
     ("trustthisfolder", b"\r"),        # «Yes, I trust this folder» — пункт по умолчанию
-    ("bypasspermissions", b"2\r"),     # «Yes, I accept» — пункт 2
+    # ВАЖНО: маркер — по тексту ПУНКТА диалога («Yes, I accept»), НЕ по
+    # «bypasspermissions»: последнее ложно совпадает со строкой СТАТУСА
+    # «⏵⏵ bypass permissions on» (постоянная UI-плашка, не диалог) → слался «2»
+    # как сообщение в чат (замечено под agent-vm).
+    ("yes,iaccept", b"2\r"),           # bypass-permissions диалог: «2. Yes, I accept»
     ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
+    # agent-vm ставит managed-настройки (CLAUDE_CODE_MAX_RETRIES/RETRY_WATCHDOG) —
+    # Claude на старте просит их подтвердить. Доверяем (это настройки самого
+    # sandbox-инструмента, benign retry-конфиг): пункт 1 «Yes, I trust» по умолч.
+    ("managedsettingsrequireapproval", b"\r"),
 ]
 
 
@@ -439,6 +447,13 @@ class SessionManager:
                     "args": [str(PKG_DIR / "channel_server.py")],
                     "env": {
                         "CHANNEL_PORT": str(session.port),
+                        # Интерфейс bind push-сервера. agent-vm: 0.0.0.0 — иначе
+                        # docker-style `--publish` не достаёт loopback гостя; под
+                        # bwrap: 127.0.0.1 (общий loopback с хостом).
+                        "CHANNEL_HOST": (
+                            "0.0.0.0" if self.config.sandbox == "agent-vm"
+                            else "127.0.0.1"
+                        ),
                         "SESSION_NAME": session.name,
                         # guest-facing: под agent-vm — host-gateway имя (см.
                         # Config.guest_orch_host); под bwrap/off — orch_host.
