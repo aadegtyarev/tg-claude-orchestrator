@@ -37,6 +37,10 @@ class DockerProxy:
         self.policy = policy
         self.real_sock = real_sock
         self._server: asyncio.AbstractServer | None = None
+        # Сильные ссылки на задачи соединений: иначе при обрыве клиента asyncio
+        # освобождает его протокол и теряет ссылку на _handle (ещё ждёт апстрим)
+        # → GC убивает её с шумным «Task was destroyed / GeneratorExit».
+        self._conns: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         if self.sock_path.exists():
@@ -62,6 +66,9 @@ class DockerProxy:
 
     # ── одно клиентское соединение = один запрос (Connection: close) ─────
     async def _handle(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._conns.add(task)
         up_r = up_w = None
         try:
             up_r, up_w = await asyncio.open_unix_connection(self.real_sock)
@@ -79,6 +86,8 @@ class DockerProxy:
             await self._close(cw)
             if up_w is not None:
                 await self._close(up_w)
+            if task is not None:
+                self._conns.discard(task)
 
     async def _serve(self, cr, cw, up_r, up_w) -> None:
         head = await self._read_head(cr)
@@ -109,14 +118,15 @@ class DockerProxy:
             await self._send_head(up_w, f"{method} {path} HTTP/1.1", out)
             up_w.write(body)
             await up_w.drain()
+            hijack = False
         else:
             # Не create: hijack (Upgrade) не трогаем — он одноразовый; иначе шлём
             # Connection: close. Тело запроса (build-tar, stdin) уедет сплайсом.
-            keep = "upgrade" in low.get("connection", "").lower() or "upgrade" in low
-            out = hdrs if keep else self._rebuild(hdrs, content_length=None)
+            hijack = "upgrade" in low.get("connection", "").lower() or "upgrade" in low
+            out = hdrs if hijack else self._rebuild(hdrs, content_length=None)
             await self._send_head(up_w, f"{method} {path} HTTP/1.1", out)
 
-        await self._splice(cr, cw, up_r, up_w)
+        await self._splice(cr, cw, up_r, up_w, hijack=hijack)
 
     # ── разбор/перекачка ────────────────────────────────────────────────
     async def _read_head(self, r):
@@ -174,7 +184,15 @@ class DockerProxy:
         w.write(buf.encode("latin-1"))
         await w.drain()
 
-    async def _splice(self, cr, cw, up_r, up_w) -> None:
+    async def _splice(self, cr, cw, up_r, up_w, *, hijack: bool) -> None:
+        """Двунаправленная перекачка. Обмен окончен, когда завершился ОТВЕТ.
+
+        Как понять, что запрос-сторона (cr→up_w) закрылась «по-хорошему» или
+        клиент ушёл: для НЕ-hijack клиент держит соединение ради ответа (Go не
+        закрывает cr до ответа), поэтому cr EOF = клиент ушёл → рвём сразу. Для
+        hijack (attach) cr EOF = закрыт stdin, клиент ещё может ждать вывод → ждём
+        ответ (если клиент не ушёл совсем). Иначе задача _handle висла бы на
+        молчащем апстриме → GC убивал её с шумным GeneratorExit."""
         async def pump(src, dst):
             try:
                 while True:
@@ -185,7 +203,34 @@ class DockerProxy:
                     await dst.drain()
             except (ConnectionResetError, BrokenPipeError):
                 pass
-        await asyncio.gather(pump(cr, up_w), pump(up_r, cw))
+            finally:
+                try:
+                    if dst.can_write_eof():
+                        dst.write_eof()
+                except (OSError, RuntimeError):
+                    pass
+
+        req = asyncio.create_task(pump(cr, up_w))    # запрос/stdin → апстрим
+        resp = asyncio.create_task(pump(up_r, cw))   # ответ/стрим → клиенту
+        try:
+            # Обмен окончен, когда завершился ОТВЕТ. Запрос может закрыться раньше
+            # (клиент дослал тело / закрыл stdin у attach) — это НЕ конец, иначе
+            # режем ответ до вывода. НО если при этом клиент совсем ушёл
+            # (cw закрывается) — не висим на молчащем контейнере, рвём.
+            while not resp.done():
+                done, _ = await asyncio.wait(
+                    {req, resp}, return_when=asyncio.FIRST_COMPLETED)
+                if resp in done:
+                    break
+                if req in done:            # запрос закрылся раньше ответа
+                    if not hijack or cw.is_closing():
+                        break              # не-hijack cr EOF = клиент ушёл; либо ушёл совсем
+                    await resp             # hijack + клиент жив: ждём вывод
+                    break
+        finally:
+            for t in (req, resp):
+                t.cancel()
+            await asyncio.gather(req, resp, return_exceptions=True)
 
     async def _error(self, w, status: int, message: str) -> None:
         reasons = {400: "Bad Request", 403: "Forbidden", 502: "Bad Gateway"}
