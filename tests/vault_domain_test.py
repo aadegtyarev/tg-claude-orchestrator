@@ -43,9 +43,12 @@ def test_no_orchestrator_dependency():
     показатель. Свежий интерпретатор — честная проверка автономности пакета
     (ловится и через run_all.sh, и через pytest)."""
     root = str(Path(__file__).parent.parent)
+    # Импортируем ВСЕ подмодули vault (pkgutil.walk_packages) — автономность
+    # обязана держаться для всего пакета, включая будущие модули, без правки теста.
     code = (
         f"import sys; sys.path.insert(0, {root!r});"
-        "import vault.secret, vault.store, vault.redact, vault.policy;"
+        "import importlib, pkgutil, vault;"
+        "[importlib.import_module(m.name) for m in pkgutil.walk_packages(vault.__path__, 'vault.')];"
         "leaked=[m for m in sys.modules if m=='orchestrator' or m.startswith('orchestrator.')];"
         "sys.exit(1 if leaked else 0)"
     )
