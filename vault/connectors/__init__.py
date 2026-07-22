@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from .contract import Connector, HttpReq, ScopeVerdict, with_header
+from .gdocs import GDocsConnector
 from .generic_bearer import GenericBearerConnector
 
 logger = logging.getLogger("vault.connectors")
@@ -49,6 +50,7 @@ def available() -> tuple[str, ...]:
 
 # Встроенные коннекторы.
 register(GenericBearerConnector())
+register(GDocsConnector())
 
 __all__ = [
     "Connector",
@@ -56,6 +58,7 @@ __all__ = [
     "ScopeVerdict",
     "with_header",
     "GenericBearerConnector",
+    "GDocsConnector",
     "register",
     "get_connector",
     "available",
