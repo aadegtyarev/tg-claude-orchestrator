@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import inspect
 import json
 import logging
 import os
@@ -300,9 +301,11 @@ class SessionManager:
         # Гоняются на КАЖДОМ старте (create/resume/clear/set_model), чтобы прокси
         # переустанавливался при возобновлении. Падение хука не роняет запуск.
         self.launch_hooks: list[Callable[[Session], Awaitable[None]]] = []
-        # Модули узнают об УДАЛЕНИИ сессии (напр. wallet: отзыв токена демона,
-        # иначе токен удалённой сессии остался бы рабочим). Синхронные, по имени.
-        self.session_delete_hooks: list[Callable[[str], None]] = []
+        # Модули узнают об УДАЛЕНИИ сессии (напр. wallet: отзыв токена демона +
+        # снятие её прокси, иначе токен/прокси удалённой сессии остались бы
+        # живыми). По имени; синхронные ИЛИ корутины — delete их дожидается
+        # (детерминированный teardown: пересоздание сессии не гонится со стопом).
+        self.session_delete_hooks: list[Callable[[str], Awaitable[None] | None]] = []
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -960,7 +963,9 @@ class SessionManager:
             # токен удалённой сессии оставался бы рабочим у демона.
             for hook in self.session_delete_hooks:
                 try:
-                    hook(session.name)
+                    result = hook(session.name)
+                    if inspect.isawaitable(result):
+                        await result  # корутинный хук (wallet: стоп прокси) дожидаем
                 except Exception:
                     logger.exception("session_delete_hook для %s", session.name)
             # Приватный дом песочницы: без удаления /new с тем же slug

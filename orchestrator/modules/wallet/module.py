@@ -30,12 +30,12 @@ Policy — TOML-файл config.wallet_secrets_file (0600, вне allowlist пе
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import shutil
 import ssl
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -75,6 +75,32 @@ SHIM_DIRNAME = ".wallet-bin"
 # системный trust надо СОХРАНИТЬ и лишь ДОБАВИТЬ к нему корень Vault. Публичный
 # серт (0644), ключа CA в песочнице нет (каталог CA — вне allowlist).
 CA_BUNDLE_NAME = ".vault-ca-bundle.crt"
+
+
+def _atomic_write(path: Path, data: str, mode: int) -> None:
+    """Атомарно записать файл в приватный дом сессии БЕЗ следования симлинку.
+
+    session_home смонтирован в песочницу как $HOME (RW) — модель туда пишет и
+    может подложить симлинк на victim-файл (напр. `ln -s ~/.ssh/authorized_keys
+    ~/.vault-ca-bundle.crt`) под именем нашего файла. Прямой `os.open(path,
+    O_TRUNC)` пошёл бы ПО симлинку и затёр цель правами демона (arbitrary write,
+    сандбокс-эскейп). Поэтому пишем во временный файл в ТОЙ ЖЕ директории и
+    `os.replace`: rename(2) заменяет саму запись назначения (в т.ч. симлинк), НЕ
+    разыменовывая её — victim остаётся нетронутым. Права выставляем ДО replace,
+    чтобы файл ни мгновения не жил с более широкими, чем нужно (mkstemp даёт 0600).
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _system_ca_pem() -> str | None:
@@ -239,6 +265,13 @@ class WalletModule:
                 "первого (%s); маршрутизация нескольких сервисов — следующий срез",
                 session.name, ", ".join(names), names[0])
         secret_name = names[0]
+        # Снять прежние прокси этой сессии для НЕ-выбранного секрета: если
+        # алфавитно первый прокси-секрет сменился между рестартами, старый прокси
+        # иначе висел бы орфаном (лишний listening-порт с валидным MITM). Свой
+        # прокси (secret_name) не трогаем — start ниже переиспользует его порт.
+        for stale in list(self.proxies.ports(session.name)):
+            if stale != secret_name:
+                await self.proxies.stop(session.name, stale)
         try:
             port = await self.daemon.start_session_proxy(session.name, secret_name)
         except ProxyPoolError as e:
@@ -255,9 +288,16 @@ class WalletModule:
         proxy_url = f"http://127.0.0.1:{port}"
         # HTTP_PROXY НЕ ставим намеренно: прокси обслуживает только CONNECT (HTTPS);
         # plain-HTTP через него получил бы 501. Сервисы под секретом — HTTPS.
+        # NO_PROXY: контрольный трафик самого claude (loopback + хост оркестратора/
+        # прокси-модели) идёт МИМО MITM — иначе одно-проходный форвард (Connection:
+        # close, без h2, лимит тела) ломал бы его egress. Внешние сервисы под
+        # секретом на loopback не попадают, перехват для них сохраняется.
+        no_proxy = self._no_proxy_value()
         self._proxy_env[session.name] = {
             "HTTPS_PROXY": proxy_url,
             "https_proxy": proxy_url,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
             "SSL_CERT_FILE": ca_path,
             "REQUESTS_CA_BUNDLE": ca_path,
             "CURL_CA_BUNDLE": ca_path,
@@ -281,12 +321,28 @@ class WalletModule:
             return None
         bundle = system.rstrip("\n") + "\n" + self.ca.ca_cert_pem().rstrip("\n") + "\n"
         path = self.core.manager.session_home(session) / CA_BUNDLE_NAME
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(bundle)
-        os.chmod(path, 0o644)  # публичный серт, не ключ — читаемость намеренна
+        # Атомарно и БЕЗ следования симлинку (модель могла подложить симлинк на
+        # victim-файл под этим именем — см. _atomic_write). 0644: публичный серт.
+        _atomic_write(path, bundle, 0o644)
         # Под bwrap дом сессии смонтирован КАК $HOME — путь виден изнутри так.
         return str(Path.home() / CA_BUNDLE_NAME)
+
+    def _no_proxy_value(self) -> str:
+        """NO_PROXY для процесса claude при активном перехвате: loopback + хост
+        оркестратора/прокси-модели, слитые с уже заданным оператором NO_PROXY.
+        Контрольный трафик claude идёт мимо строгого одно-проходного форвард-
+        прокси; внешние сервисы под секретом на loopback не попадают."""
+        hosts = ["127.0.0.1", "localhost", "::1"]
+        for attr in ("orch_host", "guest_orch_host"):
+            h = getattr(self.config, attr, "") or ""
+            if h and h not in hosts:
+                hosts.append(h)
+        existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        parts = [p.strip() for p in existing.split(",") if p.strip()]
+        for h in hosts:
+            if h not in parts:
+                parts.append(h)
+        return ",".join(parts)
 
     def redact_output(self, text: str) -> str:
         """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
@@ -346,20 +402,17 @@ class WalletModule:
         except ValueError:
             pass
 
-    def _revoke(self, session_name: str) -> None:
-        """Хук удаления сессии: отозвать её токен у демона и снять её прокси
-        (освободив порт). Хук синхронный, а снятие прокси асинхронно — планируем
-        задачей в текущем loop (delete идёт в event loop); гарантированный сброс
-        всех прокси — в stop() демона (stop_all)."""
+    async def _revoke(self, session_name: str) -> None:
+        """Хук удаления сессии: отозвать её токен у демона и СНЯТЬ её прокси
+        (освободив порт). Корутина — SessionManager.delete её дожидается, поэтому
+        стоп детерминированный: пересоздание сессии с тем же именем не гонится с
+        ещё-не-снятым старым прокси (иначе фон погасил бы уже новый). Гарантийный
+        сброс всех прокси — ещё и в stop() демона (stop_all)."""
         if self.daemon is not None:
             self.daemon.revoke_session(session_name)
         self._proxy_env.pop(session_name, None)
-        if self.proxies is not None:
-            try:
-                asyncio.get_running_loop().create_task(
-                    self.daemon.stop_session_proxies(session_name))
-            except RuntimeError:
-                pass  # нет запущенного loop — снимет stop_all при остановке модуля
+        if self.daemon is not None and self.proxies is not None:
+            await self.daemon.stop_session_proxies(session_name)
 
     async def stop(self) -> None:
         if self.core is not None:
@@ -417,12 +470,10 @@ class WalletModule:
             "token": token,
             "session": session.name,
         }
-        # O_CREAT с 0600 — файл ни мгновения не живёт с широкими правами;
-        # chmod дожимает случай, когда файл уже существовал с иными правами.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.chmod(path, 0o600)
+        # Атомарно, 0600 и БЕЗ следования симлинку: session_home RW-виден модели в
+        # песочнице, симлинком под этим именем она затёрла бы чужой файл токеном
+        # (тот же класс, что у CA-bundle — см. _atomic_write).
+        _atomic_write(path, json.dumps(payload), 0o600)
         self._provision_shims(session)
 
     # ── прозрачные обёртки (шлюз в PATH) ─────────────────────────

@@ -20,6 +20,7 @@ docs/ARCHITECTURE-claude-box.md §4.2/§4.3).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import ssl
 import sys
@@ -82,6 +83,7 @@ def _module(store, ca, pool, home: Path) -> WalletModule:
     m.proxies = pool
     m._proxy_env = {}
     m.daemon = VaultDaemon(store, host=None, guard_on=False, proxies=pool)
+    m.config = SimpleNamespace(orch_host="127.0.0.1", guest_orch_host="127.0.0.1")
     session_dir = home
     m.core = SimpleNamespace(
         manager=SimpleNamespace(session_home=lambda s, _h=session_dir: _h)
@@ -117,9 +119,12 @@ async def test_proxy_env_and_ca_bundle():
         assert env["REQUESTS_CA_BUNDLE"] == ca_path and env["CURL_CA_BUNDLE"] == ca_path
         # HTTP_PROXY НЕ ставим (прокси только CONNECT/HTTPS).
         assert "HTTP_PROXY" not in env, env
+        # NO_PROXY уводит контрольный трафик claude (loopback) мимо MITM.
+        assert "127.0.0.1" in env["NO_PROXY"] and "localhost" in env["NO_PROXY"], env
+        assert env["no_proxy"] == env["NO_PROXY"], env
         # inject-секрет по-прежнему маркером — перехват его не трогает.
         assert env["API_TOKEN"] == "<<wallet:tok>>", env
-        print("OK env: HTTPS_PROXY+trust-bundle только при прокси-секрете")
+        print("OK env: HTTPS_PROXY+trust-bundle+NO_PROXY только при прокси-секрете")
 
         # CA-bundle: файл в доме сессии, 0644, содержит корень Vault (+ систему).
         bundle_file = home / CA_BUNDLE_NAME
@@ -170,6 +175,55 @@ async def test_no_proxy_secret_backward_compat():
     assert env["API_TOKEN"] == "<<wallet:tok>>", env  # обычный кошелёк не сломан
     assert not (tmp / CA_BUNDLE_NAME).exists(), "CA-bundle записан без прокси-секрета"
     print("OK обратная совместимость: без прокси-секрета env как раньше, CA не пишется")
+
+
+async def test_symlink_no_arbitrary_write():
+    """CRITICAL-регресс (репро ревью): модель подкладывает в доме сессии симлинк
+    на victim-файл под именем нашего файла; провижн CA-bundle и wallet.json НЕ
+    затирает victim (arbitrary write / сандбокс-эскейп) и заменяет симлинк
+    обычным файлом. Дом сессии RW-виден модели в песочнице — вектор реален."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт не удался: {_IMPORT_ERR}")
+    tmp = Path(tempfile.mkdtemp(prefix="bwrap_intercept_symlink_"))
+    home = tmp / "home"
+    home.mkdir()
+    session = SimpleNamespace(name="dev")
+
+    # (1) CA-bundle: симлинк ~/.vault-ca-bundle.crt → victim.
+    try:
+        ca = VaultCA(tmp / "ca")
+    except Exception as exc:  # noqa: BLE001 — нет openssl
+        return _skip(f"VaultCA недоступен: {exc}")
+    victim = tmp / "victim"
+    victim.write_text("VICTIM-ORIGINAL")
+    store = SimpleNamespace(load=lambda: {"svc": _proxy_secret()})
+    m = _module(store, ca, None, home)
+    (home / CA_BUNDLE_NAME).symlink_to(victim)
+    ca_path = m._provision_ca_bundle(session)
+    assert ca_path is not None, "CA-bundle не записан"
+    assert victim.read_text() == "VICTIM-ORIGINAL", "victim затёрт через симлинк (CA-bundle)!"
+    bundle_file = home / CA_BUNDLE_NAME
+    assert not bundle_file.is_symlink(), "симлинк не заменён обычным файлом"
+    assert ca.ca_cert_pem().strip() in bundle_file.read_text(), "bundle не записан"
+    assert oct(bundle_file.stat().st_mode & 0o777) == "0o644"
+    print("OK симлинк-защита: _provision_ca_bundle не затирает victim, симлинк заменён")
+
+    # (2) wallet.json: симлинк ~/.wallet.json → victim2.
+    victim2 = tmp / "victim2"
+    victim2.write_text("VICTIM2-ORIGINAL")
+    m2 = WalletModule.__new__(WalletModule)
+    m2.store = store
+    m2.daemon = VaultDaemon(store, host=None, guard_on=False)
+    m2.core = SimpleNamespace(manager=SimpleNamespace(
+        session_home=lambda s: home, effective_cwd=lambda s: tmp))
+    (home / ".wallet.json").symlink_to(victim2)
+    await m2._provision(session)
+    assert victim2.read_text() == "VICTIM2-ORIGINAL", "victim затёрт через симлинк (wallet.json)!"
+    wj = home / ".wallet.json"
+    assert not wj.is_symlink(), "симлинк .wallet.json не заменён обычным файлом"
+    assert json.loads(wj.read_text())["session"] == "dev", "wallet.json не записан"
+    assert oct(wj.stat().st_mode & 0o777) == "0o600"
+    print("OK симлинк-защита: _provision (wallet.json) не затирает victim, 0600")
 
 
 # ── ЖИВОЙ bwrap ─────────────────────────────────────────────────────
@@ -331,6 +385,7 @@ def main() -> None:
     for coro in (
         test_proxy_env_and_ca_bundle,
         test_no_proxy_secret_backward_compat,
+        test_symlink_no_arbitrary_write,
         test_live_bwrap_intercept,
     ):
         asyncio.run(coro())
