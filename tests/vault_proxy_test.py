@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-    from vault.proxy import VaultProxy  # noqa: E402
+    from vault.proxy import VaultProxy, _upgrade_tls  # noqa: E402
     from vault.secret import Secret  # noqa: E402
     from vault.tls import VaultCA  # noqa: E402
     from vault.connectors import GenericBearerConnector  # noqa: E402
@@ -149,8 +149,11 @@ async def _open_mitm(proxy_url: str, host: str, port: int, trust: ssl.SSLContext
         hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
         if hl in (b"\r\n", b"\n"):
             break
-    await asyncio.wait_for(
-        writer.start_tls(trust, server_hostname=host), timeout=_TIMEOUT
+    # Кросс-версионный апгрейд (start_tls только с 3.11) — тот же helper, что и
+    # в прокси, но клиентская сторона: server_side=False + server_hostname.
+    reader, writer = await _upgrade_tls(
+        reader, writer, trust,
+        server_side=False, server_hostname=host, timeout=_TIMEOUT,
     )
     return reader, writer
 

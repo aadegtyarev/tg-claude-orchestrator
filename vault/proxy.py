@@ -40,13 +40,14 @@ standalone-компонент. Маршрутизация per-session (свой 
   * обе стороны закрываются в finally; обрыв любой стороны роняет качалку и
     закрывает встречную (нет осиротевшей задачи).
 
-Про server-side start_tls: под соединение, созданное `asyncio.start_server`,
-`StreamWriter.start_tls` выводит server_side из наличия client_connected_cb у
-протокола — т.е. апгрейд идёт как сервер (что нам и нужно) без прямого доступа к
-транспорту. Реориджин к сервису — обычный `open_connection(ssl=…)`, TLS сразу на
-коннекте, без ручного апгрейда. Выбор asyncio (а не поток-на-соединение)
-оправдан: single-loop без блокировок, таймауты на каждом await, апгрейд через
-штатный StreamWriter.start_tls стабилен на 3.11+.
+Про server-side TLS-апгрейд: делаем его через кросс-версионный `_upgrade_tls`,
+т.к. `StreamWriter.start_tls` появился только в 3.11, а проект держит
+`requires-python >=3.10`. На 3.11+ — нативный метод (сам выводит server_side из
+протокола); на 3.10 — нижний `loop.start_tls(transport, protocol, ctx,
+server_side=True, …)` (есть с 3.7) под тем же StreamReaderProtocol, так что
+reader продолжает читать. Реориджин к сервису — обычный `open_connection(ssl=…)`,
+TLS сразу на коннекте, без ручного апгрейда. Выбор asyncio (а не поток-на-
+соединение) оправдан: single-loop без блокировок, таймауты на каждом await.
 """
 
 from __future__ import annotations
@@ -111,6 +112,58 @@ def _split_authority(authority: str) -> tuple[str, int]:
         return host, int(port)
     except ValueError as exc:
         raise VaultProxyError(f"нечисловой порт в CONNECT {authority!r}") from exc
+
+
+async def _upgrade_tls(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    ctx: ssl.SSLContext,
+    *,
+    server_side: bool,
+    server_hostname: str | None = None,
+    timeout: float,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """TLS-апгрейд УЖЕ установленного plaintext-соединения — совместимо с 3.10+.
+
+    `StreamWriter.start_tls` появился только в 3.11, а проект держит
+    `requires-python >=3.10` (CI гоняет 3.10). На 3.11+ зовём нативный метод (он
+    сам выводит server_side из протокола и переносит writer). На 3.10 — нижний
+    `loop.start_tls(transport, protocol, ctx, server_side=…, server_hostname=…)`
+    (есть с 3.7): StreamReaderProtocol ПЕРЕИСПОЛЬЗУЕТСЯ (loop.start_tls сохраняет
+    его), поэтому reader продолжает получать данные через тот же protocol; нам
+    остаётся указать writer на новый TLS-транспорт.
+
+    server_side=True — термируем клиента leaf-сертом (прокси); server_side=False
+    (+ server_hostname) — клиентская сторона. Возвращает (reader, writer) поверх
+    TLS. NB: 3.10-путь на этой машине не проверить (тут 3.12) — верификация в CI.
+    """
+    if hasattr(writer, "start_tls"):  # 3.11+: нативный, сам переносит writer
+        await asyncio.wait_for(
+            writer.start_tls(ctx, server_hostname=server_hostname), timeout
+        )
+        return reader, writer
+    # 3.10: апгрейд транспорта под тем же StreamReaderProtocol. Повторяем то, что
+    # нативный start_tls делает через _replace_writer (в 3.10 его нет). Важно:
+    # loop.start_tls зовёт SSLProtocol с call_connection_made=False, поэтому
+    # protocol.connection_made ПОВТОРНО НЕ вызывается — нет двойного запуска
+    # client_connected_cb на server-side, а данные и так идут через data_received
+    # того же protocol → reader продолжает читать.
+    loop = asyncio.get_running_loop()
+    protocol = writer._protocol  # noqa: SLF001 — у StreamWriter нет публичного геттера
+    transport = writer.transport
+    await asyncio.wait_for(writer.drain(), timeout)  # дослать буфер до хендшейка
+    new_transport = await asyncio.wait_for(
+        loop.start_tls(
+            transport, protocol, ctx,
+            server_side=server_side, server_hostname=server_hostname,
+        ),
+        timeout,
+    )
+    # Перевести writer И protocol на новый TLS-транспорт (как _replace_writer).
+    writer._transport = new_transport  # noqa: SLF001 — кросс-версионный шов
+    protocol._transport = new_transport  # noqa: SLF001
+    protocol._over_ssl = True  # noqa: SLF001
+    return reader, writer
 
 
 class VaultProxy:
@@ -265,10 +318,12 @@ class VaultProxy:
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await self._drain(writer)
 
-        # Апгрейд клиентской стороны в TLS (server-side — см. module-docstring).
+        # Апгрейд клиентской стороны в TLS server-side (leaf-серт host). Через
+        # кросс-версионный _upgrade_tls (нативный start_tls только с 3.11).
         try:
-            await asyncio.wait_for(
-                writer.start_tls(leaf_ctx), timeout=self._handshake_timeout
+            reader, writer = await _upgrade_tls(
+                reader, writer, leaf_ctx,
+                server_side=True, timeout=self._handshake_timeout,
             )
         except (ssl.SSLError, asyncio.TimeoutError, ConnectionError) as exc:
             logger.info("VaultProxy: MITM-хендшейк с клиентом не удался (%s): %s", host, exc)
