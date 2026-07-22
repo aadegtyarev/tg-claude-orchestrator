@@ -516,7 +516,9 @@ class WalletModule:
         разворачивания маркеров), остальное — автономная логика пакета vault."""
         return await run_secret_command(
             cmd, secret,
-            cwd=self.host.cwd_for(session.name),
+            # cwd — состояние сессии, берём из уже-аутентифицированного объекта
+            # (не перерезолвим по имени: гонка с удалением → effective_cwd(None)).
+            cwd=self.core.manager.effective_cwd(session),
             all_secrets=self.store.load(),
             session_name=session.name,
         )

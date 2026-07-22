@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Protocol
 
 
@@ -23,6 +22,11 @@ class VaultHost(Protocol):
     Реализация сама резолвит сессию и решает, как доставить действие; если
     сессия уже недоступна (удалена) — confirm возвращает False (deny),
     наблюдаемость/аудит/уведомление тихо пропускаются.
+
+    Примечание: рабочий каталог сессии (cwd для исполнения) сюда НЕ входит — это
+    состояние сессии, а не «услуга»; демон получает его из контекста, снятого при
+    аутентификации (см. слайс 1.4b), чтобы не перерезолвивать посреди запроса
+    (гонка с удалением сессии → падение effective_cwd(None)).
     """
 
     async def confirm(self, session_name: str, description: str, preview: str) -> bool:
@@ -42,8 +46,4 @@ class VaultHost(Protocol):
     async def notify_denied(self, session_name: str, cmd_display: str) -> None:
         """Уведомить оператора об отказе, требующем внимания (не self-correcting).
         Вызывающий сам решает, звать ли (напр. печать токена не уведомляет)."""
-        ...
-
-    def cwd_for(self, session_name: str) -> Path:
-        """Рабочий каталог для исполнения команды сессии (cwd проекта)."""
         ...

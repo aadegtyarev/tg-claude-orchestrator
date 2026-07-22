@@ -29,8 +29,8 @@ def _secret(**kw) -> Secret:
 
 def _mod(cwd: Path, secret: Secret) -> WalletModule:
     m = WalletModule.__new__(WalletModule)
-    # _execute использует только host.cwd_for и store.load — крошечный фейк-host.
-    m.host = SimpleNamespace(cwd_for=lambda name: cwd)
+    # _execute берёт cwd из core.manager.effective_cwd(session) и store.load.
+    m.core = SimpleNamespace(manager=SimpleNamespace(effective_cwd=lambda s: cwd))
     m.store = SimpleNamespace(load=lambda: {secret.name: secret})
     return m
 

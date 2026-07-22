@@ -45,7 +45,3 @@ class OrchestratorVaultHost:
             session,
             self._core.t("wallet_use", line=notice_md) + " — " + self._core.t("wallet_denied"),
         )
-
-    def cwd_for(self, session_name: str):
-        session = self._core.manager.get(session_name)
-        return self._core.manager.effective_cwd(session)
