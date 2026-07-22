@@ -187,6 +187,28 @@ async def test_ask_timeout_denies_without_hang():
         await service.stop()
 
 
+async def test_ask_grant_is_per_request_no_cache():
+    """Грант эфемерный/per-request: 2-й запрос под тем же ask-префиксом СНОВА
+    зовёт host.ask (нет кэша гранта). Ревью проверило живьём — закрепляем."""
+    if _ASK_IMPORT_ERR is not None:
+        return _skip(f"импорт vault не удался: {_ASK_IMPORT_ERR}")
+    ca, service, proxy, trust, host = await _setup_ask(True)
+    try:
+        for i in range(2):
+            code, _ = await _client_get(
+                proxy.proxy_url, "localhost", service.port, f"/ask/r{i}", trust
+            )
+            assert code == 200, f"запрос {i} не 200: {code}"
+        assert len(host.calls) == 2, (
+            f"грант закэширован — host.ask не переспросил на 2-м запросе: {host.calls}"
+        )
+        assert service.seen == ["/ask/r0", "/ask/r1"], service.seen
+        print("OK ASK: грант per-request — 2-й запрос снова зовёт host.ask (нет кэша)")
+    finally:
+        await proxy.stop()
+        await service.stop()
+
+
 async def test_allow_deny_unchanged_no_ask():
     """Обычные пути под url_prefixes НЕ трогают host.ask: allow→200 (Bearer),
     вне скоупа→403; host.ask не вызывался ни разу."""
@@ -273,6 +295,44 @@ async def test_tty_ask_assume_yes_and_no_tty():
     print("OK TtyVaultHost.ask: assume_yes→True, без tty→False")
 
 
+async def test_tty_ask_self_timeout_while_confirm_holds_lock():
+    """HIGH-регресс: ask() САМОДОСТАТОЧЕН по таймауту. Параллельный confirm() (без
+    таймаута by design) держит tty-лок и НИКОГДА не отвечает → ask() обязан
+    разомкнуться по СВОЕМУ таймауту, а не застрять на захвате лока до начала
+    отсчёта. Без внешней обёртки прокси (прямой вызов host.ask)."""
+    if _ASK_IMPORT_ERR is not None:
+        return _skip(f"импорт vault не удался: {_ASK_IMPORT_ERR}")
+    master, slave = os.openpty()
+    orig_stdin, orig_stderr = sys.stdin, sys.stderr
+    sys.stdin = _PtyStdin(slave)  # type: ignore[assignment]
+    sys.stderr = open(os.devnull, "w")
+    try:
+        host = TtyVaultHost(ask_timeout=0.5)
+        # confirm захватывает лок и ждёт ответа ВЕЧНО (мы не пишем в master).
+        c = asyncio.create_task(host.confirm("s", "C", "GET /c"))
+        await asyncio.sleep(0.2)
+        assert not c.done(), "confirm должен висеть без ответа (держит лок)"
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        # ask НЕ обёрнут внешним таймаутом — проверяем его собственный.
+        r = await asyncio.wait_for(host.ask("s", "A", "GET /a"), timeout=_TIMEOUT)
+        dt = loop.time() - t0
+        assert r is False, r
+        assert dt < 5, f"ask не разомкнулся по своему таймауту (застрял на локе): {dt:.2f}s"
+        # confirm всё ещё висит (держит лок) — снимаем для чистоты.
+        c.cancel()
+        try:
+            await c
+        except asyncio.CancelledError:
+            pass
+        print("OK TtyVaultHost.ask: самодостаточный таймаут даже под удержанным confirm-локом")
+    finally:
+        sys.stderr.close()
+        sys.stdin, sys.stderr = orig_stdin, orig_stderr
+        os.close(master)
+        os.close(slave)
+
+
 async def test_tty_ask_serialized_over_one_tty():
     """Конкурентные ask сериализованы одним локом (как confirm): на одной tty
     отвечаем по очереди, ранний не затирается поздним. Через реальный pty."""
@@ -311,9 +371,11 @@ def main() -> None:
         test_ask_grant_true_injects,
         test_ask_grant_false_denied,
         test_ask_timeout_denies_without_hang,
+        test_ask_grant_is_per_request_no_cache,
         test_allow_deny_unchanged_no_ask,
         test_no_host_ask_is_deny,
         test_tty_ask_assume_yes_and_no_tty,
+        test_tty_ask_self_timeout_while_confirm_holds_lock,
         test_tty_ask_serialized_over_one_tty,
     ):
         asyncio.run(coro())
