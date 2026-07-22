@@ -235,7 +235,12 @@ class WalletModule:
                 "прокси-секреты работать не будут", e)
             self.ca = None
             return None
-        self.proxies = SessionProxyPool(self.ca, self.store)  # upstream_ssl=дефолт
+        # host=self.host — ASK-спрос гранта идёт через оркестраторный хост (§4.6);
+        # пул прокидывает его + имя сессии в per-session VaultProxy. Без host ASK
+        # трактовался бы как DENY (host=None), а заглушка ask была бы недостижима.
+        self.proxies = SessionProxyPool(
+            self.ca, self.store, host=self.host  # upstream_ssl=дефолт
+        )
         logger.info("wallet: перехват TLS включён (есть прокси-секреты в policy)")
         return self.proxies
 

@@ -24,6 +24,7 @@ import logging
 import ssl
 
 from .connectors import get_connector
+from .host import VaultHost
 from .proxy import VaultProxy
 from .store import SecretStore
 from .tls import VaultCA
@@ -41,7 +42,9 @@ class SessionProxyPool:
     ca — общий корневой CA Vault (его корень лежит в trust-store песочницы);
     store — источник policy/значений (тот же, что у демона); upstream_ssl — trust
     для реориджина к РЕАЛЬНОМУ сервису (None → системный дефолт; в тестах — trust
-    к локальному «сервису»). bind_host — где слушать (127.0.0.1).
+    к локальному «сервису»). bind_host — где слушать (127.0.0.1). host — VaultHost
+    для ASK-спроса гранта (§4.6); None → ASK трактуется как DENY (спрашивать
+    некому). Прокси per-session, поэтому имя сессии прокидывается в VaultProxy.
     """
 
     def __init__(
@@ -51,11 +54,13 @@ class SessionProxyPool:
         *,
         bind_host: str = "127.0.0.1",
         upstream_ssl: ssl.SSLContext | None = None,
+        host: VaultHost | None = None,
     ) -> None:
         self._ca = ca
         self._store = store
         self._bind_host = bind_host
         self._upstream_ssl = upstream_ssl
+        self._host = host
         # (session_name, secret_name) → живой VaultProxy.
         self._proxies: dict[tuple[str, str], VaultProxy] = {}
 
@@ -94,6 +99,8 @@ class SessionProxyPool:
             connector,
             secret,
             dict(secret.scope),
+            host=self._host,
+            session_name=session_name,
             upstream_ssl=self._upstream_ssl,
             bind_host=self._bind_host,
             bind_port=0,
