@@ -28,6 +28,7 @@ from aiohttp import web
 
 from .execute import run_secret_command
 from .host import VaultHost
+from .proxy_pool import SessionProxyPool
 from .redact import _redact
 from .secret import Secret, _prints_token
 from .store import SecretStore
@@ -64,10 +65,15 @@ class VaultDaemon:
     def __init__(
         self, store: SecretStore, host: VaultHost, *, guard_on: bool,
         shutdown_timeout: float | None = None,
+        proxies: SessionProxyPool | None = None,
     ) -> None:
         self.store = store
         self.host = host
         self.guard_on = guard_on
+        # Пул per-session MITM-прокси (§4.3/§4.5). Опционален: без него демон
+        # работает как раньше (только HTTP-API секретов). Лончер, если поднимает
+        # прокси-секреты, передаёт готовый пул (общий CA + тот же store).
+        self.proxies = proxies
         # Потолок ожидания активных хендлеров при stop(). None = дефолт aiohttp
         # (оркестратор не меняем). standalone ставит короткий: SIGINT посреди
         # висящего confirm не должен ждать зависший хендлер до дефолтных 60с.
@@ -102,6 +108,21 @@ class VaultDaemon:
             await self._runner.cleanup()
             self._runner = None
         self._tokens.clear()
+        if self.proxies is not None:
+            await self.proxies.stop_all()
+
+    # ── per-session прокси (§4.3/§4.5) ─────────────────────────
+    async def start_session_proxy(self, session_name: str, secret_name: str) -> int:
+        """Поднять MITM-прокси для (сессия, прокси-секрет) и вернуть его порт —
+        лончер прописывает HTTP_PROXY из него. Требует сконфигурированный пул."""
+        if self.proxies is None:
+            raise RuntimeError("пул прокси не сконфигурирован (proxies=None)")
+        return await self.proxies.start(session_name, secret_name)
+
+    async def stop_session_proxies(self, session_name: str) -> None:
+        """Снять все прокси сессии (teardown). Без пула — no-op."""
+        if self.proxies is not None:
+            await self.proxies.stop(session_name)
 
     @property
     def url(self) -> str:
