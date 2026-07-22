@@ -83,6 +83,7 @@ def _mgr(mode: str) -> SessionManager:
         sandbox=mode,
         sandbox_extra_rw=(),
         sandbox_dbus=True,
+        sandbox_docker=False,
         claude_config_dir=Path("/home/tester/.claude-proxy"),
     )
     m = SessionManager.__new__(SessionManager)
@@ -107,6 +108,21 @@ def test_prefix_allowlist():
     assert f"--bind-try {work}" in s                       # рабочая папка RW
     assert "--ro-bind-try" in s and "/.local/share/claude" in s  # бинарь RO
     print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
+
+
+def test_docker_sock_bound_when_enabled():
+    # sandbox_docker=True → прокси-сокет биндится на /run/docker.sock + DOCKER_HOST
+    m = _mgr("bwrap")
+    m.config.sandbox_docker = True
+    m.config.docker_proxy_sock = Path("/run/user/1000/claude-orchestrator/docker-proxy.sock")
+    s = " ".join(m.sandbox_prefix(Path("/x"), [Path("/x")]))
+    assert "--bind-try /run/user/1000/claude-orchestrator/docker-proxy.sock /run/docker.sock" in s
+    assert "--setenv DOCKER_HOST unix:///run/docker.sock" in s
+    # выключено → ни сокета, ни DOCKER_HOST
+    m.config.sandbox_docker = False
+    s2 = " ".join(m.sandbox_prefix(Path("/x"), [Path("/x")]))
+    assert "docker.sock" not in s2 and "DOCKER_HOST" not in s2
+    print("OK sandbox_prefix: docker.sock+DOCKER_HOST только при sandbox_docker=True")
 
 
 def test_real_isolation():

@@ -55,5 +55,6 @@ class BwrapRunner:
         prefix = sandbox.build_argv(
             home=home, chdir=chdir, rw_paths=rw, ro_paths=ro, home_dir=home_dir,
             system_dbus=self.config.sandbox_dbus,
+            docker_sock=(self.config.docker_proxy_sock if self.config.sandbox_docker else None),
         )
         return prefix + list(argv)

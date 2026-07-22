@@ -141,6 +141,12 @@ class Config:
     # ввод). Off (дефолт) вырезает DISPLAY/XAUTHORITY/WAYLAND_DISPLAY; on —
     # оставить (если модели действительно нужен X в песочнице).
     sandbox_x11: bool
+    # Пробрасывать ли docker.sock в песочницу (bwrap). Off (дефолт): /run под
+    # tmpfs, сокета не видно. On: настоящий /run/docker.sock биндится внутрь +
+    # DOCKER_HOST — docker/compose работают. Безопасность НЕ здесь, а на демоне:
+    # authz-плагин claude-authz режет опасное (см. modules/docker, [[docker-in-sandbox]]).
+    # Глобально (все сессии), не per-project — «докер либо везде, либо нигде».
+    sandbox_docker: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
     agent_vm_memory_gib: float | None
     agent_vm_cpus: int | None
@@ -176,6 +182,15 @@ class Config:
         `orch_host`. reply-сервер биндится на `orch_host` (host-side) — оно
         host-resolvable, а guest-facing имя резолвится только внутри гостя."""
         return AGENT_VM_GUEST_HOST if self.sandbox == "agent-vm" else self.orch_host
+
+    @property
+    def docker_proxy_sock(self) -> Path:
+        """Путь unix-сокета docker-прокси (SANDBOX_DOCKER). Фиксированный, чтобы
+        и старт прокси (__main__), и бинд в песочницу (bwrap) знали его без
+        проброса. В runtime-каталоге (tmpfs), падаем в sessions_dir."""
+        base = os.getenv("XDG_RUNTIME_DIR")
+        root = Path(base) if base else self.sessions_dir
+        return root / "claude-orchestrator" / "docker-proxy.sock"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -293,6 +308,7 @@ class Config:
             # X/Wayland в песочницу по умолчанию НЕ прокидываем (закрываем доступ
             # к хостовому GUI); SANDBOX_X11=1 — оставить, если модели нужен X.
             sandbox_x11=cls._parse_bool(os.getenv("SANDBOX_X11", "false")),
+            sandbox_docker=cls._parse_bool(os.getenv("SANDBOX_DOCKER", "false")),
             agent_vm_memory_gib=(
                 float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
             ),
