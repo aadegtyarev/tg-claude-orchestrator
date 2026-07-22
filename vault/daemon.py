@@ -61,10 +61,17 @@ class VaultDaemon:
     """HTTP-демон секретов. store — чтение policy/значений; host — услуги
     окружения (по имени сессии); guard_on — жёсткий щит (config.wallet_guard)."""
 
-    def __init__(self, store: SecretStore, host: VaultHost, *, guard_on: bool) -> None:
+    def __init__(
+        self, store: SecretStore, host: VaultHost, *, guard_on: bool,
+        shutdown_timeout: float | None = None,
+    ) -> None:
         self.store = store
         self.host = host
         self.guard_on = guard_on
+        # Потолок ожидания активных хендлеров при stop(). None = дефолт aiohttp
+        # (оркестратор не меняем). standalone ставит короткий: SIGINT посреди
+        # висящего confirm не должен ждать зависший хендлер до дефолтных 60с.
+        self.shutdown_timeout = shutdown_timeout
         self.port: int | None = None
         self._runner: web.AppRunner | None = None
         # Токен → (имя сессии, рабочий каталог). cwd снят при выдаче токена.
@@ -77,7 +84,9 @@ class VaultDaemon:
         app.router.add_post("/run", self._handle_run)
         app.router.add_post("/exec", self._handle_exec)
         app.router.add_post("/get", self._handle_get)
-        self._runner = web.AppRunner(app)
+        runner_kw = {} if self.shutdown_timeout is None else {
+            "shutdown_timeout": self.shutdown_timeout}
+        self._runner = web.AppRunner(app, **runner_kw)
         await self._runner.setup()
         # Порт выдаёт ОС: свой сокет вместо TCPSite, чтобы узнать номер без
         # залезания в приватные поля aiohttp.
