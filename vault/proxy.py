@@ -31,9 +31,13 @@ standalone-компонент. Маршрутизация per-session (свой 
      scope-DENY не режем (Р7).
 
 Про «не зависать» (урок docker-прокси: обработчик оставался pending при обрыве):
-  * все чтения И записи (`drain`) — под `asyncio.wait_for` с таймаутами (не-
-    читающий клиент заполняет write-буфер, и голый `drain()` завис бы бессрочно
-    в обход read-таймаута — resource-hang/DoS от полу-доверенного sandbox-пира);
+  * все чтения — под `asyncio.wait_for`; backpressure на запись — по РАЗМЕРУ
+    write-буфера транспорта (`_drain`), а НЕ по `drain()`-callbacks: не-читающий
+    клиент иначе устроил бы resource-hang/DoS, а на 3.10 после ручного TLS-
+    reattach flow-control-callbacks вообще не доезжают (см. `_drain`);
+  * закрытие — через `_hard_close` (`close()` без ожидания `wait_closed()`, а при
+    непустом буфере — `transport.abort()`): ожидание `wait_closed()` зависало бы на
+    недосливаемом буфере, а на 3.10 после провала start_tls и вовсе бессрочно;
   * реориджин ОДНОНАПРАВЛЕННЫЙ: запрос дослан целиком, затем качаем upstream→
     client до EOF; upstream принуждаем к EOF заголовком `Connection: close`, так
     не нужно парсить фрейминг ответа и нет висящего keep-alive;
@@ -69,7 +73,13 @@ logger = logging.getLogger(__name__)
 _CONNECT_TIMEOUT = 30      # приём CONNECT-строки и коннект к upstream
 _HANDSHAKE_TIMEOUT = 30    # MITM-хендшейк с клиентом
 _READ_TIMEOUT = 60         # чтение одного запроса (строка+заголовки+тело)
-_IDLE_TIMEOUT = 300        # пауза в потоке ответа сервиса → рвём
+_IDLE_TIMEOUT = 300        # застой (нет прогресса слива буфера) → рвём
+# Интервал опроса размера write-буфера в backpressure. Опрашиваем ТОЛЬКО пока
+# буфер выше high-water (при нормальном темпе — ноль опросов), поэтому 50мс не
+# создают busy-loop и достаточно мелкозернисты для стрима.
+_DRAIN_POLL = 0.05
+# Фолбэк high-water, если транспорт не отдаёт лимиты.
+_DRAIN_HIGH_FALLBACK = 256 * 1024
 # Потолки: защита от заливки памяти гигабайтами (как STREAM_LIMIT в redact).
 _MAX_LINE = 64 * 1024
 _MAX_HEADERS = 200
@@ -265,17 +275,58 @@ class VaultProxy:
         except Exception:  # noqa: BLE001 — прокси не должен падать на одном коннекте
             logger.exception("VaultProxy: необработанная ошибка на соединении")
         finally:
-            with suppress(Exception):
-                writer.close()
-                await writer.wait_closed()
+            self._hard_close(writer)
 
     async def _drain(self, writer: asyncio.StreamWriter) -> None:
-        """drain ПОД таймаутом: не-читающий пир заполняет write-буфер, и голый
-        `drain()` завис бы бессрочно (read-таймаут на это не влияет — блок на
-        записи), держа сокеты — resource-hang/DoS от полу-доверенного клиента.
-        Таймаут → TimeoutError вверх → соединение рвётся (finally закроет сокеты),
-        как любой другой таймаут."""
-        await asyncio.wait_for(writer.drain(), timeout=self._idle_timeout)
+        """Backpressure, НЕ зависящая от `drain()`-callbacks (кросс-версионно).
+
+        Не-читающий пир заполняет write-буфер; полагаться на `StreamWriter.drain()`
+        нельзя: на 3.10 после ручного TLS-reattach (loop.start_tls) старый
+        SSLProtocol НЕ пробрасывает pause/resume_writing в app-протокол, поэтому
+        `drain()` не блокируется и не размыкается (нативный start_tls 3.11+ это
+        чинит, но проекту нужен 3.10). Зато `transport.get_write_buffer_size()`
+        отдаёт реальный размер буфера на ОБЕИХ версиях — по нему и держим
+        backpressure: ждём, пока буфер не опустится ниже high-water, но НЕ дольше
+        idle_timeout БЕЗ ПРОГРЕССА (буфер не убывает). Застой → TimeoutError вверх
+        → соединение рвётся (как раньше), без бесконечного роста памяти."""
+        transport = writer.transport
+        try:
+            high = transport.get_write_buffer_limits()[1] or _DRAIN_HIGH_FALLBACK
+        except Exception:  # noqa: BLE001 — не все транспорты отдают лимиты
+            high = _DRAIN_HIGH_FALLBACK
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._idle_timeout
+        last: int | None = None
+        while True:
+            try:
+                size = transport.get_write_buffer_size()
+            except Exception:  # noqa: BLE001 — транспорт закрылся → считаем слитым
+                return
+            if size <= high:
+                return
+            if last is not None and size < last:
+                deadline = loop.time() + self._idle_timeout  # есть прогресс — продлеваем
+            last = size
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError  # застой пира: рвём соединение
+            await asyncio.sleep(_DRAIN_POLL)
+
+    def _hard_close(self, writer: asyncio.StreamWriter) -> None:
+        """Закрыть соединение, НЕ зависая. `wait_closed()` НЕ ждём вовсе: (а) для
+        живого пира `close()` и так дошлёт мелкий буфер в ОС и отправит FIN, а
+        доигрывание закрытия доведёт сам loop — держать на этом задачу-обработчик
+        незачем; (б) на 3.10 после ПРОВАЛА server-side start_tls close-waiter
+        StreamReaderProtocol может не резолвиться (connection_lost ушёл в
+        SSLProtocol после set_protocol) → `wait_closed()` завис бы бессрочно,
+        оставляя залипшую задачу. Если же в буфере ОСТАЛИСЬ данные (не-читающий
+        пир — застой), они бы висели недосливаемыми: рвём `transport.abort()`,
+        освобождая сокет/память. Для живого пира буфер уже пуст → abort не тронет."""
+        transport = writer.transport
+        with suppress(Exception):
+            writer.close()
+        with suppress(Exception):
+            if transport.get_write_buffer_size() > 0:
+                transport.abort()
 
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -406,9 +457,7 @@ class VaultProxy:
             # поэтому дойдём до конца без парсинга фрейминга ответа и не зависнем.
             await self._pump(up_reader, client_writer)
         finally:
-            with suppress(Exception):
-                up_writer.close()
-                await up_writer.wait_closed()
+            self._hard_close(up_writer)
 
     async def _pump(
         self, src: asyncio.StreamReader, dst: asyncio.StreamWriter
@@ -419,8 +468,9 @@ class VaultProxy:
                 if not chunk:
                     break
                 dst.write(chunk)
-                # drain ПОД таймаутом: если КЛИЕНТ перестал читать большой ответ,
-                # write-буфер заполнится и голый drain завис бы бессрочно (MEDIUM).
+                # Backpressure по размеру буфера (не по drain-callbacks): если
+                # КЛИЕНТ перестал читать большой ответ, _drain разомкнётся по
+                # застою и качалка прекратится — без роста памяти и без зависания.
                 await self._drain(dst)
         except (asyncio.TimeoutError, ssl.SSLError, OSError):
             pass  # любая сторона отвалилась — прекращаем, finally закроет сокеты
