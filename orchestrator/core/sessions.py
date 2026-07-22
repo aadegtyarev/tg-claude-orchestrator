@@ -293,6 +293,9 @@ class SessionManager:
         # Модули добавляют каталоги в НАЧАЛО PATH песочницы (напр. wallet:
         # обёртки-шлюз gh/git/curl). Синхронные, session -> [каталоги].
         self.path_hooks: list[Callable[[Session], list[str]]] = []
+        # Модули узнают об УДАЛЕНИИ сессии (напр. wallet: отзыв токена демона,
+        # иначе токен удалённой сессии остался бы рабочим). Синхронные, по имени.
+        self.session_delete_hooks: list[Callable[[str], None]] = []
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -937,6 +940,13 @@ class SessionManager:
                 self._by_name.pop(session.name, None)
                 self._cpu.pop(session.name, None)
             await self._stop_process(session)
+            # Модули: сессия удалена (напр. wallet отзывает её токен). До этого
+            # токен удалённой сессии оставался бы рабочим у демона.
+            for hook in self.session_delete_hooks:
+                try:
+                    hook(session.name)
+                except Exception:
+                    logger.exception("session_delete_hook для %s", session.name)
             # Приватный дом песочницы: без удаления /new с тем же slug
             # унаследовал бы прежний $HOME (ключи, ~/.wallet.json, ~/.bashrc-
             # foothold) и каталоги копились бы вечно.

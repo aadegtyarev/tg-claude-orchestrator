@@ -10,57 +10,53 @@ Read работают от её имени). Поэтому секрет не п
 приватный $HOME пишется каталог обёрток .wallet-bin (SHIM_DIRNAME), который ядро
 ставит первым в PATH песочницы (SessionManager.path_hooks). Обёртка каждого
 разрешённого инструмента — крошечный скрипт `wallet exec <tool> "$@"`; демон
-подбирает секрет по команде (_resolve_secret) и исполняет. git — особый случай
-(_git_shim): сетевые подкоманды идут через кошелёк, локальные — настоящим git в
-песочнице. Inject-секреты видны как env-переменные $NAME с МАРКЕРОМ вместо
-значения (session_env) — демон разворачивает маркер в реальное значение на хосте
-(_execute). CLI `bin/wallet` остаётся ручным путём (run/exec/get/env/ls/help).
+подбирает секрет по команде и исполняет. git — особый случай (_git_shim): сетевые
+подкоманды идут через кошелёк, локальные — настоящим git в песочнице. Inject-
+секреты видны как env-переменные $NAME с МАРКЕРОМ вместо значения (session_env) —
+демон разворачивает маркер в реальное значение на хосте. CLI `bin/wallet`
+остаётся ручным путём (run/exec/get/env/ls/help).
 
-Аутентификация per-session: на старте (и через core.session_hooks для новых
-сессий) в персистентный $HOME сессии кладётся ~/.wallet.json (0600) с URL
-демона и токеном. Policy — TOML-файл config.wallet_secrets_file (0600, вне
-allowlist песочницы): каким сессиям и каким командам разрешён секрет, нужно ли
-подтверждение кнопками. Отказ по умолчанию: секрет без sessions/commands не
-выдаётся никому и ни на что.
+Этот модуль — оркестраторный АДАПТЕР над автономным демоном (vault/daemon.py):
+провижн (~/.wallet.json, обёртки, CLI-симлинк), хуки сессий (path/env/redact),
+правка policy из бота, старт/стоп демона. Сам HTTP-API секретов, реестр токенов и
+исполнение под секретом живут в vault/ (без зависимостей оркестратора).
+
+Аутентификация per-session: при провижне демон выдаёт токен, привязанный к
+рабочему каталогу сессии (issue_token снимает cwd ОДИН раз — без перерезолва
+посреди запроса), а адаптер кладёт в ~/.wallet.json (0600) URL демона и токен.
+Policy — TOML-файл config.wallet_secrets_file (0600, вне allowlist песочницы).
+Отказ по умолчанию: секрет без sessions/commands не выдаётся никому и ни на что.
 """
 
 from __future__ import annotations
 
-import functools
-import html
 import json
 import logging
 import os
-import secrets
 import shutil
-import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from aiohttp import web
-
-# Домен кошелька вынесен в автономный пакет vault/ (без зависимостей
+# Домен и демон кошелька вынесены в автономный пакет vault/ (без зависимостей
 # оркестратора) — фаза 1 редизайна, docs/ARCHITECTURE-claude-box.md. Модуль
-# здесь — оркестраторный адаптер над ним (демон/провижн/хуки сессий).
-from vault.execute import run_secret_command
-from vault.redact import _redact, _redact_text
+# здесь — оркестраторный адаптер над ним (провижн/хуки сессий/старт демона).
+from vault.daemon import VaultDaemon
+from vault.redact import _redact_text
 from vault.secret import (
     DEFAULT_HOST_COMMANDS,  # noqa: F401 — ре-экспорт для тестов/обратной совместимости
     GIT_NETWORK,
-    Secret,
+    Secret,  # noqa: F401 — ре-экспорт для тестов
     _always_denied,  # noqa: F401 — ре-экспорт для тестов (движок решения — vault.verdict)
-    _prints_token,
+    _prints_token,  # noqa: F401 — ре-экспорт для тестов (исполнение — vault.daemon)
     marker,
 )
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore
-from vault.verdict import evaluate
 
 from .host import OrchestratorVaultHost
 from .policy import PolicyEditor, PolicyError
 
 if TYPE_CHECKING:
     from ...config import Config
-    from ...core.sessions import Session
 
 logger = logging.getLogger(__name__)
 
@@ -70,21 +66,8 @@ logger = logging.getLogger(__name__)
 SHIM_DIRNAME = ".wallet-bin"
 
 
-def _authed(handler):
-    """Декоратор wallet-роут-хендлеров: резолвит сессию через `_auth`, отдаёт 401
-    если Bearer-токен не признан, иначе зовёт хендлер с готовым `session`. Единая
-    точка 401-политики на все 4 роута (/secrets, /run, /exec, /get)."""
-    @functools.wraps(handler)
-    async def wrapper(self, request: web.Request) -> web.Response:
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
-        return await handler(self, request, session)
-    return wrapper
-
-
 class WalletModule:
-    """Модуль ядра: aiohttp-демон на 127.0.0.1:<эфемерный порт> + токены сессий."""
+    """Модуль ядра: адаптер над автономным VaultDaemon (провижн/хуки/старт)."""
 
     name = "wallet"
 
@@ -95,14 +78,11 @@ class WalletModule:
         # confirm/new/rm; значения токенов не показывает и не принимает.
         self.policy = PolicyEditor(config.wallet_secrets_file)
         self.core = None
-        # VaultHost: услуги окружения для демона (подтверждение/бабл/аудит/notice/
-        # cwd). Ставится в start() поверх ядра; демон ходит через него, не через core.
+        # VaultHost: услуги окружения для демона (подтверждение/бабл/аудит/notice).
+        # Ставится в start() поверх ядра; демон ходит через него, не через core.
         self.host = None
-        self.port: int | None = None
-        self._runner: web.AppRunner | None = None
-        # Токен → имя сессии. Session-объект резолвим на каждый запрос через
-        # manager.get: сессия могла быть удалена после выдачи токена.
-        self._tokens: dict[str, str] = {}
+        # Автономный демон секретов (vault/daemon.py) — создаётся в start().
+        self.daemon: VaultDaemon | None = None
 
     def handle_command(self, args_str: str) -> str:
         """`/wallet <args>` — просмотр/правка policy кошелька (HTML-текст).
@@ -141,26 +121,16 @@ class WalletModule:
             self._write_default_secrets()  # прокол на хост gh/git/ssh/scp «из коробки»
         self.store.load()  # ранняя диагностика прав/синтаксиса — в лог на старте
 
-        app = web.Application()
-        app.router.add_get("/secrets", self._handle_secrets)
-        app.router.add_post("/run", self._handle_run)
-        app.router.add_post("/exec", self._handle_exec)
-        app.router.add_post("/get", self._handle_get)
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        # Порт выдаёт ОС: свой сокет вместо TCPSite, чтобы узнать номер без
-        # залезания в приватные поля aiohttp.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", 0))
-        self.port = sock.getsockname()[1]
-        await web.SockSite(self._runner, sock).start()
-        logger.info("wallet: демон на 127.0.0.1:%d", self.port)
+        self.daemon = VaultDaemon(self.store, self.host, guard_on=self.config.wallet_guard)
+        await self.daemon.start()
 
         self._provision_cli()
         for session in core.manager.list_all():
             await self._provision(session)
         core.session_hooks.append(self._provision)
+        # Удаление сессии → отзыв её токена у демона (иначе токен удалённой
+        # сессии остался бы рабочим; раньше это давал _auth через manager.get).
+        core.manager.session_delete_hooks.append(self._revoke)
         # Прозрачный шлюз: каталог обёрток (.wallet-bin) первым в PATH песочницы.
         core.manager.path_hooks.append(self.session_path)
         # env для песочницы: shared → реальное значение, inject → маркер $NAME.
@@ -220,16 +190,21 @@ class WalletModule:
         except ValueError:
             pass
 
+    def _revoke(self, session_name: str) -> None:
+        """Хук удаления сессии: отозвать её токен у демона."""
+        if self.daemon is not None:
+            self.daemon.revoke_session(session_name)
+
     async def stop(self) -> None:
         if self.core is not None:
             self._discard(self.core.session_hooks, self._provision)
+            self._discard(self.core.manager.session_delete_hooks, self._revoke)
             self._discard(self.core.manager.path_hooks, self.session_path)
             self._discard(self.core.manager.env_hooks, self.session_env)
             self._discard(self.core.output_redactors, self.redact_output)
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
-        self._tokens.clear()
+        if self.daemon is not None:
+            await self.daemon.stop()
+            self.daemon = None
 
     def _provision_cli(self) -> None:
         """Симлинк ~/.local/bin/wallet → <репо>/bin/wallet, чтобы CLI был в PATH
@@ -257,15 +232,20 @@ class WalletModule:
             logger.error("wallet: не удалось провизить CLI %s: %s", link, e)
 
     async def _provision(self, session) -> None:
-        """Выдать сессии токен и записать ~/.wallet.json в её приватный $HOME.
+        """Выдать сессии токен (демон привязывает к нему её cwd) и записать
+        ~/.wallet.json в её приватный $HOME.
 
-        Внутри песочницы session_home смонтирован КАК $HOME процесса claude,
-        так что CLI найдёт файл по ~/.wallet.json без настройки.
+        cwd снимаем ЗДЕСЬ, из уже-аутентифицированного объекта сессии, и отдаём
+        демону при выдаче токена — дальше демон его не перерезолвивает (гонка с
+        удалением сессии роняла бы effective_cwd(None)). Внутри песочницы
+        session_home смонтирован КАК $HOME процесса claude — CLI найдёт файл по
+        ~/.wallet.json без настройки.
         """
-        token = secrets.token_urlsafe(32)
+        cwd = self.core.manager.effective_cwd(session)
+        token = self.daemon.issue_token(session.name, cwd)
         path = self.core.manager.session_home(session) / ".wallet.json"
         payload = {
-            "url": f"http://127.0.0.1:{self.port}",
+            "url": self.daemon.url,
             "token": token,
             "session": session.name,
         }
@@ -275,9 +255,6 @@ class WalletModule:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         os.chmod(path, 0o600)
-        # Перевыдача (рестарт/повторный hook) отзывает прежний токен сессии.
-        self._tokens = {t: n for t, n in self._tokens.items() if n != session.name}
-        self._tokens[token] = session.name
         self._provision_shims(session)
 
     # ── прозрачные обёртки (шлюз в PATH) ─────────────────────────
@@ -352,173 +329,3 @@ class WalletModule:
             )
         except OSError as e:
             logger.error("wallet: обёртки для %s не созданы: %s", session.name, e)
-
-    # ── HTTP API ────────────────────────────────────────────────
-
-    def _auth(self, request: web.Request):
-        """Bearer-токен → Session. Сравнение constant-time (compare_digest),
-        перебор без раннего выхода — тайминг не выдаёт «почти угадал»."""
-        header = request.headers.get("Authorization", "")
-        token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
-        # На байтах: compare_digest на str с не-ASCII бросает TypeError (был бы
-        # 500 вместо 401). Перебор без раннего выхода — тайминг не выдаёт «почти».
-        token_b = token.encode("utf-8", "replace")
-        found: str | None = None
-        for known, sname in self._tokens.items():
-            if secrets.compare_digest(known.encode("utf-8"), token_b):
-                found = sname
-        if not token or found is None:
-            return None
-        return self.core.manager.get(found)
-
-    @_authed
-    async def _handle_secrets(self, request: web.Request, session: Session) -> web.Response:
-        """Список секретов, разрешённых этой сессии, — БЕЗ значений."""
-        out = [
-            {
-                "name": s.name,
-                "description": s.description,
-                "commands": list(s.effective_commands),
-                "confirm": s.confirm,
-                # host — команда на хосте с его окружением; inject — значение в
-                # env-переменную `env` дочернего процесса; shared — значение
-                # ВЫДАётся сессии (wallet get/env), не прячется.
-                "mode": s.mode,
-                "env": s.env or None,
-            }
-            for s in self.store.load().values()
-            if s.session_allowed(session.name)
-        ]
-        return web.json_response(out)
-
-    @_authed
-    async def _handle_get(self, request: web.Request, session: Session) -> web.Response:
-        """Выдать сессии ЗНАЧЕНИЕ shared-секрета (dev-ключ, логин/пароль).
-
-        Только для shared — host/inject значения не выдаются НИКОГДА (в этом их
-        смысл). shared — про хранение вне чата/репо, не про сокрытие от модели."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        name = str(data.get("secret", ""))
-        secret = self.store.load().get(name)
-        if secret is None or not secret.session_allowed(session.name):
-            return web.json_response(
-                {"error": "denied",
-                 "reason": f"нет shared-секрета «{name}» для этой сессии (см. wallet ls)"},
-                status=403,
-            )
-        if not secret.shared:
-            return web.json_response(
-                {"error": "denied",
-                 "reason": f"секрет «{name}» не shared — значение не выдаётся "
-                           "(для host/inject используй wallet run)"},
-                status=403,
-            )
-        if secret.confirm:
-            ok = await self.host.confirm(
-                session.name,
-                f"выдать значение shared-секрета «{name}» сессии",
-                f"wallet get {name}",
-            )
-            if not ok:
-                return web.json_response(
-                    {"error": "denied", "reason": "отклонено кнопкой подтверждения"},
-                    status=403,
-                )
-        # Наблюдаемость: выдача видна строкой (без значения).
-        await self.host.observe(
-            session.name, f"🔐 <b>wallet get</b> <code>{html.escape(name)}</code>",
-        )
-        self.host.record(session.name, secret=name, cmd=f"get {name}", allowed=True)
-        return web.json_response(
-            {"name": name, "env": secret.env or None, "value": secret.value}
-        )
-
-    @_authed
-    async def _handle_run(self, request: web.Request, session: Session) -> web.Response:
-        """Явный вызов: `wallet run <name> -- <cmd>` — секрет задан именем."""
-        try:
-            body = await request.json()
-            name = str(body["secret"])
-            cmd = [str(c) for c in body["cmd"]]
-            if not cmd:
-                raise ValueError("пустая команда")
-        except Exception:
-            return web.json_response({"error": "bad request"}, status=400)
-        return await self._run_secret(session, self.store.load().get(name), cmd, name)
-
-    @_authed
-    async def _handle_exec(self, request: web.Request, session: Session) -> web.Response:
-        """Прозрачный шлюз: `wallet exec <cmd>` (зовут обёртки в PATH песочницы)
-        — секрет подбирается ПО КОМАНДЕ (чей `commands` её разрешает). Модель
-        зовёт инструмент как обычно."""
-        try:
-            body = await request.json()
-            cmd = [str(c) for c in body["cmd"]]
-            if not cmd:
-                raise ValueError("пустая команда")
-        except Exception:
-            return web.json_response({"error": "bad request"}, status=400)
-        secret = self._resolve_secret(session, cmd)
-        label = secret.name if secret is not None else os.path.basename(cmd[0])
-        return await self._run_secret(session, secret, cmd, label)
-
-    def _resolve_secret(self, session, cmd: list[str]):
-        """Секрет, чьи commands разрешают эту команду для сессии (авто-подбор для
-        /exec). Первый подходящий; None — если ни один не разрешает."""
-        for s in self.store.load().values():
-            if s.session_allowed(session.name) and s.command_allowed(cmd):
-                return s
-        return None
-
-    async def _run_secret(self, session, secret, cmd: list[str], label: str) -> web.Response:
-        """Общий путь /run и /exec: policy (guard/deny/confirm) + наблюдаемость +
-        выполнение на хосте + редакция вывода."""
-        cmd_str = " ".join(cmd)
-        all_secrets = self.store.load()
-        # Решение policy (guard/deny/sessions/commands) — чистый движок vault.
-        # Подтверждение кнопкой — side-effect здесь (движок лишь помечает needs_confirm).
-        verdict = evaluate(secret, cmd, session.name, guard_on=self.config.wallet_guard)
-        allowed = verdict.allowed
-        if verdict.needs_confirm:
-            allowed = await self.host.confirm(
-                session.name, f"{label} → {cmd_str[:200]}", cmd_str,
-            )
-        # Наблюдаемость: КАЖДАЯ попытка видна строкой в бабле; отдельное
-        # уведомление — только на ОТКАЗ (нужно внимание).
-        cmd_disp = f"{label} → {cmd_str[:120]}"
-        bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.host.observe(session.name, bubble_line)
-        self.host.record(session.name, secret=label, cmd=cmd_str, allowed=bool(allowed))
-        if not allowed:
-            # verdict.reason покрывает policy-отказ; None → отказ пришёл от
-            # confirm-кнопки (движок пропустил policy, но оператор нажал ✗).
-            reason = verdict.reason if verdict.reason is not None else "отклонено кнопкой подтверждения"
-            # Operator-notice — только для отказов, требующих его внимания.
-            # `gh auth token`/`--show-token` (печать токена) НЕ шлём: отказ
-            # самокорректирующийся (reason ушёл в stderr модели, аудит — в бабле),
-            # а фоновый поллер Claude Code («PR status») зовёт её периодически —
-            # иначе спам в чат на каждый опрос. git-RCE и policy-отказы — шлём.
-            if not _prints_token(cmd):
-                await self.host.notify_denied(session.name, cmd_disp)
-            return web.json_response({"error": "denied", "reason": reason}, status=403)
-        code, out, err = await self._execute(session, secret, cmd)
-        values = [s.value for s in all_secrets.values()]
-        return web.json_response(
-            {"code": code, "stdout": _redact(out, values), "stderr": _redact(err, values)}
-        )
-
-    async def _execute(self, session, secret: Secret, cmd: list[str]) -> tuple[int, bytes, bytes]:
-        """Запустить команду НА ХОСТЕ под секретом — делегат в vault.execute.
-        Резолвит cwd проекта (effective_cwd) и текущий набор секретов (для
-        разворачивания маркеров), остальное — автономная логика пакета vault."""
-        return await run_secret_command(
-            cmd, secret,
-            # cwd — состояние сессии, берём из уже-аутентифицированного объекта
-            # (не перерезолвим по имени: гонка с удалением → effective_cwd(None)).
-            cwd=self.core.manager.effective_cwd(session),
-            all_secrets=self.store.load(),
-            session_name=session.name,
-        )
