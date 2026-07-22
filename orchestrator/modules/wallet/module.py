@@ -55,6 +55,7 @@ from vault.secret import (
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore
 from vault.verdict import evaluate
 
+from .host import OrchestratorVaultHost
 from .policy import PolicyEditor, PolicyError
 
 if TYPE_CHECKING:
@@ -94,6 +95,9 @@ class WalletModule:
         # confirm/new/rm; значения токенов не показывает и не принимает.
         self.policy = PolicyEditor(config.wallet_secrets_file)
         self.core = None
+        # VaultHost: услуги окружения для демона (подтверждение/бабл/аудит/notice/
+        # cwd). Ставится в start() поверх ядра; демон ходит через него, не через core.
+        self.host = None
         self.port: int | None = None
         self._runner: web.AppRunner | None = None
         # Токен → имя сессии. Session-объект резолвим на каждый запрос через
@@ -116,6 +120,7 @@ class WalletModule:
 
     async def start(self, core) -> None:
         self.core = core
+        self.host = OrchestratorVaultHost(core)
         # Провижн (~/.wallet.json в приватном доме сессии) виден CLI только
         # когда дом смонтирован КАК $HOME процесса claude — это делает лишь
         # BwrapRunner. Под off/agent-vm CLI не найдёт конфиг → предупреждаем.
@@ -412,10 +417,10 @@ class WalletModule:
                 status=403,
             )
         if secret.confirm:
-            ok = await self.core.request_confirmation(
-                session, tool="wallet",
-                description=f"выдать значение shared-секрета «{name}» сессии",
-                preview=f"wallet get {name}",
+            ok = await self.host.confirm(
+                session.name,
+                f"выдать значение shared-секрета «{name}» сессии",
+                f"wallet get {name}",
             )
             if not ok:
                 return web.json_response(
@@ -423,11 +428,10 @@ class WalletModule:
                     status=403,
                 )
         # Наблюдаемость: выдача видна строкой (без значения).
-        await self.core.bubbles.append_background(
-            session.name,
-            f"🔐 <b>wallet get</b> <code>{html.escape(name)}</code>", tool="wallet",
+        await self.host.observe(
+            session.name, f"🔐 <b>wallet get</b> <code>{html.escape(name)}</code>",
         )
-        self.core._record(session, "wallet", secret=name, cmd=f"get {name}", allowed=True)
+        self.host.record(session.name, secret=name, cmd=f"get {name}", allowed=True)
         return web.json_response(
             {"name": name, "env": secret.env or None, "value": secret.value}
         )
@@ -479,16 +483,15 @@ class WalletModule:
         verdict = evaluate(secret, cmd, session.name, guard_on=self.config.wallet_guard)
         allowed = verdict.allowed
         if verdict.needs_confirm:
-            allowed = await self.core.request_confirmation(
-                session, tool="wallet",
-                description=f"{label} → {cmd_str[:200]}", preview=cmd_str,
+            allowed = await self.host.confirm(
+                session.name, f"{label} → {cmd_str[:200]}", cmd_str,
             )
         # Наблюдаемость: КАЖДАЯ попытка видна строкой в бабле; отдельное
         # уведомление — только на ОТКАЗ (нужно внимание).
         cmd_disp = f"{label} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.core.bubbles.append_background(session.name, bubble_line, tool="wallet")
-        self.core._record(session, "wallet", secret=label, cmd=cmd_str, allowed=bool(allowed))
+        await self.host.observe(session.name, bubble_line)
+        self.host.record(session.name, secret=label, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
             # verdict.reason покрывает policy-отказ; None → отказ пришёл от
             # confirm-кнопки (движок пропустил policy, но оператор нажал ✗).
@@ -499,11 +502,7 @@ class WalletModule:
             # а фоновый поллер Claude Code («PR status») зовёт её периодически —
             # иначе спам в чат на каждый опрос. git-RCE и policy-отказы — шлём.
             if not _prints_token(cmd):
-                notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"
-                await self.core.notice(
-                    session,
-                    self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
-                )
+                await self.host.notify_denied(session.name, cmd_disp)
             return web.json_response({"error": "denied", "reason": reason}, status=403)
         code, out, err = await self._execute(session, secret, cmd)
         values = [s.value for s in all_secrets.values()]
@@ -517,7 +516,7 @@ class WalletModule:
         разворачивания маркеров), остальное — автономная логика пакета vault."""
         return await run_secret_command(
             cmd, secret,
-            cwd=self.core.manager.effective_cwd(session),
+            cwd=self.host.cwd_for(session.name),
             all_secrets=self.store.load(),
             session_name=session.name,
         )
