@@ -34,6 +34,8 @@ import json
 import logging
 import os
 import shutil
+import ssl
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,7 +43,9 @@ from typing import TYPE_CHECKING
 # оркестратора) — фаза 1 редизайна, docs/ARCHITECTURE-claude-box.md. Модуль
 # здесь — оркестраторный адаптер над ним (провижн/хуки сессий/старт демона).
 from vault.daemon import VaultDaemon
+from vault.proxy_pool import ProxyPoolError, SessionProxyPool
 from vault.redact import _redact_text
+from vault.tls import VaultCA, VaultCAError
 from vault.secret import (
     DEFAULT_HOST_COMMANDS,  # noqa: F401 — ре-экспорт для тестов/обратной совместимости
     GIT_NETWORK,
@@ -65,6 +69,59 @@ logger = logging.getLogger(__name__)
 # побеждают настоящие бинари. Имя знает и ядро (session_home) — держим синхронно.
 SHIM_DIRNAME = ".wallet-bin"
 
+# Объединённый trust-bundle (системные корни + CA Vault) в приватном доме
+# сессии. SSL_CERT_FILE указывает СЮДА, а не только на CA Vault: иначе процесс
+# перестал бы доверять всем прочим сертам (api.anthropic.com, github…) —
+# системный trust надо СОХРАНИТЬ и лишь ДОБАВИТЬ к нему корень Vault. Публичный
+# серт (0644), ключа CA в песочнице нет (каталог CA — вне allowlist).
+CA_BUNDLE_NAME = ".vault-ca-bundle.crt"
+
+
+def _atomic_write(path: Path, data: str, mode: int) -> None:
+    """Атомарно записать файл в приватный дом сессии БЕЗ следования симлинку.
+
+    session_home смонтирован в песочницу как $HOME (RW) — модель туда пишет и
+    может подложить симлинк на victim-файл (напр. `ln -s ~/.ssh/authorized_keys
+    ~/.vault-ca-bundle.crt`) под именем нашего файла. Прямой `os.open(path,
+    O_TRUNC)` пошёл бы ПО симлинку и затёр цель правами демона (arbitrary write,
+    сандбокс-эскейп). Поэтому пишем во временный файл в ТОЙ ЖЕ директории и
+    `os.replace`: rename(2) заменяет саму запись назначения (в т.ч. симлинк), НЕ
+    разыменовывая её — victim остаётся нетронутым. Права выставляем ДО replace,
+    чтобы файл ни мгновения не жил с более широкими, чем нужно (mkstemp даёт 0600).
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _system_ca_pem() -> str | None:
+    """PEM системного набора доверенных корней (для объединения с CA Vault).
+
+    Берём файл по умолчанию OpenSSL (Debian/Ubuntu: /etc/ssl/certs/ca-
+    certificates.crt). None — если файл не найден/не читается: тогда перехват
+    НЕ включаем (лучше без перехвата, чем сломать весь TLS урезанным trust-store).
+    """
+    paths = ssl.get_default_verify_paths()
+    candidates = [paths.cafile, paths.openssl_cafile, "/etc/ssl/certs/ca-certificates.crt"]
+    for p in candidates:
+        if p and os.path.exists(p):
+            try:
+                text = Path(p).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if text.strip():
+                return text
+    return None
+
 
 class WalletModule:
     """Модуль ядра: адаптер над автономным VaultDaemon (провижн/хуки/старт)."""
@@ -83,6 +140,15 @@ class WalletModule:
         self.host = None
         # Автономный демон секретов (vault/daemon.py) — создаётся в start().
         self.daemon: VaultDaemon | None = None
+        # Перехват TLS (§4.2): общий CA Vault + пул per-session MITM-прокси.
+        # Создаются в start() ТОЛЬКО если в policy есть прокси-секрет (иначе
+        # openssl-генерация CA и слушающие сокеты не нужны — «выключено = не
+        # существует», обратная совместимость для сессий без прокси-секретов).
+        self.ca: VaultCA | None = None
+        self.proxies: SessionProxyPool | None = None
+        # session_name → env-вклад перехвата (HTTPS_PROXY + *_CA_BUNDLE). Пишет
+        # launch-хук (порт прокси известен), читает session_env (env процесса).
+        self._proxy_env: dict[str, dict[str, str]] = {}
 
     def handle_command(self, args_str: str) -> str:
         """`/wallet <args>` — просмотр/правка policy кошелька (HTML-текст).
@@ -121,7 +187,15 @@ class WalletModule:
             self._write_default_secrets()  # прокол на хост gh/git/ssh/scp «из коробки»
         self.store.load()  # ранняя диагностика прав/синтаксиса — в лог на старте
 
-        self.daemon = VaultDaemon(self.store, self.host, guard_on=self.config.wallet_guard)
+        # Перехват TLS (§4.2/§4.3): поднимаем CA+пул прокси ТОЛЬКО при наличии
+        # прокси-секрета в policy. upstream_ssl пула — ДЕФОЛТНЫЙ (системный
+        # trust): НЕ переопределяем, иначе самозванец под сервис получил бы кред
+        # (CRITICAL, см. vault_proxy_test.test_default_upstream_rejects_...).
+        proxies = self._make_proxy_pool()
+
+        self.daemon = VaultDaemon(
+            self.store, self.host, guard_on=self.config.wallet_guard, proxies=proxies
+        )
         await self.daemon.start()
 
         self._provision_cli()
@@ -133,11 +207,142 @@ class WalletModule:
         core.manager.session_delete_hooks.append(self._revoke)
         # Прозрачный шлюз: каталог обёрток (.wallet-bin) первым в PATH песочницы.
         core.manager.path_hooks.append(self.session_path)
+        # Перехват TLS: поднять per-session прокси ДО старта claude, чтобы
+        # session_env увидел его порт (launch_hooks выполняются перед env_hooks).
+        core.manager.launch_hooks.append(self._start_session_proxies)
         # env для песочницы: shared → реальное значение, inject → маркер $NAME.
         core.manager.env_hooks.append(self.session_env)
         # Вымарывать значения секретов из чат-вывода (shared модель видит и может
         # случайно эхнуть — safety-net, чтобы не улетело в Telegram/историю).
         core.output_redactors.append(self.redact_output)
+
+    # ── перехват TLS: пул прокси и его провижн (§4.2/§4.3) ──────
+
+    def _make_proxy_pool(self) -> SessionProxyPool | None:
+        """Создать общий CA Vault + пул прокси, ЕСЛИ в policy есть прокси-секрет.
+
+        Нет прокси-секретов → None (демон работает как раньше, без CA/сокетов —
+        обратная совместимость). upstream_ssl оставляем ДЕФОЛТНЫМ (системный
+        trust): реориджин к реальному сервису обязан проверять его настоящий серт.
+        """
+        if not any(s.is_proxy for s in self.store.load().values()):
+            return None
+        try:
+            self.ca = VaultCA()
+        except VaultCAError as e:
+            logger.error(
+                "wallet: не удалось создать CA Vault (%s) — перехват TLS выключен, "
+                "прокси-секреты работать не будут", e)
+            self.ca = None
+            return None
+        self.proxies = SessionProxyPool(self.ca, self.store)  # upstream_ssl=дефолт
+        logger.info("wallet: перехват TLS включён (есть прокси-секреты в policy)")
+        return self.proxies
+
+    async def _start_session_proxies(self, session) -> None:
+        """launch-хук: поднять MITM-прокси для прокси-секрета сессии и подготовить
+        её env-вклад (HTTPS_PROXY + trust-bundle). Идемпотентно (пул переиспользует
+        порт). Нет пула/прокси-секретов → чистит вклад и выходит (обратная
+        совместимость: обычная сессия ничего нового не получает).
+
+        Несколько прокси-секретов у сессии: HTTPS_PROXY один на процесс, поэтому
+        в этом срезе перехват включаем ТОЛЬКО для ПЕРВОГО (по имени) секрета и
+        громко предупреждаем. Маршрутизация нескольких сервисов — следующий срез.
+        """
+        self._proxy_env.pop(session.name, None)
+        if self.proxies is None:
+            return
+        names = sorted(
+            s.name for s in self.store.load().values()
+            if s.is_proxy and s.session_allowed(session.name)
+        )
+        if not names:
+            return
+        if len(names) > 1:
+            logger.warning(
+                "wallet: сессии %s назначено несколько прокси-секретов (%s) — "
+                "HTTPS_PROXY один на процесс, поэтому перехват включён ТОЛЬКО для "
+                "первого (%s); маршрутизация нескольких сервисов — следующий срез",
+                session.name, ", ".join(names), names[0])
+        secret_name = names[0]
+        # Снять прежние прокси этой сессии для НЕ-выбранного секрета: если
+        # алфавитно первый прокси-секрет сменился между рестартами, старый прокси
+        # иначе висел бы орфаном (лишний listening-порт с валидным MITM). Свой
+        # прокси (secret_name) не трогаем — start ниже переиспользует его порт.
+        for stale in list(self.proxies.ports(session.name)):
+            if stale != secret_name:
+                await self.proxies.stop(session.name, stale)
+        try:
+            port = await self.daemon.start_session_proxy(session.name, secret_name)
+        except ProxyPoolError as e:
+            logger.error(
+                "wallet: прокси сессии %s (секрет %s) не поднят: %s",
+                session.name, secret_name, e)
+            return
+        ca_path = self._provision_ca_bundle(session)
+        if ca_path is None:
+            # Без trust-bundle клиент не доверится leaf прокси — перехват
+            # бесполезен; снимаем прокси, чтобы не висел порт впустую.
+            await self.daemon.stop_session_proxies(session.name)
+            return
+        proxy_url = f"http://127.0.0.1:{port}"
+        # HTTP_PROXY НЕ ставим намеренно: прокси обслуживает только CONNECT (HTTPS);
+        # plain-HTTP через него получил бы 501. Сервисы под секретом — HTTPS.
+        # NO_PROXY: контрольный трафик самого claude (loopback + хост оркестратора/
+        # прокси-модели) идёт МИМО MITM — иначе одно-проходный форвард (Connection:
+        # close, без h2, лимит тела) ломал бы его egress. Внешние сервисы под
+        # секретом на loopback не попадают, перехват для них сохраняется.
+        no_proxy = self._no_proxy_value()
+        self._proxy_env[session.name] = {
+            "HTTPS_PROXY": proxy_url,
+            "https_proxy": proxy_url,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+            "SSL_CERT_FILE": ca_path,
+            "REQUESTS_CA_BUNDLE": ca_path,
+            "CURL_CA_BUNDLE": ca_path,
+        }
+        logger.info(
+            "wallet: сессия %s → перехват секрета %s через 127.0.0.1:%d (trust %s)",
+            session.name, secret_name, port, ca_path)
+
+    def _provision_ca_bundle(self, session) -> str | None:
+        """Записать объединённый trust-bundle (системные корни + CA Vault) в
+        приватный дом сессии (0644) и вернуть путь ВНУТРИ песочницы ($HOME/имя).
+
+        Возвращаем None, если системный набор корней не найден: тогда указывать
+        SSL_CERT_FILE только на CA Vault нельзя (сломало бы прочий TLS)."""
+        system = _system_ca_pem()
+        if system is None:
+            logger.error(
+                "wallet: системный CA-bundle не найден — перехват TLS для сессии %s "
+                "не включён (SSL_CERT_FILE на один Vault CA сломал бы прочий TLS)",
+                session.name)
+            return None
+        bundle = system.rstrip("\n") + "\n" + self.ca.ca_cert_pem().rstrip("\n") + "\n"
+        path = self.core.manager.session_home(session) / CA_BUNDLE_NAME
+        # Атомарно и БЕЗ следования симлинку (модель могла подложить симлинк на
+        # victim-файл под этим именем — см. _atomic_write). 0644: публичный серт.
+        _atomic_write(path, bundle, 0o644)
+        # Под bwrap дом сессии смонтирован КАК $HOME — путь виден изнутри так.
+        return str(Path.home() / CA_BUNDLE_NAME)
+
+    def _no_proxy_value(self) -> str:
+        """NO_PROXY для процесса claude при активном перехвате: loopback + хост
+        оркестратора/прокси-модели, слитые с уже заданным оператором NO_PROXY.
+        Контрольный трафик claude идёт мимо строгого одно-проходного форвард-
+        прокси; внешние сервисы под секретом на loopback не попадают."""
+        hosts = ["127.0.0.1", "localhost", "::1"]
+        for attr in ("orch_host", "guest_orch_host"):
+            h = getattr(self.config, attr, "") or ""
+            if h and h not in hosts:
+                hosts.append(h)
+        existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        parts = [p.strip() for p in existing.split(",") if p.strip()]
+        for h in hosts:
+            if h not in parts:
+                parts.append(h)
+        return ",".join(parts)
 
     def redact_output(self, text: str) -> str:
         """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
@@ -164,6 +369,10 @@ class WalletModule:
             else:
                 out[s.env] = marker(s.name)
                 out[s.env + "_FILE"] = marker(s.name, as_file=True)
+        # Перехват TLS: HTTPS_PROXY + trust-bundle, подготовленные launch-хуком
+        # (_start_session_proxies) ДО этого вызова. Пусто для сессий без
+        # прокси-секретов — обычная сессия ничего нового не получает.
+        out.update(self._proxy_env.get(session.name, {}))
         return out
 
     def _write_default_secrets(self) -> None:
@@ -193,20 +402,29 @@ class WalletModule:
         except ValueError:
             pass
 
-    def _revoke(self, session_name: str) -> None:
-        """Хук удаления сессии: отозвать её токен у демона."""
+    async def _revoke(self, session_name: str) -> None:
+        """Хук удаления сессии: отозвать её токен у демона и СНЯТЬ её прокси
+        (освободив порт). Корутина — SessionManager.delete её дожидается, поэтому
+        стоп детерминированный: пересоздание сессии с тем же именем не гонится с
+        ещё-не-снятым старым прокси (иначе фон погасил бы уже новый). Гарантийный
+        сброс всех прокси — ещё и в stop() демона (stop_all)."""
         if self.daemon is not None:
             self.daemon.revoke_session(session_name)
+        self._proxy_env.pop(session_name, None)
+        if self.daemon is not None and self.proxies is not None:
+            await self.daemon.stop_session_proxies(session_name)
 
     async def stop(self) -> None:
         if self.core is not None:
             self._discard(self.core.session_hooks, self._provision)
             self._discard(self.core.manager.session_delete_hooks, self._revoke)
             self._discard(self.core.manager.path_hooks, self.session_path)
+            self._discard(self.core.manager.launch_hooks, self._start_session_proxies)
             self._discard(self.core.manager.env_hooks, self.session_env)
             self._discard(self.core.output_redactors, self.redact_output)
+        self._proxy_env.clear()
         if self.daemon is not None:
-            await self.daemon.stop()
+            await self.daemon.stop()  # stop_all снимает все прокси, освобождает порты
             self.daemon = None
 
     def _provision_cli(self) -> None:
@@ -252,12 +470,10 @@ class WalletModule:
             "token": token,
             "session": session.name,
         }
-        # O_CREAT с 0600 — файл ни мгновения не живёт с широкими правами;
-        # chmod дожимает случай, когда файл уже существовал с иными правами.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.chmod(path, 0o600)
+        # Атомарно, 0600 и БЕЗ следования симлинку: session_home RW-виден модели в
+        # песочнице, симлинком под этим именем она затёрла бы чужой файл токеном
+        # (тот же класс, что у CA-bundle — см. _atomic_write).
+        _atomic_write(path, json.dumps(payload), 0o600)
         self._provision_shims(session)
 
     # ── прозрачные обёртки (шлюз в PATH) ─────────────────────────

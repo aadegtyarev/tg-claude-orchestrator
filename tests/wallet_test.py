@@ -85,6 +85,7 @@ def make_env(tmp: Path):
             session_home=lambda s: home,
             env_hooks=[],
             path_hooks=[],
+            launch_hooks=[],
             session_delete_hooks=[],
         ),
         session_hooks=[],

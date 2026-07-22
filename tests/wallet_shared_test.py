@@ -108,6 +108,7 @@ async def test_wallet_shared():
     )
     m3 = WalletModule.__new__(WalletModule)
     m3.store = st3
+    m3._proxy_env = {}  # без launch-хука перехвата: вклад пуст
     env = m3.session_env(SESSION)
     assert env["OPENAI_API_KEY"] == "KEYVAL"                 # shared → реальное
     assert env["API_TOKEN"] == "<<wallet:tok>>"             # inject → маркер
