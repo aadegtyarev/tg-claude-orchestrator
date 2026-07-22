@@ -18,7 +18,7 @@ HTTP-запрос в выданный скоуп, и это трёхзначно
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from ..secret import Secret
 
@@ -64,13 +64,13 @@ class ScopeVerdict:
 
     @classmethod
     def deny(cls, reason: str, remedy: str) -> ScopeVerdict:
-        if not remedy:
+        if not remedy or not remedy.strip():
             raise ValueError("DENY без remedy запрещён (Р0: отказ предписывающий)")
         return cls(kind="deny", reason=reason, remedy=remedy)
 
     @classmethod
     def ask(cls, descr: str) -> ScopeVerdict:
-        if not descr:
+        if not descr or not descr.strip():
             raise ValueError("ASK без descr запрещён (нужно описание для оператора)")
         return cls(kind="ask", descr=descr)
 
@@ -97,10 +97,14 @@ def with_header(req: HttpReq, name: str, value: str) -> HttpReq:
     return replace(req, headers=headers)
 
 
+@runtime_checkable
 class Connector(Protocol):
     """Плагин под конкретный сервис (§4.5). Обязательны для КАЖДОГО коннектора
     `name`, `authorize`, `in_scope`; остальное — по мере умений сервиса
-    (generic-bearer их не поддерживает и возвращает None/скоуп как есть)."""
+    (generic-bearer их не поддерживает и возвращает None/скоуп как есть).
+
+    `@runtime_checkable` → `isinstance(x, Connector)` в рантайме проверяет
+    НАЛИЧИЕ методов (не сигнатуры) — ловит забытый метод без mypy в CI."""
 
     name: str
 
