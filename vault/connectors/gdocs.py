@@ -117,9 +117,22 @@ def _extract(path: str, query_pairs: list[tuple[str, str]]) -> dict:
 
 class GDocsConnector:
     """Коннектор Google Docs/Drive/Sheets/Slides: OAuth-Bearer + скоуп по
-    docs/folders с deny на share/export/copy/листинг (fail-closed)."""
+    docs/folders с deny на share/export/copy/перенос/листинг (fail-closed).
+
+    NB: scope.folders сейчас даёт доступ ТОЛЬКО к самому объекту-папке (адресация
+    по её id — метаданные/UI-открытие), НЕ к файлам внутри неё. Резолв
+    folder→список docId — отдельный слайс (resolve_scope, живой вызов Drive);
+    до него файлы внутри папки доступны, лишь если их id заведены в scope.docs.
+    """
 
     name = "gdocs"
+
+    # Публичный host-set коннектора: официальные Google-хосты, которые интеграция
+    # (launcher → VaultProxy.service_hosts) обязана завернуть на нашу in_scope-
+    # логику. Вывести хосты из scope нельзя — у gdocs scope = docs/folders, а не
+    # url_prefixes, поэтому без явной передачи этого набора прокси форварднул бы
+    # gdocs-запросы сквозь (fail-closed, но in_scope недостижим). Экспонируем.
+    service_hosts: tuple[str, ...] = tuple(sorted(_HOSTS))
 
     def authorize(self, req: HttpReq, secret: Secret) -> HttpReq:
         """OAuth access-token (уже готовый в secret.value; хранение/рефреш —
@@ -142,7 +155,23 @@ class GDocsConnector:
                 ),
             )
 
-        canon = _canonical(req.url)
+        # Разбор URL целиком под try: битый адрес (например, кривая IPv6-скобка
+        # `https://[::1]docs.google.com/…`) роняет urlsplit/`.hostname`/`.port`
+        # ValueError'ом — ловим и отклоняем (fail-closed), а не падаем наружу.
+        try:
+            canon = _canonical(req.url)
+            sp = urlsplit(req.url)
+            host = (sp.hostname or "").lower()
+            port = sp.port
+        except ValueError:
+            return ScopeVerdict.deny(
+                reason=f"URL «{req.url}» не разбирается (malformed, напр. битая IPv6-скобка)",
+                remedy=self._remedy(
+                    "URL не разбирается как корректный адрес (например, битая IPv6-скобка) — "
+                    "кошелёк такой не пропускает. Обратись корректным URL к самому документу.",
+                    docs, folders,
+                ),
+            )
         if canon is None:
             return ScopeVerdict.deny(
                 reason=f"URL «{req.url}» подозрителен (многослойное кодирование)",
@@ -153,9 +182,6 @@ class GDocsConnector:
                 ),
             )
         scheme, _netloc, path = canon
-        sp = urlsplit(req.url)
-        host = (sp.hostname or "").lower()
-        port = sp.port
         if scheme != "https" or host not in _HOSTS or port not in (None, 443):
             return ScopeVerdict.deny(
                 reason=f"хост/схема «{scheme}://{host}» — не официальный Google-хост",
@@ -184,9 +210,38 @@ class GDocsConnector:
 
         info = _extract(path, pairs)
 
+        # Неоднозначность id в query → fail-closed DENY. Дубль id-ключа
+        # (`id=A&id=B`) или разные id-ключи с разными значениями (`fileId=A&id=B`)
+        # — parser differential: какой возьмёт реальный сервер, неизвестно. Плюс
+        # конфликт id в пути и в query. Твой же принцип «неоднозначно → DENY».
+        q_keys = [k.lower() for k, _v in pairs if k.lower() in _ID_QUERY_KEYS]
+        q_vals = {v for k, v in pairs if k.lower() in _ID_QUERY_KEYS}
+        path_id = info["id"] if info["marker"] not in ("query", None) else None
+        if (
+            len(q_keys) != len(set(q_keys))                          # дубль id-ключа
+            or len(q_vals) > 1                                        # разные id в query
+            or (path_id is not None and q_vals and q_vals != {path_id})  # путь ≠ query
+        ):
+            return ScopeVerdict.deny(
+                reason=f"неоднозначный id в URL «{req.url}» (дубль/конфликт path↔query)",
+                remedy=self._remedy(
+                    "В URL несколько разных идентификаторов документа (дубль query-параметра "
+                    "или расхождение пути и query) — какой возьмёт сервер, неоднозначно, поэтому "
+                    "кошелёк отклоняет. Обратись к одному конкретному документу однозначным URL.",
+                    docs, folders,
+                ),
+            )
+
         # Опасная операция вне «читать/править содержимое» → DENY ДАЖЕ для in-scope id.
+        # Правка СОДЕРЖИМОГО идёт через специфичные content-write endpoint'ы
+        # (Docs/Sheets/Slides `:batchUpdate`, Sheets `values`) — их и только их
+        # пропускаем для PATCH/PUT. Всё прочее PATCH/PUT на Drive `files/<id>` —
+        # мутация МЕТАДАННЫХ (перенос addParents/removeParents, переименование
+        # `?name=`, в корзину `trashed:true`) = эксфильтрация одним запросом → DENY.
+        is_content_write = info["verb"] == "batchupdate" or info["op"] == "values"
+        method = req.method.upper()
         danger = None
-        if req.method.upper() == "DELETE":
+        if method == "DELETE":
             danger = "удаление ресурса (DELETE)"
         elif info["verb"] in _DANGEROUS_OPS:
             danger = info["verb"]
@@ -194,6 +249,8 @@ class GDocsConnector:
             danger = info["op"]
         elif any(k.lower() == "export" for k, _ in pairs):
             danger = "export"
+        elif method in ("PATCH", "PUT") and not is_content_write:
+            danger = "мутация метаданных (перенос addParents/переименование/в корзину)"
         if danger is not None:
             return ScopeVerdict.deny(
                 reason=(
@@ -201,8 +258,10 @@ class GDocsConnector:
                     "запрещена даже для документа в скоупе"
                 ),
                 remedy=self._remedy(
-                    f"Операция «{danger}» (шаринг/экспорт/копирование/удаление/подписка) "
-                    "коннектором gdocs запрещена — даже для документа из твоего скоупа.",
+                    f"Операция «{danger}» (шаринг/экспорт/копирование/удаление/перенос/"
+                    "переименование/корзина) коннектором gdocs запрещена даже для документа "
+                    "из твоего скоупа. Правь СОДЕРЖИМОЕ обычным запросом к самому документу "
+                    "(Docs/Sheets/Slides :batchUpdate, Sheets values), а не через Drive files.",
                     docs, folders,
                 ),
             )
@@ -248,7 +307,8 @@ class GDocsConnector:
                 "Можно: читать и править СОДЕРЖИМОЕ этих документов (docs.google.com/…/d/<id>/…, "
                 "Drive/Docs/Sheets/Slides API по этим id).",
                 "Нельзя: шаринг (permissions), экспорт (export), копирование (copy), удаление, "
-                "листинг всех файлов, любой документ вне списка.",
+                "перенос/переименование (Drive files PATCH/PUT), листинг всех файлов, любой "
+                "документ вне списка.",
                 "Что делать: работай только с перечисленными id обычным запросом (кошелёк "
                 "подставит OAuth-токен сам); нужен другой документ/папка или операция вне "
                 "чтения/правки — попроси оператора расширить scope (docs/folders) этого секрета.",

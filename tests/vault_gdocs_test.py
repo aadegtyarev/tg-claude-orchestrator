@@ -123,6 +123,67 @@ def test_deny_dangerous_ops_even_in_scope():
     print("OK in_scope DENY: share/export/copy/watch/revisions/delete даже для in-scope id")
 
 
+def test_deny_metadata_mutation():
+    conn = GDocsConnector()
+    # перенос/переименование/корзина через Drive files PATCH/PUT — эксфильтрация
+    # одним запросом; тело не нужно (addParents/removeParents/name — чисто query).
+    for req in (
+        _req(f"https://www.googleapis.com/drive/v3/files/{DOC}?addParents={OUTSIDER}", "PATCH"),
+        _req(
+            f"https://www.googleapis.com/drive/v3/files/{DOC}?removeParents={FOLDER}",
+            "PATCH",
+        ),
+        _req(f"https://www.googleapis.com/drive/v3/files/{DOC}?name=hacked", "PATCH"),
+        _req(f"https://www.googleapis.com/drive/v3/files/{DOC}", "PUT"),
+        _req(f"https://www.googleapis.com/upload/drive/v3/files/{DOC}?uploadType=media", "PATCH"),
+    ):
+        v = conn.in_scope(req, SCOPE)
+        assert v.is_deny and v.remedy, req.url
+        assert DOC in v.remedy, req.url          # in-scope id, но операция запрещена
+    print("OK in_scope DENY: PATCH/PUT метаданных Drive files (перенос/переименование)")
+
+
+def test_allow_content_write_endpoints():
+    conn = GDocsConnector()
+    # правка СОДЕРЖИМОГО через специфичные endpoint'ы — ALLOW (in-scope)
+    assert conn.in_scope(
+        _req(f"https://docs.googleapis.com/v1/documents/{DOC}:batchUpdate", "PATCH"), SCOPE
+    ).is_allow
+    assert conn.in_scope(
+        _req(f"https://sheets.googleapis.com/v4/spreadsheets/{DOC}/values/Sheet1!A1:B2", "PUT"),
+        SCOPE,
+    ).is_allow
+    assert conn.in_scope(
+        _req(f"https://sheets.googleapis.com/v4/spreadsheets/{DOC}/values:batchUpdate", "POST"),
+        SCOPE,
+    ).is_allow
+    print("OK in_scope ALLOW: content-write (:batchUpdate/values) для in-scope id")
+
+
+def test_deny_ambiguous_query_id():
+    conn = GDocsConnector()
+    # дубль id-ключа (parser differential)
+    assert conn.in_scope(_req(f"https://drive.google.com/open?id={DOC}&id={OUTSIDER}"), SCOPE).is_deny
+    assert conn.in_scope(_req(f"https://drive.google.com/open?id={OUTSIDER}&id={DOC}"), SCOPE).is_deny
+    # разные id-ключи с разными значениями
+    assert conn.in_scope(
+        _req(f"https://drive.google.com/uc?fileId={DOC}&id={OUTSIDER}"), SCOPE
+    ).is_deny
+    # id в пути ≠ id в query
+    assert conn.in_scope(
+        _req(f"https://www.googleapis.com/drive/v3/files/{DOC}?fileId={OUTSIDER}"), SCOPE
+    ).is_deny
+    print("OK in_scope DENY: неоднозначный id (дубль ключа / путь≠query)")
+
+
+def test_deny_malformed_ipv6_no_crash():
+    conn = GDocsConnector()
+    # кривая IPv6-скобка роняла urlsplit ValueError'ом — теперь DENY без краша
+    v = conn.in_scope(_req(f"https://[::1]docs.google.com/document/d/{DOC}/edit"), SCOPE)
+    assert v.is_deny and v.remedy
+    print("OK in_scope DENY: malformed IPv6 → отказ без краша")
+
+
 def test_deny_listing_and_create():
     conn = GDocsConnector()
     for url, method in (
@@ -203,7 +264,10 @@ def test_registry_returns_gdocs():
     conn = get_connector("gdocs")
     assert conn is not None and conn.name == "gdocs"
     assert isinstance(conn, Connector)                        # @runtime_checkable
-    print("OK реестр: gdocs зарегистрирован и соответствует контракту")
+    # публичный host-set экспонирован для VaultProxy.service_hosts (интеграция)
+    assert "docs.google.com" in conn.service_hosts
+    assert "www.googleapis.com" in conn.service_hosts
+    print("OK реестр: gdocs зарегистрирован, соответствует контракту, service_hosts экспонирован")
 
 
 def test_no_orchestrator_dependency():
@@ -226,6 +290,10 @@ def main():
     test_allow_read_edit_in_scope()
     test_deny_foreign_doc()
     test_deny_dangerous_ops_even_in_scope()
+    test_deny_metadata_mutation()
+    test_allow_content_write_endpoints()
+    test_deny_ambiguous_query_id()
+    test_deny_malformed_ipv6_no_crash()
     test_deny_listing_and_create()
     test_deny_foreign_host_and_subdomain_trick()
     test_deny_encoding_and_traversal()
