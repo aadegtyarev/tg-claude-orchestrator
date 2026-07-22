@@ -12,6 +12,7 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
+from .connectors import get_connector
 from .secret import Secret
 
 logger = logging.getLogger(__name__)
@@ -79,9 +80,51 @@ class SecretStore:
                 continue
             has_value, has_env = "value" in raw, "env" in raw
             is_shared = bool(raw.get("shared", False))
+            connector = str(raw.get("connector", ""))
+            raw_scope = raw.get("scope", {})
+            scope = dict(raw_scope) if isinstance(raw_scope, dict) else {}
+            if raw.get("scope") is not None and not isinstance(raw_scope, dict):
+                logger.error(
+                    "wallet: секрет %r — scope должен быть таблицей "
+                    "([secrets.%s.scope]), а не %s; пропущен",
+                    name, name, type(raw_scope).__name__)
+                continue
+            # Прокси-секрет (§4.5): connector задан → кред подставляет MITM-прокси,
+            # значение в env песочницы НЕ входит. Требует value (сам кред); env не
+            # используется. Неизвестный connector → секрет НЕ активен (не грузим),
+            # реестр громко логирует («выключено = не существует»).
+            if connector:
+                if not has_value:
+                    logger.error(
+                        "wallet: connector-секрет %r без value — пропущен", name)
+                    continue
+                # Прокси-секрет несёт ТОЛЬКО value (для прокси)+scope+sessions+
+                # confirm. shared/env/commands на нём ЗАПРЕЩЕНЫ: каждый из них —
+                # путь наружу к сырому значению (shared → wallet get; env → маркер
+                # в песочнице → разворот в argv; commands → инъекция в env
+                # ребёнка), а кред proxy-секрета обязан жить ТОЛЬКО в прокси между
+                # машиной и сервисом (§4.4). Любой из них → секрет НЕ активен
+                # (выключено = не существует), громкий лог.
+                leaks = [
+                    field for field, present in (
+                        ("shared", is_shared),
+                        ("env", has_env),
+                        ("commands", bool(raw.get("commands"))),
+                    ) if present
+                ]
+                if leaks:
+                    logger.error(
+                        "wallet: connector-секрет %r несёт запрещённые поля %s — "
+                        "прокси-секрет не должен раздавать своё значение (его "
+                        "подставляет только прокси); секрет НЕ активен",
+                        name, ", ".join(leaks))
+                    continue
+                if get_connector(connector) is None:
+                    # get_connector уже залогировал WARNING с известными именами.
+                    continue
             # shared-секрет требует value (env опционален — для env-выдачи);
             # inject — ОБА поля; host-passthrough — НИ ОДНОГО. Иначе ошибка.
-            if is_shared:
+            elif is_shared:
                 if not has_value:
                     logger.error("wallet: shared-секрет %r без value — пропущен", name)
                     continue
@@ -101,5 +144,7 @@ class SecretStore:
                 allow_unsafe=bool(raw.get("allow_unsafe", False)),
                 confirm=bool(raw.get("confirm", True)),
                 shared=is_shared,
+                connector=connector,
+                scope=scope,
             )
         return self._secrets

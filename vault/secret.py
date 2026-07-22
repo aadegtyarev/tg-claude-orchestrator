@@ -7,7 +7,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Маркер секрета для скрытых inject-секретов. В env песочницы вместо реального
 # значения кладётся `<<wallet:имя>>`; модель пишет привычный `$ENV`, шелл
@@ -135,13 +135,36 @@ class Secret:
     # при заданном `env` реальное значение сразу лежит в env песочницы (в отличие
     # от inject, где там маркер). host/inject значения НЕ выдаются никогда.
     shared: bool
+    # connector — имя коннектора (§4.5): секрет с коннектором — НЕ host/inject/
+    # shared, а «прокси-секрет»: его кред подставляется MITM-прокси МЕЖДУ машиной
+    # и сервисом (§4.4), в env песочницы значение не входит. Пусто = сегодняшний
+    # секрет (host/inject/shared), прокси не поднимается. Поля с дефолтом — в
+    # конце dataclass (обратная совместимость позиционных конструкций).
+    connector: str = ""
+    # scope — машинный скоуп прокси-секрета, как его понимает коннектор (для
+    # generic-bearer: {"url_prefixes": [...]}). Пусто для не-прокси-секретов.
+    # NB: dict-поле делает Secret нехешируемым (frozen лишь запрещает переприсвоение
+    # атрибута, но не мутацию dict). SecretStore кэширует и переиспользует Secret
+    # между load(), поэтому МУТИРОВАТЬ secret.scope на месте нельзя — испортит
+    # общий кэш; потребители берут защитную копию (см. proxy_pool.start → dict()).
+    scope: dict = field(default_factory=dict)
+
+    @property
+    def is_proxy(self) -> bool:
+        """Прокси-секрет (§4.5): кред подставляет MITM-прокси по коннектору, а не
+        env-инъекция/host-passthrough. Определяется наличием connector."""
+        return bool(self.connector)
 
     @property
     def host_passthrough(self) -> bool:
-        return not (self.value and self.env)
+        # Прокси-секрет НЕ проходной на хост: у него value без env, но команды им
+        # не запускаются (иначе он молча раздал бы DEFAULT_HOST_COMMANDS).
+        return not self.is_proxy and not (self.value and self.env)
 
     @property
     def mode(self) -> str:
+        if self.is_proxy:
+            return "proxy"
         if self.shared:
             return "shared"
         return "host" if self.host_passthrough else "inject"
