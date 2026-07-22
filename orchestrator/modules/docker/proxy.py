@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Callable
 
 from .decision import Policy, endpoint, evaluate
 
@@ -29,12 +30,19 @@ _CHUNK = 65536
 
 
 class DockerProxy:
-    """Один экземпляр на оркестратор (докер глобальный, не per-session). Политика
-    берётся из $HOME оператора."""
+    """Один экземпляр НА СЕССИЮ: allowlist = папки проекта именно этой сессии
+    (изоляция на уровне сессии). roots_provider отдаёт актуальные корни при каждом
+    запросе (linked_path сессии может смениться)."""
 
-    def __init__(self, sock_path: Path, *, policy: Policy, real_sock: str = _REAL_SOCK) -> None:
+    def __init__(
+        self,
+        sock_path: Path,
+        *,
+        roots_provider: "Callable[[], list[Path]]",
+        real_sock: str = _REAL_SOCK,
+    ) -> None:
         self.sock_path = Path(sock_path)
-        self.policy = policy
+        self.roots_provider = roots_provider
         self.real_sock = real_sock
         self._server: asyncio.AbstractServer | None = None
         # Сильные ссылки на задачи соединений: иначе при обрыве клиента asyncio
@@ -107,7 +115,8 @@ class DockerProxy:
                 obj = json.loads(body) if body else None
             except ValueError:
                 obj = None
-            verdict = evaluate(method, path, obj, policy=self.policy)
+            policy = Policy.for_roots(self.roots_provider())
+            verdict = evaluate(method, path, obj, policy=policy)
             if not verdict.allow:
                 logger.info("DENY %s %s — %s", method, path, verdict.reason)
                 await self._error(cw, 403, verdict.reason)

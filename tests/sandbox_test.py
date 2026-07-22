@@ -110,19 +110,19 @@ def test_prefix_allowlist():
     print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
 
 
-def test_docker_sock_bound_when_enabled():
-    # sandbox_docker=True → прокси-сокет биндится на /run/docker.sock + DOCKER_HOST
-    m = _mgr("bwrap")
-    m.config.sandbox_docker = True
-    m.config.docker_proxy_sock = Path("/run/user/1000/claude-orchestrator/docker-proxy.sock")
-    s = " ".join(m.sandbox_prefix(Path("/x"), [Path("/x")]))
-    assert "--bind-try /run/user/1000/claude-orchestrator/docker-proxy.sock /run/docker.sock" in s
+def test_docker_sock_bound_when_passed():
+    # build_argv с docker_sock → прокси-сокет биндится на /run/docker.sock + DOCKER_HOST
+    dsock = Path("/run/user/1000/claude-orchestrator/docker-noos.sock")
+    s = " ".join(sandbox.build_argv(
+        home=Path("/home/t"), chdir=Path("/x"), rw_paths=[Path("/x")], ro_paths=[],
+        docker_sock=dsock))
+    assert f"--bind-try {dsock} /run/docker.sock" in s
     assert "--setenv DOCKER_HOST unix:///run/docker.sock" in s
-    # выключено → ни сокета, ни DOCKER_HOST
-    m.config.sandbox_docker = False
-    s2 = " ".join(m.sandbox_prefix(Path("/x"), [Path("/x")]))
+    # без docker_sock → ни сокета, ни DOCKER_HOST
+    s2 = " ".join(sandbox.build_argv(
+        home=Path("/home/t"), chdir=Path("/x"), rw_paths=[Path("/x")], ro_paths=[]))
     assert "docker.sock" not in s2 and "DOCKER_HOST" not in s2
-    print("OK sandbox_prefix: docker.sock+DOCKER_HOST только при sandbox_docker=True")
+    print("OK build_argv: docker.sock+DOCKER_HOST только при переданном docker_sock")
 
 
 def test_real_isolation():

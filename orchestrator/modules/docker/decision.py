@@ -3,25 +3,25 @@
 proxy.py; прокси стоит ТОЛЬКО в песочнице модели — личный докер оператора мимо
 него, поэтому оператору тут ничего не запрещено.
 
-Две цели (оператор задал явно): не дать модели (1) снести систему и (2) добраться
-до секретов по стандартным Linux-путям. Не от намеренного побега — та граница у
-agent-vm; это соломка от СЛУЧАЙНОСТЕЙ.
+Скоуп = ПАПКА ПРОЕКТА + устройства (оператор задал явно). Это ALLOWLIST (не
+денайлист): монтировать можно ТОЛЬКО под разрешёнными корнями (RW-область
+песочницы: папки проектов сессий), всё прочее — отказ. Так нет дыр «забыл путь», а
+секреты (~/.ssh, ~/.aws, secrets.toml) и система (/etc, /usr) отсекаются сами —
+они вне папок проектов. Не от намеренного побега — та граница у agent-vm; это
+соломка от СЛУЧАЙНОСТЕЙ.
 
 Запрещаем (у модели):
-  * снести систему: bind системных путей (/, /etc, /usr, /bin, /lib, /boot,
-    /sys, /proc, /root); --privileged; Pid/Ipc/UTS/Userns=host
-  * секреты по стандартным путям: bind ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube,
-    ~/.docker, каталога secrets.toml, /run+/var/run (там docker.sock)
-  * опасные --cap-add (SYS_ADMIN и пр. — тоже путь снести систему)
-  * volume create с device+o=bind на запрещённый путь (обходной bind)
+  * bind ЛЮБОГО пути вне разрешённых корней проекта (allowlist)
+  * то же для --mount type=bind и volume create с o=bind,device
+  * escape в обход скоупа: --privileged, Pid/Ipc/UTS/Userns=host, опасные --cap-add
 
 Сознательно РАЗРЕШАЕМ:
-  * --device (USB/TTY — оператор просил пускать)
-  * bind любых прочих путей, включая соседние проекты
+  * --device (USB/TTY — оператор просил)
+  * bind под корнями проекта; именованные тома
   * публикацию портов и network=host — песочница и так на сети хоста
 
-Денайлист (запрет перечисленного, остальное пускаем) — коарзно, но соразмерно
-«соломке от случайностей». Нераспарсили create → deny (безопасная сторона).
+create без разобранного тела → deny (безопасная сторона). Корни резолвятся при
+запросе (сессии приходят/уходят) — Policy строится динамически.
 
 См. [[docker-in-sandbox]].
 """
@@ -31,9 +31,9 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
-# Опасные capabilities: фактический выход на хост. Узкий список — не весь набор.
+# Опасные capabilities: фактический выход на хост в обход скоупа. Узкий список.
 _DANGEROUS_CAPS = {"SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "SYS_BOOT",
                    "SYS_RAWIO", "DAC_READ_SEARCH", "ALL"}
 
@@ -44,22 +44,6 @@ _HOST_NS = ("PidMode", "IpcMode", "UTSMode", "UsernsMode")
 _VERSION_RE = re.compile(r"^/v[0-9]+\.[0-9]+")
 
 
-def default_forbidden(home: str) -> tuple[str, ...]:
-    """Корни хоста, bind которых запрещаем. home — $HOME оператора (креды под ним).
-    Оператор может расширить список в конфиге. Заметь: /dev тут НЕТ — устройства
-    пускаем через --device (не через bind /dev)."""
-    h = home.rstrip("/")
-    return (
-        # снести систему: RW-bind этих путей может испортить хост
-        "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32",
-        "/boot", "/sys", "/proc", "/root",
-        "/var/run", "/run",                     # сокеты, вкл. docker.sock
-        # секреты по стандартным Linux-путям
-        f"{h}/.ssh", f"{h}/.aws", f"{h}/.gnupg", f"{h}/.kube",
-        f"{h}/.docker", f"{h}/.config/claude-orchestrator",  # secrets.toml
-    )
-
-
 @dataclass(frozen=True)
 class Verdict:
     allow: bool
@@ -68,31 +52,25 @@ class Verdict:
 
 @dataclass(frozen=True)
 class Policy:
-    """Настройка решения. forbidden — префиксы путей, bind которых запрещён."""
+    """Разрешённые корни (папки проектов) + опасные caps. Строится динамически из
+    текущих сессий (allowed_roots) — прокси зовёт evaluate с актуальной Policy."""
 
-    forbidden: tuple[str, ...]
+    allowed_roots: tuple[str, ...]
     dangerous_caps: frozenset[str] = field(default_factory=lambda: frozenset(_DANGEROUS_CAPS))
 
     @classmethod
-    def for_home(cls, home: str, extra_forbidden: tuple[str, ...] = ()) -> "Policy":
-        return cls(forbidden=tuple(default_forbidden(home)) + tuple(extra_forbidden))
+    def for_roots(cls, roots) -> "Policy":
+        norm = tuple(str(Path(r)) for r in roots)
+        return cls(allowed_roots=norm)
 
 
 def _norm(path: str) -> str:
-    """Нормализовать абсолютный путь хоста для сравнения по префиксу.
-
-    Демон видит уже абсолютные пути (docker CLI резолвит `-v ./x` в абсолют до
-    отправки). Схлопываем `..`/симлинк-неустойчивость на уровне строки —
-    normpath убирает `a/../b`; ведущий `~` не трогаем (демон его не пришлёт)."""
     return posixpath.normpath(path)
 
 
 def _under(path: str, root: str) -> bool:
     p = PurePosixPath(_norm(path))
     r = PurePosixPath(_norm(root))
-    if r == PurePosixPath("/"):
-        # Корень как префикс поймал бы ВСЁ. Запрещаем только bind самого «/».
-        return p == r
     return p == r or r in p.parents
 
 
@@ -101,37 +79,38 @@ def _is_host_path(src: str) -> bool:
     return src.startswith("/")
 
 
-def _forbidden_bind(src: str, forbidden: tuple[str, ...]) -> str | None:
-    if not _is_host_path(src):
-        return None  # именованный/анонимный том — не путь хоста
-    norm = _norm(src)
-    for root in forbidden:
-        if _under(norm, root):
-            return (
-                f"монтирование `{src}` запрещено: путь `{root}` содержит "
-                f"системные файлы/креды хоста. Смонтируй рабочий каталог проекта, "
-                f"а не системный путь."
-            )
-    return None
+def _allowed(src: str, roots: tuple[str, ...]) -> bool:
+    return any(_under(src, r) for r in roots)
 
 
-def _check_binds(binds, forbidden) -> str | None:
+def _deny_bind(src: str, roots: tuple[str, ...]) -> str:
+    allowed = ", ".join(roots) or "(нет разрешённых корней)"
+    return (
+        f"монтирование `{src}` вне папки проекта. Смонтировать можно только под: "
+        f"{allowed}. Секреты и системные пути недоступны из песочницы."
+    )
+
+
+def _check_binds(binds, roots) -> str | None:
     for entry in binds or []:
         parts = str(entry).split(":")
         if len(parts) < 2:
             continue  # анонимный том без src
-        if reason := _forbidden_bind(parts[0], forbidden):
-            return reason
+        src = parts[0]
+        if not _is_host_path(src):
+            continue  # именованный том — не путь хоста
+        if not _allowed(_norm(src), roots):
+            return _deny_bind(src, roots)
     return None
 
 
-def _check_mounts(mounts, forbidden) -> str | None:
+def _check_mounts(mounts, roots) -> str | None:
     for mnt in mounts or []:
         if (mnt.get("Type") or "volume") != "bind":
             continue
         src = mnt.get("Source") or mnt.get("source") or ""
-        if src and (reason := _forbidden_bind(src, forbidden)):
-            return reason
+        if src and _is_host_path(src) and not _allowed(_norm(src), roots):
+            return _deny_bind(src, roots)
     return None
 
 
@@ -151,26 +130,23 @@ def endpoint(method: str, uri: str) -> str:
 
 
 def evaluate(method: str, uri: str, body: dict | None, *, policy: Policy) -> Verdict:
-    """Решение authz по одному запросу демона.
-
-    body — распарсенное JSON-тело запроса (None, если тела нет/не JSON). Всё, что
-    не create-контейнера и не create-тома, разрешаем: host-ФС оно не монтирует.
-    """
+    """Решение по одному запросу. body — распарсенное тело (None, если тела нет/не
+    JSON). Не create/volume — разрешаем (host-ФС оно не монтирует)."""
     kind = endpoint(method, uri)
     if kind == "other":
         return Verdict(True)
 
     if body is None:
-        # create без разбираемого тела — не рискуем (deny — безопасная сторона).
         return Verdict(False, "тело create не разобрано — отказано на всякий случай")
 
+    roots = policy.allowed_roots
+
     if kind == "volume_create":
-        # Обходной bind: driver=local + o=bind + device=/host/path.
         opts = (body.get("DriverOpts") or {})
         dev = opts.get("device") or opts.get("Device") or ""
         o = (opts.get("o") or opts.get("O") or "")
-        if dev and "bind" in str(o) and (reason := _forbidden_bind(dev, policy.forbidden)):
-            return Verdict(False, reason)
+        if dev and "bind" in str(o) and _is_host_path(dev) and not _allowed(_norm(dev), roots):
+            return Verdict(False, _deny_bind(dev, roots))
         return Verdict(True)
 
     # kind == 'create'
@@ -178,8 +154,8 @@ def evaluate(method: str, uri: str, body: dict | None, *, policy: Policy) -> Ver
 
     if hc.get("Privileged"):
         return Verdict(False, (
-            "--privileged даёт доступ к устройствам и ядру хоста — это выход из "
-            "песочницы. Для сервисов/тестов он не нужен."
+            "--privileged даёт доступ к устройствам и ядру хоста в обход скоупа — "
+            "это выход из песочницы. Для сервисов/тестов он не нужен."
         ))
 
     for key in _HOST_NS:
@@ -189,20 +165,20 @@ def evaluate(method: str, uri: str, body: dict | None, *, policy: Policy) -> Ver
                 f"пролом песочницы. Убери host-режим."
             ))
 
-    # --device (Devices) СОЗНАТЕЛЬНО пускаем: USB/TTY по делу (оператор просил).
-
     caps = {str(c).upper() for c in (hc.get("CapAdd") or [])}
     if bad := (caps & policy.dangerous_caps):
         return Verdict(False, (
             f"capabilities {', '.join(sorted(bad))} дают выход на хост. Убери --cap-add."
         ))
 
-    if reason := _check_binds(hc.get("Binds"), policy.forbidden):
+    # --device (Devices) СОЗНАТЕЛЬНО пускаем: USB/TTY по делу (оператор просил).
+
+    if reason := _check_binds(hc.get("Binds"), roots):
         return Verdict(False, reason)
-    if reason := _check_mounts(hc.get("Mounts"), policy.forbidden):
+    if reason := _check_mounts(hc.get("Mounts"), roots):
         return Verdict(False, reason)
 
     return Verdict(True)
 
 
-__all__ = ["Verdict", "Policy", "evaluate", "endpoint", "default_forbidden"]
+__all__ = ["Verdict", "Policy", "evaluate", "endpoint"]

@@ -53,26 +53,17 @@ async def main() -> None:
     else:
         logger.info("Раннер: %s — claude и /bash изолированы", runner.name)
 
-    # docker-прокси (SANDBOX_DOCKER): тонкий фильтр над docker.sock, биндится в
-    # песочницу. Имеет смысл только под bwrap (под agent-vm сокет внутрь не
-    # прокидывается, под off песочницы нет) — иначе громко предупреждаем, а не
-    # молча делаем no-op.
-    docker_proxy = None
+    # docker в песочнице (SANDBOX_BWRAP_DOCKER): у КАЖДОЙ сессии свой прокси-фильтр
+    # (поднимается в SessionManager при старте сессии, allowlist = её проект).
+    # Имеет смысл только под bwrap — иначе громко предупреждаем, а не молча no-op.
     if config.sandbox_docker:
         if runner.name != "bwrap":
             logger.warning(
-                "SANDBOX_DOCKER=1, но раннер %s (не bwrap) — прокси не поднят. "
-                "docker в песочнице доступен только под SANDBOX=bwrap.", runner.name)
+                "SANDBOX_BWRAP_DOCKER=1, но раннер %s (не bwrap) — docker в песочнице "
+                "недоступен. Работает только под SANDBOX=bwrap.", runner.name)
         else:
-            from pathlib import Path as _Path
-
-            from .modules.docker.decision import Policy
-            from .modules.docker.proxy import DockerProxy
-            docker_proxy = DockerProxy(
-                config.docker_proxy_sock, policy=Policy.for_home(str(_Path.home())))
-            await docker_proxy.start()
-            logger.info("docker-прокси поднят: %s (docker/compose в песочнице разрешены)",
-                        config.docker_proxy_sock)
+            logger.info("docker в песочнице включён: per-session прокси, "
+                        "allowlist = папка проекта сессии + устройства")
 
     if not config.allowed_user_ids:
         logger.warning(
@@ -131,8 +122,6 @@ async def main() -> None:
             logger.debug("close_all при остановке: %s", e)
         await manager.shutdown()
         await reply_runner.cleanup()
-        if docker_proxy is not None:
-            await docker_proxy.stop()
         await core.close()
         logger.info("Готово.")
 

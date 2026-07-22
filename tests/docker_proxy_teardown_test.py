@@ -14,7 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.modules.docker.decision import Policy  # noqa: E402
 from orchestrator.modules.docker.proxy import DockerProxy  # noqa: E402
 
 
@@ -38,7 +37,7 @@ async def scenario():
     up_sock = d / "up.sock"
     proxy_sock = d / "proxy.sock"
     upstream = await _silent_upstream(up_sock)
-    proxy = DockerProxy(proxy_sock, policy=Policy.for_home("/home/op"), real_sock=str(up_sock))
+    proxy = DockerProxy(proxy_sock, roots_provider=lambda: [d], real_sock=str(up_sock))
     await proxy.start()
     try:
         # клиент шлёт запрос (не create → пройдёт к апстриму) и резко закрывается

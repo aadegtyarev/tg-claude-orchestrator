@@ -17,7 +17,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.modules.docker.decision import Policy  # noqa: E402
 from orchestrator.modules.docker.proxy import DockerProxy  # noqa: E402
 
 IMG = "postgres:16-alpine"  # в кэше; гоняем через --entrypoint, БД не поднимаем
@@ -63,9 +62,9 @@ def _real(argv, timeout=30):
 
 async def scenario():
     tag = f"pxtest-{uuid.uuid4().hex[:8]}"
-    work = Path(tempfile.mkdtemp())
+    work = Path(tempfile.mkdtemp())   # «проект сессии» = единственный корень allowlist
     sock = Path(tempfile.mkdtemp()) / "docker.sock"
-    proxy = DockerProxy(sock, policy=Policy.for_home(str(Path.home())))
+    proxy = DockerProxy(sock, roots_provider=lambda: [work])
     await proxy.start()
     try:
         # 1) чужой bind (/etc) → отказ с нашим объяснением
@@ -80,6 +79,12 @@ async def scenario():
              f"{Path.home()}/.ssh:/x", IMG, "hi"], sock)
         assert code != 0 and "docker-proxy" in err, (code, err)
         print("OK live: bind ~/.ssh → отказ")
+
+        # 2b) /tmp — не секрет, но ВНЕ проекта → тоже отказ (это allowlist)
+        code, out, err = await _docker(
+            ["run", "--rm", "--entrypoint", "echo", "-v", "/tmp:/x", IMG, "hi"], sock)
+        assert code != 0 and "docker-proxy" in err, (code, err)
+        print("OK live: bind /tmp (вне проекта) → отказ (allowlist, не denylist)")
 
         # 3) свой рабочий путь → полный цикл run --rm без зависаний
         code, out, err = await _docker(
