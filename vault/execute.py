@@ -80,7 +80,12 @@ async def run_secret_command(
         def repl(m) -> str:  # m: re.Match от MARKER_RE.sub
             nonlocal tmpdir
             s = all_secrets.get(m.group(1))
-            if s is None or not s.session_allowed(session_name) or not s.value:
+            # proxy-секрет (connector) НЕ разворачиваем даже по литеральному
+            # маркеру: его value обязан жить только в прокси (§4.4), а не попадать
+            # в argv любой команды. store уже не активирует proxy-секрет с env/
+            # commands — это второй рубеж (defense-in-depth).
+            if (s is None or s.is_proxy or not s.session_allowed(session_name)
+                    or not s.value):
                 return ""
             if not m.group(2):
                 return s.value

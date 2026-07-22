@@ -117,6 +117,44 @@ def test_store_connector_without_value_skipped():
     print("OK store: connector-секрет без value пропущен")
 
 
+def test_store_connector_rejects_value_leaking_fields():
+    """CRITICAL/HIGH: прокси-секрет с shared/env/commands раздал бы своё значение
+    наружу (wallet get / маркер в песочнице / инъекция в env). store НЕ активирует
+    такой секрет («выключено = не существует»). Валидный (value+scope) — грузится."""
+    tmp = Path(tempfile.mkdtemp(prefix="vault_wire_leak_"))
+    store = _store_with(tmp, (
+        '[secrets.leak_shared]\n'
+        'connector = "generic-bearer"\n'
+        'value = "SUPER-SECRET"\n'
+        'shared = true\n'
+        'sessions = ["*"]\n'
+        '[secrets.leak_shared.scope]\n'
+        'url_prefixes = ["https://api.svc/v1"]\n\n'
+        '[secrets.leak_env]\n'
+        'connector = "generic-bearer"\n'
+        'value = "SUPER-SECRET"\n'
+        'env = "LEAK"\n'
+        'sessions = ["*"]\n\n'
+        '[secrets.leak_cmds]\n'
+        'connector = "generic-bearer"\n'
+        'value = "SUPER-SECRET"\n'
+        'commands = ["curl *"]\n'
+        'sessions = ["*"]\n\n'
+        '[secrets.ok]\n'
+        'connector = "generic-bearer"\n'
+        'value = "OK-TOKEN"\n'
+        'sessions = ["*"]\n'
+        '[secrets.ok.scope]\n'
+        'url_prefixes = ["https://api.svc/v1"]\n'
+    ))
+    secrets = store.load()
+    assert "leak_shared" not in secrets, "connector+shared должен быть не активен"
+    assert "leak_env" not in secrets, "connector+env должен быть не активен"
+    assert "leak_cmds" not in secrets, "connector+commands должен быть не активен"
+    assert "ok" in secrets and secrets["ok"].mode == "proxy", secrets
+    print("OK store: proxy-секрет с shared/env/commands не активен (утечка value закрыта)")
+
+
 # ── пул: end-to-end через выделенный порт ──────────────────────────────────
 
 async def _service_and_ca():
@@ -342,6 +380,86 @@ async def test_daemon_delegates_to_pool():
         await service.stop()
 
 
+async def test_get_denies_proxy_secret_value():
+    """Defense-in-depth: /get на АКТИВНЫЙ proxy-секрет (mode=proxy) → 403, значение
+    НЕ выдаётся (гейт по mode!='shared', а не по сырому shared)."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"ssl-среда недоступна: {_IMPORT_ERR}")
+    import aiohttp
+
+    from vault.daemon import VaultDaemon
+
+    tmp = Path(tempfile.mkdtemp(prefix="vault_wire_get_"))
+    store = _store_with(tmp, (
+        '[secrets.psvc]\n'
+        'connector = "generic-bearer"\n'
+        'value = "PROXY-CRED-DO-NOT-LEAK"\n'
+        'sessions = ["*"]\n'
+        '[secrets.psvc.scope]\n'
+        'url_prefixes = ["https://api.svc/v1"]\n'
+    ))
+
+    class _Host:
+        async def confirm(self, *a):
+            return True
+
+        async def observe(self, *a):
+            return None
+
+        def record(self, *a, **k):
+            return None
+
+        async def notify_denied(self, *a):
+            return None
+
+    daemon = VaultDaemon(store, _Host(), guard_on=True)
+    await daemon.start()
+    try:
+        token = daemon.issue_token("sess-1", tmp)
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{daemon.url}/get",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"secret": "psvc"},
+            ) as r:
+                assert r.status == 403, f"/get proxy-секрета должен быть 403, был {r.status}"
+                data = await r.json()
+        assert "PROXY-CRED-DO-NOT-LEAK" not in str(data), data
+        print("OK /get: значение proxy-секрета не выдаётся (403, гейт по mode)")
+    finally:
+        await daemon.stop()
+
+
+async def test_execute_sub_ignores_proxy_marker():
+    """Defense-in-depth: литеральный маркер proxy-секрета в argv НЕ разворачивается
+    в значение (execute._sub пропускает is_proxy) — кред не течёт в команду."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"ssl-среда недоступна: {_IMPORT_ERR}")
+    from vault.execute import run_secret_command
+    from vault.secret import Secret
+
+    tmp = Path(tempfile.mkdtemp(prefix="vault_wire_sub_"))
+    proxy = Secret(
+        name="psvc", value="PROXY-CRED-DO-NOT-LEAK", env="", description="",
+        sessions=("*",), commands=(), deny=(), allow_unsafe=False,
+        confirm=False, shared=False, connector="generic-bearer",
+        scope={"url_prefixes": ["https://api.svc/v1"]},
+    )
+    runner = Secret(
+        name="run", value="", env="", description="", sessions=("*",),
+        commands=("echo",), deny=(), allow_unsafe=False, confirm=False,
+        shared=False,
+    )
+    all_secrets = {"psvc": proxy, "run": runner}
+    code, out, err = await run_secret_command(
+        ["echo", "<<wallet:psvc>>"], runner,
+        cwd=tmp, all_secrets=all_secrets, session_name="sess-1",
+    )
+    assert code == 0, (code, err)
+    assert b"PROXY-CRED-DO-NOT-LEAK" not in out, out
+    print("OK execute: маркер proxy-секрета не разворачивается в argv (кред не течёт)")
+
+
 def main() -> None:
     if _IMPORT_ERR is not None:
         _skip(f"vault-проводка недоступна (нет ssl/openssl): {_IMPORT_ERR}")
@@ -349,12 +467,15 @@ def main() -> None:
     test_store_parses_connector_and_scope()
     test_store_unknown_connector_inactive()
     test_store_connector_without_value_skipped()
+    test_store_connector_rejects_value_leaking_fields()
     for coro in (
         test_pool_allow_injects_cred,
         test_pool_deny_out_of_scope,
         test_pool_distinct_sessions_distinct_ports_attribution,
         test_pool_lifecycle_releases_port,
         test_daemon_delegates_to_pool,
+        test_get_denies_proxy_secret_value,
+        test_execute_sub_ignores_proxy_marker,
     ):
         asyncio.run(coro())
     print("ALL VAULT-WIRE OK")

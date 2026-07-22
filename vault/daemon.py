@@ -194,7 +194,11 @@ class VaultDaemon:
                  "reason": f"нет shared-секрета «{name}» для этой сессии (см. wallet ls)"},
                 status=403,
             )
-        if not secret.shared:
+        if secret.mode != "shared":
+            # Гейт по mode, НЕ по сырому `shared`: proxy-секрет (connector) может
+            # нести shared=true в файле, но его значение выдавать нельзя — кред
+            # живёт только в прокси (§4.4). store такой секрет уже не активирует,
+            # это второй рубеж (defense-in-depth).
             return web.json_response(
                 {"error": "denied",
                  "reason": f"секрет «{name}» не shared — значение не выдаётся "

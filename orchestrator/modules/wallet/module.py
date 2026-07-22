@@ -154,7 +154,10 @@ class WalletModule:
         сертификат) — для inject-секретов."""
         out: dict[str, str] = {}
         for s in self.store.load().values():
-            if not s.env or not s.session_allowed(session.name):
+            # proxy-секрет (connector) в песочницу НЕ эмитим: его кред живёт
+            # только в прокси (§4.4), маркер/значение в env недопустимы. store уже
+            # не активирует proxy-секрет с env — это второй рубеж.
+            if s.is_proxy or not s.env or not s.session_allowed(session.name):
                 continue
             if s.shared:
                 out[s.env] = s.value

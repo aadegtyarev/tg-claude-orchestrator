@@ -98,6 +98,27 @@ class SecretStore:
                     logger.error(
                         "wallet: connector-секрет %r без value — пропущен", name)
                     continue
+                # Прокси-секрет несёт ТОЛЬКО value (для прокси)+scope+sessions+
+                # confirm. shared/env/commands на нём ЗАПРЕЩЕНЫ: каждый из них —
+                # путь наружу к сырому значению (shared → wallet get; env → маркер
+                # в песочнице → разворот в argv; commands → инъекция в env
+                # ребёнка), а кред proxy-секрета обязан жить ТОЛЬКО в прокси между
+                # машиной и сервисом (§4.4). Любой из них → секрет НЕ активен
+                # (выключено = не существует), громкий лог.
+                leaks = [
+                    field for field, present in (
+                        ("shared", is_shared),
+                        ("env", has_env),
+                        ("commands", bool(raw.get("commands"))),
+                    ) if present
+                ]
+                if leaks:
+                    logger.error(
+                        "wallet: connector-секрет %r несёт запрещённые поля %s — "
+                        "прокси-секрет не должен раздавать своё значение (его "
+                        "подставляет только прокси); секрет НЕ активен",
+                        name, ", ".join(leaks))
+                    continue
                 if get_connector(connector) is None:
                     # get_connector уже залогировал WARNING с известными именами.
                     continue

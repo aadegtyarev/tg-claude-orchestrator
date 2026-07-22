@@ -143,6 +143,10 @@ class Secret:
     connector: str = ""
     # scope — машинный скоуп прокси-секрета, как его понимает коннектор (для
     # generic-bearer: {"url_prefixes": [...]}). Пусто для не-прокси-секретов.
+    # NB: dict-поле делает Secret нехешируемым (frozen лишь запрещает переприсвоение
+    # атрибута, но не мутацию dict). SecretStore кэширует и переиспользует Secret
+    # между load(), поэтому МУТИРОВАТЬ secret.scope на месте нельзя — испортит
+    # общий кэш; потребители берут защитную копию (см. proxy_pool.start → dict()).
     scope: dict = field(default_factory=dict)
 
     @property
