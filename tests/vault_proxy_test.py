@@ -63,6 +63,7 @@ class _Service:
         self.server: asyncio.AbstractServer | None = None
         self.host = "localhost"
         self.port = 0
+        self.seen: list[str] = []  # target'ы всех дошедших до сервиса запросов
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(
@@ -82,6 +83,7 @@ class _Service:
         try:
             line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
             target = line.decode("latin-1").split(" ")[1]
+            self.seen.append(target)
             auth = ""
             while True:
                 hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
@@ -90,7 +92,13 @@ class _Service:
                 name, _, value = hl.rstrip(b"\r\n").decode("latin-1").partition(":")
                 if name.strip().lower() == "authorization":
                     auth = value.strip()
-            body = f"path={target} auth={auth}".encode()
+            # Путь с «big» → большой ответ (для теста застоя клиента): клиент не
+            # читает → write-буфер прокси заполняется → drain обязан размыкаться
+            # по таймауту, а не виснуть.
+            if "big" in target:
+                body = b"x" * 8_000_000
+            else:
+                body = f"path={target} auth={auth}".encode()
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -124,35 +132,52 @@ def _trust_ctx(ca: VaultCA) -> ssl.SSLContext:
     return ctx
 
 
-async def _client_get(proxy_url: str, host: str, port: int, path: str,
-                      trust: ssl.SSLContext) -> tuple[int, str]:
-    """Клиент через HTTPS-прокси: ручной CONNECT + TLS-хендшейк + GET. Возвращает
-    (status_code, raw_response_text). Всё под таймаутом (не виснет)."""
+async def _open_mitm(proxy_url: str, host: str, port: int, trust: ssl.SSLContext):
+    """Ручной CONNECT к прокси + апгрейд клиентской стороны в TLS. Возвращает
+    (reader, writer) поверх MITM-туннеля. Всё под таймаутом (не виснет)."""
     p = proxy_url.removeprefix("http://")
     phost, pport = p.split(":")
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(phost, int(pport)), timeout=_TIMEOUT
     )
+    authority = f"{host}:{port}"
+    writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+    await writer.drain()
+    status_line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
+    assert b"200" in status_line, f"CONNECT не удался: {status_line!r}"
+    while True:  # дочитать заголовки ответа CONNECT
+        hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
+        if hl in (b"\r\n", b"\n"):
+            break
+    await asyncio.wait_for(
+        writer.start_tls(trust, server_hostname=host), timeout=_TIMEOUT
+    )
+    return reader, writer
+
+
+async def _read_status(text: str) -> int:
+    return int(text.split(" ", 2)[1]) if text.startswith("HTTP/") else 0
+
+
+async def _client_get(proxy_url: str, host: str, port: int, path: str,
+                      trust: ssl.SSLContext, *,
+                      request_line: str | None = None,
+                      host_header: str | None = None) -> tuple[int, str]:
+    """CONNECT+MITM+GET через прокси → (status_code, raw_response_text).
+
+    request_line — переопределить строку запроса целиком (для absolute-form);
+    host_header — переопределить заголовок Host (для проверки маршрута по
+    CONNECT-authority, а не по Host)."""
+    reader, writer = await _open_mitm(proxy_url, host, port, trust)
     try:
         authority = f"{host}:{port}"
-        writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
-        await writer.drain()
-        status_line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
-        assert b"200" in status_line, f"CONNECT не удался: {status_line!r}"
-        while True:  # дочитать заголовки ответа CONNECT
-            hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_TIMEOUT)
-            if hl in (b"\r\n", b"\n"):
-                break
-        # апгрейд клиентской стороны в TLS поверх туннеля
-        await asyncio.wait_for(
-            writer.start_tls(trust, server_hostname=host), timeout=_TIMEOUT
-        )
-        writer.write(f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        rl = request_line if request_line is not None else f"GET {path} HTTP/1.1"
+        hh = host_header if host_header is not None else authority
+        writer.write(f"{rl}\r\nHost: {hh}\r\n\r\n".encode())
         await writer.drain()
         raw = await asyncio.wait_for(reader.read(65536), timeout=_TIMEOUT)
         text = raw.decode("latin-1")
-        code = int(text.split(" ", 2)[1]) if text.startswith("HTTP/") else 0
-        return code, text
+        return await _read_status(text), text
     finally:
         try:
             writer.close()
@@ -161,16 +186,20 @@ async def _client_get(proxy_url: str, host: str, port: int, path: str,
             pass
 
 
-async def _setup():
-    """Поднять CA, сервис и прокси; вернуть (ca, service, proxy, trust)."""
+async def _setup(*, upstream_trust: bool = True, **proxy_kwargs):
+    """Поднять CA, сервис и прокси; вернуть (ca, service, proxy, trust).
+
+    upstream_trust=False → прокси с ДЕФОЛТНЫМ (системным) upstream_ssl: реориджин
+    к сервису на Vault-CA-серте провалится (прод-путь, самозванец не получит кред).
+    proxy_kwargs пробрасываются в VaultProxy (напр. idle_timeout=… для теста застоя)."""
     ca = VaultCA(Path(tempfile.mkdtemp(prefix="vault_proxy_")))
     service = _Service(_service_ctx(ca))
     await service.start()
     scope = {"url_prefixes": [f"https://localhost:{service.port}/allowed"]}
-    proxy = VaultProxy(
-        ca, GenericBearerConnector(), _mk_secret(), scope,
-        upstream_ssl=_trust_ctx(ca),
-    )
+    kw = dict(proxy_kwargs)
+    if upstream_trust:
+        kw.setdefault("upstream_ssl", _trust_ctx(ca))
+    proxy = VaultProxy(ca, GenericBearerConnector(), _mk_secret(), scope, **kw)
     await proxy.start()
     return ca, service, proxy, _trust_ctx(ca)
 
@@ -288,6 +317,142 @@ async def test_abort_does_not_hang():
         await service.stop()
 
 
+async def test_default_upstream_rejects_untrusted_service():
+    """Прод-trust (регресс, CRITICAL-класс): при ДЕФОЛТНОМ upstream_ssl реориджин
+    к сервису на Vault-CA-серте (не системный trust) ПРОВАЛИВАЕТСЯ → 502, кред НЕ
+    уходит. Доказывает: в проде самозванец под сервис не получит секрет."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт vault.proxy не удался: {_IMPORT_ERR}")
+    ca, service, proxy, trust = await _setup(upstream_trust=False)
+    try:
+        code, text = await _client_get(
+            proxy.proxy_url, "localhost", service.port, "/allowed/data", trust
+        )
+        assert code == 502, f"ожидали 502 (upstream не доверен), получили {code}: {text!r}"
+        assert _SECRET_VALUE not in text, "секрет утёк в ответе при провале upstream"
+        # До сервиса НЕ дошли (TLS не установился) — сервис ничего не видел.
+        assert service.seen == [], f"запрос дошёл до недоверенного сервиса: {service.seen}"
+        print("OK VaultProxy: дефолтный upstream_ssl режет Vault-CA-серт → 502, кред не ушёл")
+    finally:
+        await proxy.stop()
+        await service.stop()
+
+
+async def test_pipelining_second_request_ignored():
+    """Смуглинг/pipelining: два запроса back-to-back на одном MITM-TLS. Прокси
+    обслуживает ТОЛЬКО первый (Connection: close, один запрос на туннель); второй
+    не проскакивает мимо in_scope и до сервиса не доходит."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт vault.proxy не удался: {_IMPORT_ERR}")
+    ca, service, proxy, trust = await _setup()
+    reader, writer = await _open_mitm(proxy.proxy_url, "localhost", service.port, trust)
+    try:
+        authority = f"localhost:{service.port}"
+        # Первый — ALLOW; второй — вне scope. Шлём слитно, до чтения ответа.
+        writer.write(
+            f"GET /allowed/one HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            f"GET /forbidden/two HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(65536), timeout=_TIMEOUT)
+        text = raw.decode("latin-1")
+        assert await _read_status(text) == 200, f"первый запрос не 200: {text!r}"
+        assert "path=/allowed/one" in text, f"ответ не на первый запрос: {text!r}"
+        await asyncio.sleep(0.2)  # дать шанс (ошибочно) обработать второй
+        assert service.seen == ["/allowed/one"], (
+            f"второй запрос проскочил к сервису мимо in_scope: {service.seen}"
+        )
+        print("OK VaultProxy: pipelining — второй запрос не проскакивает мимо in_scope")
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            pass
+        await proxy.stop()
+        await service.stop()
+
+
+async def test_host_header_ignored_route_by_authority():
+    """Host-mismatch: CONNECT на in-scope host, но Host-заголовок на чужой → и
+    in_scope, и реориджин идут по CONNECT-authority; чужой ресурс не подставляет
+    решение (запрос всё равно уходит к authority-сервису под его скоупом)."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт vault.proxy не удался: {_IMPORT_ERR}")
+    ca, service, proxy, trust = await _setup()
+    try:
+        code, text = await _client_get(
+            proxy.proxy_url, "localhost", service.port, "/allowed/x", trust,
+            host_header="evil.example.com",
+        )
+        # Решение по authority (localhost, in-scope) → ALLOW, дошли до НАШЕГО сервиса.
+        assert code == 200, f"ожидали 200 (маршрут по authority), получили {code}: {text!r}"
+        assert service.seen == ["/allowed/x"], f"ушли не туда: {service.seen}"
+        assert f"auth=Bearer {_SECRET_VALUE}" in text, "кред не подставлен по authority"
+        print("OK VaultProxy: Host-заголовок игнорируется, маршрут по CONNECT-authority")
+    finally:
+        await proxy.stop()
+        await service.stop()
+
+
+async def test_absolute_form_request_rejected():
+    """LOW: absolute-form request-line (`GET https://evil/… HTTP/1.1`) в туннеле →
+    явный 400 (fail-closed), к in_scope мусорный url не пускаем, сервис не тронут."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт vault.proxy не удался: {_IMPORT_ERR}")
+    ca, service, proxy, trust = await _setup()
+    try:
+        code, text = await _client_get(
+            proxy.proxy_url, "localhost", service.port, "/allowed/x", trust,
+            request_line="GET https://evil.example.com/allowed/x HTTP/1.1",
+        )
+        assert code == 400, f"ожидали 400 на absolute-form, получили {code}: {text!r}"
+        assert service.seen == [], f"absolute-form дошёл до сервиса: {service.seen}"
+        assert _SECRET_VALUE not in text, "секрет утёк в ответе на absolute-form"
+        print("OK VaultProxy: absolute-form request-line → 400, сервис не тронут")
+    finally:
+        await proxy.stop()
+        await service.stop()
+
+
+async def test_client_stall_does_not_hang():
+    """MEDIUM-фикс: клиент делает валидный запрос к большому ресурсу и перестаёт
+    читать → write-буфер прокси заполняется → drain размыкается по idle_timeout,
+    прокси не виснет и продолжает обслуживать; висящих задач не остаётся."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт vault.proxy не удался: {_IMPORT_ERR}")
+    # Малый idle_timeout — чтобы застой размыкался быстро, без 5-мин ожидания.
+    ca, service, proxy, trust = await _setup(idle_timeout=1.0)
+    try:
+        reader, writer = await _open_mitm(proxy.proxy_url, "localhost", service.port, trust)
+        authority = f"localhost:{service.port}"
+        writer.write(f"GET /allowed/big HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        await writer.drain()
+        # Прочитать чуть-чуть и ЗАМЕРЕТЬ (не читать остаток большого ответа).
+        await asyncio.wait_for(reader.read(1024), timeout=_TIMEOUT)
+        await asyncio.sleep(2.5)  # > idle_timeout: прокси должен разомкнуть drain
+        # Прокси жив: свежий запрос на другом туннеле проходит.
+        code, _ = await _client_get(
+            proxy.proxy_url, "localhost", service.port, "/allowed/ok", trust
+        )
+        assert code == 200, f"прокси завис на застое клиента: {code}"
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.2)
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        assert len(pending) <= 1, f"похоже на залипшие задачи после застоя: {pending}"
+        print("OK VaultProxy: застой клиента размыкается по таймауту, задачи не залипают")
+    finally:
+        await proxy.stop()
+        await service.stop()
+
+
 def main() -> None:
     if _IMPORT_ERR is not None:
         _skip(f"vault.proxy недоступен: {_IMPORT_ERR}")
@@ -297,6 +462,11 @@ def main() -> None:
         test_client_never_sends_secret,
         test_out_of_scope_denied,
         test_abort_does_not_hang,
+        test_default_upstream_rejects_untrusted_service,
+        test_pipelining_second_request_ignored,
+        test_host_header_ignored_route_by_authority,
+        test_absolute_form_request_rejected,
+        test_client_stall_does_not_hang,
     ):
         asyncio.run(coro())
     print("ALL VAULT-PROXY OK")

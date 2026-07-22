@@ -31,7 +31,9 @@ standalone-компонент. Маршрутизация per-session (свой 
      scope-DENY не режем (Р7).
 
 Про «не зависать» (урок docker-прокси: обработчик оставался pending при обрыве):
-  * все чтения — под `asyncio.wait_for` с таймаутами;
+  * все чтения И записи (`drain`) — под `asyncio.wait_for` с таймаутами (не-
+    читающий клиент заполняет write-буфер, и голый `drain()` завис бы бессрочно
+    в обход read-таймаута — resource-hang/DoS от полу-доверенного sandbox-пира);
   * реориджин ОДНОНАПРАВЛЕННЫЙ: запрос дослан целиком, затем качаем upstream→
     client до EOF; upstream принуждаем к EOF заголовком `Connection: close`, так
     не нужно парсить фрейминг ответа и нет висящего keep-alive;
@@ -137,6 +139,10 @@ class VaultProxy:
         upstream_ssl: ssl.SSLContext | None = None,
         bind_host: str = "127.0.0.1",
         bind_port: int = 0,
+        connect_timeout: float = _CONNECT_TIMEOUT,
+        handshake_timeout: float = _HANDSHAKE_TIMEOUT,
+        read_timeout: float = _READ_TIMEOUT,
+        idle_timeout: float = _IDLE_TIMEOUT,
     ) -> None:
         self.ca = ca
         self.connector = connector
@@ -152,6 +158,12 @@ class VaultProxy:
         )
         self.bind_host = bind_host
         self.bind_port = bind_port
+        # Таймауты — атрибуты (не только модульные константы): тесты подставляют
+        # малые значения, чтобы проверить размыкание по таймауту без 5-мин ожиданий.
+        self._connect_timeout = connect_timeout
+        self._handshake_timeout = handshake_timeout
+        self._read_timeout = read_timeout
+        self._idle_timeout = idle_timeout
         self.port: int | None = None
         self._server: asyncio.AbstractServer | None = None
         # Кэш server-SSLContext по host (leaf грузим с диска один раз на host).
@@ -204,11 +216,19 @@ class VaultProxy:
                 writer.close()
                 await writer.wait_closed()
 
+    async def _drain(self, writer: asyncio.StreamWriter) -> None:
+        """drain ПОД таймаутом: не-читающий пир заполняет write-буфер, и голый
+        `drain()` завис бы бессрочно (read-таймаут на это не влияет — блок на
+        записи), держа сокеты — resource-hang/DoS от полу-доверенного клиента.
+        Таймаут → TimeoutError вверх → соединение рвётся (finally закроет сокеты),
+        как любой другой таймаут."""
+        await asyncio.wait_for(writer.drain(), timeout=self._idle_timeout)
+
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         line = await asyncio.wait_for(
-            reader.readuntil(b"\r\n"), timeout=_CONNECT_TIMEOUT
+            reader.readuntil(b"\r\n"), timeout=self._connect_timeout
         )
         parts = line.rstrip(b"\r\n").decode("latin-1").split()
         if len(parts) < 2:
@@ -243,12 +263,12 @@ class VaultProxy:
             return
 
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await writer.drain()
+        await self._drain(writer)
 
         # Апгрейд клиентской стороны в TLS (server-side — см. module-docstring).
         try:
             await asyncio.wait_for(
-                writer.start_tls(leaf_ctx), timeout=_HANDSHAKE_TIMEOUT
+                writer.start_tls(leaf_ctx), timeout=self._handshake_timeout
             )
         except (ssl.SSLError, asyncio.TimeoutError, ConnectionError) as exc:
             logger.info("VaultProxy: MITM-хендшейк с клиентом не удался (%s): %s", host, exc)
@@ -265,6 +285,19 @@ class VaultProxy:
         authority: str,
     ) -> None:
         method, target, headers, body = await self._read_request(reader)
+        # Маршрут — ТОЛЬКО по CONNECT-authority. Валидный запрос в туннеле —
+        # origin-form (`/path`). Absolute-form (`GET https://evil/…`) или
+        # authority-form — попытка увести реориджин/скоуп на чужой ресурс мимо
+        # authority: fail-closed 400, к in_scope мусорный url не пускаем (иначе
+        # urlsplit(url).port на битом порту бросал бы ValueError → сырой обрыв).
+        if not target.startswith("/"):
+            await self._send_response(
+                writer, 400, "Bad Request",
+                b"VaultProxy: only origin-form request targets are accepted; "
+                b"the tunnel routes by the CONNECT authority, not by an "
+                b"absolute-form URL or Host header\n",
+            )
+            return
         url = f"https://{authority}{target}"
         req = HttpReq(method=method, url=url, headers=dict(headers), body=body)
 
@@ -301,7 +334,7 @@ class VaultProxy:
                 asyncio.open_connection(
                     host, port, ssl=self.upstream_ssl, server_hostname=host
                 ),
-                timeout=_CONNECT_TIMEOUT,
+                timeout=self._connect_timeout,
             )
         except (ssl.SSLError, OSError, asyncio.TimeoutError) as exc:
             # Ошибку логируем/отдаём БЕЗ заголовков (там может быть кред).
@@ -313,7 +346,7 @@ class VaultProxy:
             return
         try:
             up_writer.write(self._build_request(method, target, headers, body))
-            await up_writer.drain()
+            await self._drain(up_writer)
             # Однонаправленная качалка: upstream принуждён к EOF (Connection:close),
             # поэтому дойдём до конца без парсинга фрейминга ответа и не зависнем.
             await self._pump(up_reader, client_writer)
@@ -327,11 +360,13 @@ class VaultProxy:
     ) -> None:
         try:
             while True:
-                chunk = await asyncio.wait_for(src.read(_CHUNK), timeout=_IDLE_TIMEOUT)
+                chunk = await asyncio.wait_for(src.read(_CHUNK), timeout=self._idle_timeout)
                 if not chunk:
                     break
                 dst.write(chunk)
-                await dst.drain()
+                # drain ПОД таймаутом: если КЛИЕНТ перестал читать большой ответ,
+                # write-буфер заполнится и голый drain завис бы бессрочно (MEDIUM).
+                await self._drain(dst)
         except (asyncio.TimeoutError, ssl.SSLError, OSError):
             pass  # любая сторона отвалилась — прекращаем, finally закроет сокеты
 
@@ -341,7 +376,7 @@ class VaultProxy:
         self, reader: asyncio.StreamReader
     ) -> tuple[str, str, dict[str, str], bytes]:
         line = await asyncio.wait_for(
-            reader.readuntil(b"\r\n"), timeout=_READ_TIMEOUT
+            reader.readuntil(b"\r\n"), timeout=self._read_timeout
         )
         fields = line.rstrip(b"\r\n").decode("latin-1").split(" ", 2)
         if len(fields) < 2:
@@ -354,7 +389,7 @@ class VaultProxy:
     async def _read_headers(self, reader: asyncio.StreamReader) -> dict[str, str]:
         headers: dict[str, str] = {}
         for _ in range(_MAX_HEADERS):
-            hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_READ_TIMEOUT)
+            hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=self._read_timeout)
             if hl in (b"\r\n", b"\n"):
                 return headers
             name, sep, value = hl.rstrip(b"\r\n").decode("latin-1").partition(":")
@@ -366,7 +401,7 @@ class VaultProxy:
     async def _drain_headers(self, reader: asyncio.StreamReader) -> None:
         """Дочитать заголовки CONNECT до пустой строки (их не форвардим)."""
         for _ in range(_MAX_HEADERS):
-            hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=_READ_TIMEOUT)
+            hl = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=self._read_timeout)
             if hl in (b"\r\n", b"\n"):
                 return
         raise VaultProxyError("слишком много заголовков CONNECT")
@@ -388,13 +423,13 @@ class VaultProxy:
             raise VaultProxyError(f"Content-Length вне допустимого: {length}")
         if length == 0:
             return b""
-        return await asyncio.wait_for(reader.readexactly(length), timeout=_READ_TIMEOUT)
+        return await asyncio.wait_for(reader.readexactly(length), timeout=self._read_timeout)
 
     async def _read_chunked(self, reader: asyncio.StreamReader) -> bytes:
         buf = bytearray()
         while True:
             size_line = await asyncio.wait_for(
-                reader.readuntil(b"\r\n"), timeout=_READ_TIMEOUT
+                reader.readuntil(b"\r\n"), timeout=self._read_timeout
             )
             size_hex = size_line.split(b";", 1)[0].strip()
             try:
@@ -405,15 +440,15 @@ class VaultProxy:
                 # трейлеры до пустой строки
                 while True:
                     tl = await asyncio.wait_for(
-                        reader.readuntil(b"\r\n"), timeout=_READ_TIMEOUT
+                        reader.readuntil(b"\r\n"), timeout=self._read_timeout
                     )
                     if tl in (b"\r\n", b"\n"):
                         break
                 return bytes(buf)
             if len(buf) + size > _MAX_BODY:
                 raise VaultProxyError("тело chunked превысило лимит")
-            buf += await asyncio.wait_for(reader.readexactly(size), timeout=_READ_TIMEOUT)
-            await asyncio.wait_for(reader.readexactly(2), timeout=_READ_TIMEOUT)  # CRLF
+            buf += await asyncio.wait_for(reader.readexactly(size), timeout=self._read_timeout)
+            await asyncio.wait_for(reader.readexactly(2), timeout=self._read_timeout)  # CRLF
         # недостижимо
 
     # --- сборка исходящего запроса / ответов ------------------------------
@@ -468,7 +503,7 @@ class VaultProxy:
         ).encode("latin-1")
         writer.write(head + body)
         with suppress(Exception):
-            await writer.drain()
+            await self._drain(writer)  # под таймаутом — не виснем на не-читающем пире
 
     # --- вспомогательное ---------------------------------------------------
 
