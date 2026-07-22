@@ -119,7 +119,12 @@ class GenericBearerConnector:
 
     def in_scope(self, req: HttpReq, scope: dict) -> ScopeVerdict:
         prefixes = list(scope.get("url_prefixes") or [])
-        if not prefixes:
+        # ask_prefixes (§4.6): URL под таким префиксом (и НЕ под обычным
+        # url_prefixes) → ASK — доступ не в скоупе, но расширяем спросом гранта у
+        # оператора. allow-префиксы проверяем ПЕРВЫМИ, так что пересечение
+        # (URL и в url_prefixes, и в ask_prefixes) — тихий ALLOW, спрос не нужен.
+        ask_prefixes = list(scope.get("ask_prefixes") or [])
+        if not prefixes and not ask_prefixes:
             return ScopeVerdict.deny(
                 reason="у секрета не задан scope.url_prefixes — в скоуп не входит ничего",
                 remedy=(
@@ -128,6 +133,7 @@ class GenericBearerConnector:
                     "scope.url_prefixes этого секрета."
                 ),
             )
+        listed = "; ".join(prefixes) or "(нет allow-префиксов)"
         req_c = _canonical(req.url)
         if req_c is None:
             return ScopeVerdict.deny(
@@ -136,12 +142,20 @@ class GenericBearerConnector:
                     "URL не декодируется однозначно (многослойный percent-encoding) — "
                     "кошелёк такой не пропускает. Обратись к сервису обычным URL без "
                     "лишнего кодирования, под разрешёнными префиксами: "
-                    + "; ".join(prefixes) + "."
+                    + listed + "."
                 ),
             )
         if any(_under_prefix(req_c, _canonical_prefix(pref)) for pref in prefixes):
             return ScopeVerdict.allow()
-        listed = "; ".join(prefixes)
+        if any(_under_prefix(req_c, _canonical_prefix(pref)) for pref in ask_prefixes):
+            return ScopeVerdict.ask(
+                descr=(
+                    f"запрос {req.method} к «{req.url}» под ask-префиксом секрета — "
+                    "вне автоматически разрешённого скоупа, но помечен как требующий "
+                    "подтверждения оператора. При подтверждении кошелёк подставит "
+                    "кред и пропустит ИМЕННО этот запрос к сервису."
+                )
+            )
         return ScopeVerdict.deny(
             reason=f"URL «{req.url}» вне выданного скоупа секрета",
             remedy=(

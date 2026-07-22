@@ -11,6 +11,10 @@ manager.get (сессия могла быть удалена после выда
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class OrchestratorVaultHost:
     """VaultHost на ядре оркестратора. Один экземпляр на модуль кошелька."""
@@ -25,6 +29,18 @@ class OrchestratorVaultHost:
         return await self._core.request_confirmation(
             session, tool="wallet", description=description, preview=preview,
         )
+
+    async def ask(self, session_name: str, description: str, preview: str) -> bool:
+        # ЗАГЛУШКА (фаза 2 ASK-flow, vault-сторона): рендер кнопок гранта в
+        # Telegram — следующий (оркестраторный) срез. Пока безопасный дефолт DENY,
+        # чтобы не пропустить ASK без подтверждения (Р0) и не сломать сборку.
+        # TODO(ASK-flow orchestrator): поднять кнопки гранта (эфемерный/persist)
+        # через permission-relay, вернуть вердикт оператора.
+        logger.info(
+            "wallet ask: [%s] %s — ask пока не поддержан (DENY; рендер кнопок в "
+            "след. срезе)", session_name, description,
+        )
+        return False
 
     async def observe(self, session_name: str, line_html: str) -> None:
         # append_background адресуется по имени сессии — резолв не нужен.

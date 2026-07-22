@@ -18,6 +18,13 @@ logger = logging.getLogger("vault.tty")
 
 _TAG = re.compile(r"<[^>]+>")  # снять HTML-разметку из observe-строк для tty
 
+# Таймаут ASK-спроса на tty (Р0: молчание оператора → безопасный дефолт False).
+# confirm остаётся без таймаута (блокирующее подтверждение перед действием), а
+# ASK поднимается посреди HTTP-запроса под прокси — виснуть на нём нельзя.
+_ASK_TIMEOUT = 120.0
+
+_YES = ("y", "yes", "д", "да")
+
 
 class TtyVaultHost:
     """Standalone-хост: confirm через tty, observe/record/notify — в stderr-лог.
@@ -29,9 +36,9 @@ class TtyVaultHost:
     def __init__(self, *, assume_yes: bool = False, log: logging.Logger | None = None) -> None:
         self.assume_yes = assume_yes
         self.log = log or logger
-        # Одна tty на весь демон → confirm'ы сериализуем: без этого конкурентные
-        # add_reader на один fd затирали бы колбэк друг друга и более ранний
-        # запрос висел бы вечно (нашло ревью 1.5).
+        # Одна tty на весь демон → confirm/ask сериализуем ОДНИМ локом: без этого
+        # конкурентные add_reader на один fd затирали бы колбэк друг друга и более
+        # ранний запрос висел бы вечно (нашло ревью 1.5).
         self._confirm_lock = asyncio.Lock()
 
     async def confirm(self, session_name: str, description: str, preview: str) -> bool:
@@ -41,14 +48,45 @@ class TtyVaultHost:
             self.log.warning(
                 "confirm без tty и без --yes → отказ: %s", description)
             return False
+        ans = await self._prompt(f"vault: подтвердить «{description}»?", preview)
+        return ans is not None and ans.strip().lower() in _YES
+
+    async def ask(self, session_name: str, description: str, preview: str) -> bool:
+        """ASK-грант на ЭТОТ запрос (§4.6). Спрашиваем на tty ПО ОБРАЗЦУ confirm
+        (add_reader+lock, отменяемо), но С ТАЙМАУТОМ _ASK_TIMEOUT: ASK поднимается
+        посреди запроса под прокси — молчание оператора не должно висеть, дефолт
+        False (Р0). assume_yes → True; нет tty → False (некому спросить)."""
+        if self.assume_yes:
+            return True
+        if not sys.stdin.isatty():
+            self.log.warning("ask без tty и без --yes → отказ: %s", description)
+            return False
+        ans = await self._prompt(
+            f"vault: РАЗРЕШИТЬ доступ «{description}»?", preview,
+            timeout=_ASK_TIMEOUT,
+        )
+        if ans is None:
+            self.log.warning("ask без ответа (таймаут/отмена) → отказ: %s", description)
+            return False
+        return ans.strip().lower() in _YES
+
+    async def _prompt(
+        self, question: str, preview: str, *, timeout: float | None = None
+    ) -> str | None:
+        """Спросить строку на tty под общим локом (одна tty — по вопросу за раз).
+
+        Возвращает введённую строку либо None (отмена/таймаут — безопасный отказ
+        на стороне вызывающего). Читаем stdin через add_reader (selectors), а НЕ
+        input() в потоке: поток в input() нельзя отменить, и asyncio.run на выходе
+        ждал бы его вечно — SIGINT посреди спроса вешал бы `vault serve`. Здесь
+        чтение async и отменяемо; timeout (для ASK) размыкает молчание (Р0).
+
+        Один общий лок на confirm И ask: обе делят единственную tty, конкурентные
+        add_reader на один fd затирали бы колбэк друг друга и более ранний вопрос
+        висел бы вечно (урок ревью 1.5)."""
         try:
-            # По одному вопросу за раз (одна tty). Читаем stdin через add_reader
-            # (selectors), а НЕ input() в потоке: поток в input() нельзя отменить,
-            # и asyncio.run на выходе ждал бы его вечно — SIGINT посреди confirm
-            # вешал бы `vault serve`. Здесь чтение async и отменяемо: отмена
-            # хендлера (shutdown) или ожидания лока → безопасный отказ.
             async with self._confirm_lock:
-                sys.stderr.write(f"vault: подтвердить «{description}»?\n  {preview}\n[y/N] ")
+                sys.stderr.write(f"{question}\n  {preview}\n[y/N] ")
                 sys.stderr.flush()
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
@@ -65,12 +103,15 @@ class TtyVaultHost:
 
                 loop.add_reader(fd, _readable)
                 try:
-                    ans = await fut
+                    if timeout is None:
+                        return await fut
+                    return await asyncio.wait_for(fut, timeout)
+                except asyncio.TimeoutError:
+                    return None  # молчание → отказ (Р0)
                 finally:
                     loop.remove_reader(fd)
-            return ans.strip().lower() in ("y", "yes", "д", "да")
         except asyncio.CancelledError:
-            return False
+            return None
 
     async def observe(self, session_name: str, line_html: str) -> None:
         self.log.info("[%s] %s", session_name, _TAG.sub("", line_html))
