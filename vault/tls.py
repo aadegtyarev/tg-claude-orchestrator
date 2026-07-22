@@ -19,6 +19,7 @@ Leaf-серты кэшируются по host (в памяти и на диск
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import logging
 import os
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 _CA_DAYS = 3650
 _LEAF_DAYS = 30
 _KEY_BITS = 2048
+# Таймаут openssl: MITM-путь синхронный, зависший openssl не должен вешать issue().
+_OPENSSL_TIMEOUT = 30
+# Максимальная длина DNS-имени (RFC 1035), без учёта опц. trailing dot.
+_MAX_DNS_LEN = 253
+_MAX_LABEL_LEN = 63
 
 
 def _default_ca_dir() -> Path:
@@ -43,33 +49,73 @@ def _default_ca_dir() -> Path:
 
 def _run(args: list[str]) -> None:
     """Запустить openssl, подняв понятную ошибку с stderr при сбое."""
-    r = subprocess.run(
-        ["openssl", *args],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["openssl", *args],
+            capture_output=True,
+            text=True,
+            timeout=_OPENSSL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VaultCAError(f"openssl {args[0]} завис (>{_OPENSSL_TIMEOUT}s)") from exc
     if r.returncode != 0:
         raise VaultCAError(
             f"openssl {args[0]} завершился с кодом {r.returncode}:\n{r.stderr.strip()}"
         )
 
 
-def _san_entry(host: str) -> str:
-    """SAN-запись под host: IP:… для адресов, DNS:… для имён (включая wildcard)."""
+def _validate_host(host: str) -> tuple[str, str]:
+    """Строго провалидировать host ДО любой подстановки в openssl-форматы.
+
+    host в проде приходит из ПЕРЕХВАЧЕННОГО запроса (§4.2 — под контролем сети/
+    модели), поэтому подстановка в SAN/subj/NCONF-extfile без валидации — вектор
+    инъекции (запятая в SAN, `${ENV::X}` раскрытие переменных, `/` в subj).
+
+    Принимаем ТОЛЬКО: валидный IP (канонизируем через ipaddress) ЛИБО валидное
+    DNS-имя (≤253; метки 1–63 из [A-Za-z0-9-], не начинать/кончать `-`; опц.
+    trailing dot). Всё прочее (запятая, `$`, `{}`, `/`, `\\n`, пробел, юникод,
+    пусто, `:` кроме IPv6) → VaultCAError. Возвращает (kind, canonical).
+    """
+    if not host or not isinstance(host, str):
+        raise VaultCAError("пустой host")
+    # IP (в т.ч. IPv6 с ':') — канонизируем, чтобы разные записи одного адреса
+    # не плодили разные leaf и совпадали в кэше.
     try:
-        ipaddress.ip_address(host)
-        return f"IP:{host}"
+        return ("ip", str(ipaddress.ip_address(host)))
     except ValueError:
-        return f"DNS:{host}"
+        pass
+    name = host[:-1] if host.endswith(".") else host  # опц. trailing dot
+    if not name or len(name) > _MAX_DNS_LEN:
+        raise VaultCAError(f"host не валидное DNS-имя (длина): {host!r}")
+    labels = name.split(".")
+    for label in labels:
+        if not (1 <= len(label) <= _MAX_LABEL_LEN):
+            raise VaultCAError(f"host: недопустимая длина метки в {host!r}")
+        if label[0] == "-" or label[-1] == "-":
+            raise VaultCAError(f"host: метка начинается/кончается на '-' в {host!r}")
+        if not all(c.isascii() and (c.isalnum() or c == "-") for c in label):
+            raise VaultCAError(f"host: недопустимый символ в {host!r}")
+    return ("dns", host)
 
 
-def _slug(host: str) -> str:
-    """Безопасное имя файла из host (wildcard/двоеточия/слэши → подчёркивание)."""
-    return "".join(c if c.isalnum() or c in ".-" else "_" for c in host)
+def _san_entry(kind: str, value: str) -> str:
+    """SAN-запись из УЖЕ провалидированного host: IP:… либо DNS:…."""
+    return f"IP:{value}" if kind == "ip" else f"DNS:{value}"
+
+
+def _cache_name(canonical: str) -> str:
+    """Имя файла кэша БЕЗ потерь: хеш канонизированного host + читаемый префикс.
+
+    Хеш гарантирует, что разные host НИКОГДА не делят файл (IPv6 содержит ':',
+    негодный для имени файла). Префикс — только для читаемости каталога.
+    """
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    prefix = "".join(c if c.isalnum() or c in ".-" else "_" for c in canonical)[:40]
+    return f"{prefix}-{digest}"
 
 
 class VaultCAError(RuntimeError):
-    """Сбой при генерации/выпуске сертификата (обёртка над ошибкой openssl)."""
+    """Сбой при валидации/генерации/выпуске сертификата."""
 
 
 @dataclass(frozen=True)
@@ -132,19 +178,26 @@ class VaultCA:
     # --- leaf --------------------------------------------------------------
 
     def issue(self, host: str) -> LeafCert:
-        """Выпустить (или отдать из кэша) leaf-серт на host, подписанный корнем."""
-        cached = self._leaf_cache.get(host)
+        """Выпустить (или отдать из кэша) leaf-серт на host, подписанный корнем.
+
+        host валидируется СТРОГО ДО любой подстановки (см. _validate_host); всё
+        подозрительное → VaultCAError, при этом НИЧЕГО не выпускается/не пишется.
+        Кэш и имя файла — по канонизированному host.
+        """
+        kind, canonical = _validate_host(host)
+
+        cached = self._leaf_cache.get(canonical)
         if cached is not None:
             return cached
 
-        slug = _slug(host)
-        cert_path = self.leaf_dir / f"{slug}.crt"
-        key_path = self.leaf_dir / f"{slug}.key"
+        name = _cache_name(canonical)
+        cert_path = self.leaf_dir / f"{name}.crt"
+        key_path = self.leaf_dir / f"{name}.key"
 
         # На диске уже есть — переиспользуем (стабильный серт между рестартами).
         if cert_path.exists() and key_path.exists():
-            leaf = LeafCert(host=host, cert_path=cert_path, key_path=key_path)
-            self._leaf_cache[host] = leaf
+            leaf = LeafCert(host=canonical, cert_path=cert_path, key_path=key_path)
+            self._leaf_cache[canonical] = leaf
             return leaf
 
         with tempfile.TemporaryDirectory(prefix="vault_leaf_") as td:
@@ -152,7 +205,7 @@ class VaultCA:
             csr = tmp / "leaf.csr"
             ext = tmp / "leaf.ext"
             ext.write_text(
-                f"subjectAltName={_san_entry(host)}\n"
+                f"subjectAltName={_san_entry(kind, canonical)}\n"
                 "basicConstraints=critical,CA:FALSE\n"
                 "keyUsage=critical,digitalSignature,keyEncipherment\n"
                 "extendedKeyUsage=serverAuth\n"
@@ -161,7 +214,7 @@ class VaultCA:
                 "req", "-new", "-newkey", f"rsa:{_KEY_BITS}", "-nodes",
                 "-keyout", str(key_path),
                 "-out", str(csr),
-                "-subj", f"/CN={host}",
+                "-subj", f"/CN={canonical}",
             ])
             _run([
                 "x509", "-req", "-in", str(csr),
@@ -174,7 +227,7 @@ class VaultCA:
         os.chmod(key_path, 0o600)
         os.chmod(cert_path, 0o644)
 
-        leaf = LeafCert(host=host, cert_path=cert_path, key_path=key_path)
-        self._leaf_cache[host] = leaf
-        logger.info("VaultCA: выпущен leaf на %s", host)
+        leaf = LeafCert(host=canonical, cert_path=cert_path, key_path=key_path)
+        self._leaf_cache[canonical] = leaf
+        logger.info("VaultCA: выпущен leaf на %s", canonical)
         return leaf
