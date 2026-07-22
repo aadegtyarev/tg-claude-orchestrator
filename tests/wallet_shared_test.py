@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from orchestrator.modules.wallet.host import OrchestratorVaultHost  # noqa: E402
 from orchestrator.modules.wallet.module import SecretStore, WalletModule  # noqa: E402
 
 SESSION = SimpleNamespace(name="noos")
@@ -53,6 +54,9 @@ def _mod(store: SecretStore, confirm_ok: bool = True) -> WalletModule:
         bubbles=SimpleNamespace(append_background=bg),
         _record=lambda *a, **k: None,
     )
+    # _auth ходит через core (токены+manager.get); side-effects _handle_get —
+    # через host. Реальный адаптер над фейковым core.
+    m.host = OrchestratorVaultHost(m.core)
     return m
 
 

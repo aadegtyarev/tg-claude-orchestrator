@@ -29,6 +29,7 @@ def _secret(**kw) -> Secret:
 
 def _mod(cwd: Path, secret: Secret) -> WalletModule:
     m = WalletModule.__new__(WalletModule)
+    # _execute берёт cwd из core.manager.effective_cwd(session) и store.load.
     m.core = SimpleNamespace(manager=SimpleNamespace(effective_cwd=lambda s: cwd))
     m.store = SimpleNamespace(load=lambda: {secret.name: secret})
     return m
