@@ -15,6 +15,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Таймаут спроса гранта у оператора. Держим ЗАВЕДОМО ниже страховочного
+# потолка прокси (vault.proxy._ASK_TIMEOUT = 180с), чтобы наш собственный
+# таймаут сработал первым: request_confirmation по истечении гасит кнопки во
+# всех адаптерах (иначе прокси уже вернул бы DENY, а «висящие» ✅/❌ вводили бы
+# оператора в заблуждение). Оператор не ответил → False (DENY, Р0).
+_ASK_CONFIRM_TIMEOUT = 150.0
+
 
 class OrchestratorVaultHost:
     """VaultHost на ядре оркестратора. Один экземпляр на модуль кошелька."""
@@ -31,16 +38,31 @@ class OrchestratorVaultHost:
         )
 
     async def ask(self, session_name: str, description: str, preview: str) -> bool:
-        # ЗАГЛУШКА (фаза 2 ASK-flow, vault-сторона): рендер кнопок гранта в
-        # Telegram — следующий (оркестраторный) срез. Пока безопасный дефолт DENY,
-        # чтобы не пропустить ASK без подтверждения (Р0) и не сломать сборку.
-        # TODO(ASK-flow orchestrator): поднять кнопки гранта (эфемерный/persist)
-        # через permission-relay, вернуть вердикт оператора.
-        logger.info(
-            "wallet ask: [%s] %s — ask пока не поддержан (DENY; рендер кнопок в "
-            "след. срезе)", session_name, description,
+        """Спрос ГРАНТа доступа ВНЕ scope (§4.6 ASK-flow). Рендер — те же кнопки
+        permission-relay, что и confirm, но с текстом, явно маркирующим ЗАПРОС
+        РАСШИРЕНИЯ доступа (🔓 «доступ ВНЕ scope»), чтобы оператор не спутал его
+        со штатным подтверждением команды под секретом. Грант — РАЗОВЫЙ/эфемерный:
+        просто возвращаем вердикт оператора на ЭТОТ запрос; policy не пишем и scope
+        не расширяем.
+
+        description — от коннектора (что за ресурс/почему вне scope); preview —
+        факт запроса (метод+URL), куда уйдёт кред. Значение секрета сюда НЕ
+        приходит и в текст не попадает. Сессия удалена → False (мягкая деградация,
+        как confirm). Таймаут (оператор молчит) → False (Р0).
+
+        TODO(ASK-flow persist): «расширить scope навсегда/на папку» — отдельный
+        UX-срез (третья кнопка + запись в policy); здесь сознательно НЕ делаем.
+        """
+        session = self._core.manager.get(session_name)
+        if session is None:
+            return False
+        return await self._core.request_confirmation(
+            session,
+            tool=self._core.t("wallet_ask_tool"),
+            description=self._core.t("wallet_ask_desc", description=description),
+            preview=preview,
+            timeout=_ASK_CONFIRM_TIMEOUT,
         )
-        return False
 
     async def observe(self, session_name: str, line_html: str) -> None:
         # append_background адресуется по имени сессии — резолв не нужен.

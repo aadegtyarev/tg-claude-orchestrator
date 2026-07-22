@@ -188,6 +188,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "по умолчанию (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "отказано (policy/подтверждение)",
+        "wallet_ask_tool": "wallet 🔓 доступ ВНЕ scope",
+        "wallet_ask_desc": (
+            "модель просит доступ к ресурсу вне разрешённого scope секрета — "
+            "{description}. Разрешить кошельку подставить кред ТОЛЬКО в этот "
+            "запрос? (разовый грант, scope не расширяется)"
+        ),
         "wallet_disabled": "🔐 Кошелёк не подключён (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
@@ -430,6 +436,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "default (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "denied (policy/confirmation)",
+        "wallet_ask_tool": "wallet 🔓 access OUTSIDE scope",
+        "wallet_ask_desc": (
+            "the model requests access to a resource outside the secret's "
+            "allowed scope — {description}. Allow the wallet to inject the "
+            "credential into THIS request only? (one-off grant, scope is not "
+            "expanded)"
+        ),
         "wallet_disabled": "🔐 Wallet not enabled (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
