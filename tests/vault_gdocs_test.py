@@ -160,6 +160,26 @@ def test_allow_content_write_endpoints():
     print("OK in_scope ALLOW: content-write (:batchUpdate/values) для in-scope id")
 
 
+def test_deny_forged_content_write_on_drive_host():
+    conn = GDocsConnector()
+    # Подделка content-write формы на Drive-хосте: у Drive НЕТ files:batchUpdate /
+    # files/<id>/values — это прикрытие переноса/переименования метаданных через
+    # query. Проверка host+marker → форма невалидна → DENY (PATCH метаданных).
+    for req in (
+        _req(
+            f"https://www.googleapis.com/drive/v3/files/{DOC}:batchUpdate?addParents={OUTSIDER}",
+            "PATCH",
+        ),
+        _req(f"https://www.googleapis.com/drive/v3/files/{DOC}/values?name=pwned", "PATCH"),
+        # verb batchUpdate на правильном marker, но на Drive-хосте — тоже DENY
+        _req(f"https://www.googleapis.com/drive/v3/documents/{DOC}:batchUpdate?name=x", "PATCH"),
+    ):
+        v = conn.in_scope(req, SCOPE)
+        assert v.is_deny and v.remedy, req.url
+        assert DOC in v.remedy, req.url
+    print("OK in_scope DENY: подделка content-write формы на Drive-хосте (перенос/переименование)")
+
+
 def test_deny_ambiguous_query_id():
     conn = GDocsConnector()
     # дубль id-ключа (parser differential)
@@ -292,6 +312,7 @@ def main():
     test_deny_dangerous_ops_even_in_scope()
     test_deny_metadata_mutation()
     test_allow_content_write_endpoints()
+    test_deny_forged_content_write_on_drive_host()
     test_deny_ambiguous_query_id()
     test_deny_malformed_ipv6_no_crash()
     test_deny_listing_and_create()

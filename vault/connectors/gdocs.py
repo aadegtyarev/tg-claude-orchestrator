@@ -62,6 +62,15 @@ _COLLECTION_MARKERS = frozenset({"files", "documents", "spreadsheets", "presenta
 # uc?id=, а также устаревшие ?fileId=/?spreadsheetId=/… (проверяются в lowercase).
 _ID_QUERY_KEYS = ("fileid", "spreadsheetid", "presentationid", "documentid", "id")
 
+# Content-write формы (`:batchUpdate`, Sheets `values`) правят СОДЕРЖИМОЕ и потому
+# пропускаются для PATCH/PUT. Но форма проверяется по (host, marker) РЕАЛЬНОГО
+# ресурса, а не по одному имени сегмента: у Drive нет `files:batchUpdate` и
+# `files/<id>/values` — это Docs/Sheets/Slides. Иначе подделанная content-write
+# форма на Drive-хосте (`files/<id>:batchUpdate?addParents=…`) провезла бы перенос
+# метаданных мимо DENY. Неизвестная форма под Google-хостом → не content-write.
+_BATCHUPDATE_HOSTS = frozenset({"docs.googleapis.com", "sheets.googleapis.com", "slides.googleapis.com"})
+_BATCHUPDATE_MARKERS = frozenset({"documents", "spreadsheets", "presentations"})
+
 # Операции ВНЕ «читать/править содержимое» — DENY даже для in-scope id. Это
 # сегмент-действие сразу ПОСЛЕ id (`files/<id>/export`, `.../d/<id>/copy`) либо
 # кастом-verb на самом id-сегменте (`<id>:watch`). Шаринг/экспорт/копия/подписка/
@@ -238,7 +247,18 @@ class GDocsConnector:
         # пропускаем для PATCH/PUT. Всё прочее PATCH/PUT на Drive `files/<id>` —
         # мутация МЕТАДАННЫХ (перенос addParents/removeParents, переименование
         # `?name=`, в корзину `trashed:true`) = эксфильтрация одним запросом → DENY.
-        is_content_write = info["verb"] == "batchupdate" or info["op"] == "values"
+        # Content-write форма валидна ТОЛЬКО на реальном (host, marker) ресурсе —
+        # иначе подделка на Drive-хосте (`files/<id>:batchUpdate`/`files/<id>/values`
+        # с ?addParents=/?name=) провезла бы перенос/переименование мимо DENY.
+        is_content_write = (
+            info["verb"] == "batchupdate"
+            and host in _BATCHUPDATE_HOSTS
+            and info["marker"] in _BATCHUPDATE_MARKERS
+        ) or (
+            info["op"] == "values"
+            and host == "sheets.googleapis.com"
+            and info["marker"] == "spreadsheets"
+        )
         method = req.method.upper()
         danger = None
         if method == "DELETE":
