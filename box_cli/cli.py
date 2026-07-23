@@ -692,7 +692,7 @@ async def main_async(argv: Sequence[str]) -> int:
     arbiter = None if opts.unattended else StdinArbiter(0)
     if opts.wallet is not None:
         from .tty import BoxVaultHost, UnattendedVaultHost
-        from .wallet import WalletError, setup_wallet_intercept
+        from .wallet import WalletError, box_policy_access, setup_wallet_intercept
         if engine != "bwrap":
             sys.stderr.write(
                 "claude-box: --wallet с --engine off: песочницы НЕТ. Модель и так "
@@ -714,7 +714,16 @@ async def main_async(argv: Sequence[str]) -> int:
         secrets_path = opts.secrets or Path(DEFAULT_SECRETS).expanduser()
         # Хост кошелька = кто отвечает на confirm/ASK. Attended — арбитр
         # терминала; unattended — deny+log (§4.6), без таймаутов и без stdin.
-        host = UnattendedVaultHost() if arbiter is None else BoxVaultHost(arbiter)
+        # BoxVaultHost получает PolicyEditor и флаг «можно ли писать policy» — для
+        # третьего исхода ASK «разрешить навсегда» (§4.6). Правка разрешена, если
+        # secrets.toml физически пишется; иначе хост честно предложит только
+        # разовый грант (см. box_policy_access / BoxVaultHost._grant_offer).
+        if arbiter is None:
+            host = UnattendedVaultHost()
+        else:
+            policy, allow_edit = box_policy_access(secrets_path)
+            host = BoxVaultHost(
+                arbiter, policy=policy, allow_policy_edit=allow_edit)
         try:
             intercept = await setup_wallet_intercept(
                 opts.wallet, secrets_path=secrets_path, host=host)
