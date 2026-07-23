@@ -50,6 +50,7 @@ from vault.cli import build_daemon, write_wallet
 from vault.daemon import VaultDaemon
 from vault.inject import proxy_sandbox_env
 from vault.host import VaultHost
+from vault.policy import PolicyEditor
 from vault.proxy_pool import ProxyPoolError, SessionProxyPool
 from vault.secret import Secret
 from vault.shims import SHIM_DIRNAME, install_cli, tool_names, write_shims
@@ -67,6 +68,31 @@ SESSION_NAME = "claude-box"
 # под bwrap $HOME — пустой tmpfs, туда писать бессмысленно; клиент находит файл
 # по WALLET_FILE (bin/wallet смотрит его ПЕРВЫМ, до ~/.wallet.json).
 WALLET_FILE_NAME = "wallet.json"
+
+
+def box_policy_access(secrets_path: Path) -> tuple[PolicyEditor, bool]:
+    """PolicyEditor для ASK-гранта «навсегда» + можно ли писать в secrets.toml.
+
+    Для claude-box правка policy РАЗРЕШЕНА по умолчанию (в отличие от бота с
+    тумблером WALLET_POLICY_EDIT): это файл самого оператора, и оператор сидит в
+    tty — некому и незачем это запрещать. НО правка обязана быть физически
+    возможной: PolicyEditor пишет через временный файл в КАТАЛОГЕ secrets.toml
+    (+ flock на `<файл>.lock` рядом) и os.replace, поэтому нужна запись в каталог;
+    сам файл на RO-носителе/под чужим uid — сигнал «оператор правок здесь не
+    хочет». Если писать нельзя — возвращаем allow=False, и BoxVaultHost честно НЕ
+    предложит «навсегда» (только разовый грант), а не упадёт при попытке записи.
+
+    Редактор возвращаем всегда (он читает файл заново на каждую правку и полезен
+    для сообщений об отзыве); решает лишь второй элемент — разрешена ли запись.
+    """
+    editor = PolicyEditor(secrets_path)
+    parent = secrets_path.parent
+    # Каталог должен пускать на запись (создать tmp/lock) и обход (X). Файла может
+    # ещё не быть — тогда важен только каталог; если файл есть и RO — не предлагаем.
+    allow = os.access(parent, os.W_OK | os.X_OK)
+    if allow and secrets_path.exists() and not os.access(secrets_path, os.W_OK):
+        allow = False
+    return editor, allow
 
 
 class WalletError(Exception):
