@@ -55,6 +55,21 @@ logger = logging.getLogger("claude-box.tty")
 
 _TAG = re.compile(r"<[^>]+>")  # снять HTML-разметку из observe-строк для терминала
 
+# Управляющие/непечатаемые байты (C0 без \t, DEL, C1) — вырезаем из ЛЮБОГО
+# недоверенного текста перед выводом на реальный tty. Иначе модель, управляя URL
+# запроса, протащила бы ESC-последовательности в grant.value (percent-декодируется
+# коннектором) и очистила бы/подрисовала бы экран оператора поверх ASK-вопроса —
+# спуфинг ровно той прозрачности, ради которой ASK и существует (нашло ревью).
+# PolicyEditor такое отклоняет на ЗАПИСИ, но экран подделывается ДО ответа.
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _tty_safe(text: str) -> str:
+    """Обезвредить недоверенный текст для вывода в терминал: убрать управляющие
+    байты (ESC/CR/переводы каретки/C1). \\t и \\n сохраняем — они безопасны и
+    нужны для разметки самого вопроса."""
+    return _CTRL.sub("", text)
+
 # Таймаут вопроса. У TtyVaultHost без таймаута живёт только confirm (там вопрос
 # держит один лишь `vault serve`), здесь же вопрос держит ВЕСЬ терминал сессии:
 # зависший confirm заморозил бы и claude. Поэтому таймаут на обоих — молчание
@@ -199,6 +214,10 @@ class StdinArbiter:
         if not self.start():
             self.log.warning("вопрос без читаемого stdin → отказ: %s", question)
             return ""
+        # question/preview содержат недоверенный текст (descr коннектора, URL
+        # запроса, значение гранта) — обезвреживаем управляющие байты ПЕРЕД
+        # выводом на tty (см. _tty_safe). choices — наш литерал, не трогаем.
+        question, preview = _tty_safe(question), _tty_safe(preview)
         async with self._lock:
             loop = asyncio.get_running_loop()
             fut: asyncio.Future[str] = loop.create_future()
@@ -416,15 +435,21 @@ class BoxVaultHost(_LogVaultHost):
         assert grant is not None  # вариант «a» без гранта не предлагается
         assert self._policy is not None
         try:
-            self._policy.grant_scope(
-                grant.secret, grant.key, grant.value, exist_ok=True)
+            # grant_scope синхронный и ждёт межпроцессный flock (до ~1с при
+            # конкурентной правке secrets.toml из бота/CLI). В event-loop это
+            # заморозило бы ВСЮ сессию, включая PTY-relay — выносим в executor.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self._policy.grant_scope(
+                    grant.secret, grant.key, grant.value, exist_ok=True))
         except (PolicyError, OSError) as e:
             self.log.error(
                 "wallet: постоянный грант НЕ записан (%s.%s += %s): %s",
                 grant.secret, grant.key, grant.value, e)
             sys.stderr.write(
-                f"\r\n(в policy НЕ записано: {e}; доступ выдан только на этот "
-                "запрос)\r\n")
+                f"\r\n(в policy НЕ записано: {_tty_safe(str(e))}; доступ выдан "
+                "только на этот запрос)\r\n")
             sys.stderr.flush()
             return AskResult(granted=True, persisted=False)
         sys.stderr.write(

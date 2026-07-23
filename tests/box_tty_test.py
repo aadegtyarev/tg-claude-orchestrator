@@ -342,6 +342,42 @@ async def test_ask_always_writes_narrow_grant():
         Path(str(secrets) + ".lock").unlink(missing_ok=True)
 
 
+async def test_ask_offer_sanitizes_terminal_control_bytes():
+    """Управляющие байты в grant.value (модель управляет URL запроса, коннектор
+    percent-декодирует путь) НЕ должны попадать на реальный tty: иначе ESC-склейка
+    очистила бы экран и подрисовала фальшивый «безопасный» текст поверх ASK-вопроса
+    (спуфинг прозрачности — нашло ревью). Проверяем, что в напечатанном тексте нет
+    сырых control-байт, хотя грант их «содержит»."""
+    evil = ScopeGrant(
+        key="url_prefixes",
+        # \x1b[2J = очистка экрана, \x1b[3J = скроллбэка, \x07 = звонок, \r = возврат
+        value="https://api.svc/v1/docs/42\x1b[2J\x1b[3JВСЁ-ХОРОШО\x07\r",
+        label="метка\x1b[31mкрасным\x1b[0m",
+        secret="svc",
+    )
+    secrets = _write_secrets()
+    p = _Pty()
+    try:
+        editor, _ = box_policy_access(secrets)
+        arb = StdinArbiter(p.slave, write_bytes=p.sink_write, timeout=2.0)
+        ttymod.setraw(p.slave)
+        arb.start()
+        host = BoxVaultHost(arb, policy=editor, allow_policy_edit=True)
+        # печатаем «n» — нас интересует ТОЛЬКО текст вопроса, не запись
+        _res, text = await _ask_typing(host, p, "n\n".encode(), evil)
+        arb.stop()
+        # ни одного управляющего байта (кроме наших \r\n\t разметки) в выводе
+        bad = [c for c in text if ord(c) < 0x20 and c not in "\r\n\t"] + \
+              [c for c in text if 0x7f <= ord(c) <= 0x9f]
+        assert not bad, f"control-байты утекли на tty: {bad!r}\nтекст={text!r}"
+        assert "\x1b" not in text, "ESC утёк — экран можно подделать"
+        print("OK ASK-инъекция: управляющие байты grant.value обезврежены до вывода")
+    finally:
+        p.close()
+        secrets.unlink(missing_ok=True)
+        Path(str(secrets) + ".lock").unlink(missing_ok=True)
+
+
 async def test_ask_yes_is_once_policy_untouched():
     """«y» при доступной «навсегда» → разовый грант: granted, НЕ persisted, policy
     не тронут (кред уходит только в этот запрос)."""
@@ -509,6 +545,7 @@ def main() -> None:
     asyncio.run(test_box_vault_host_verdicts())
     asyncio.run(test_assume_yes_does_not_ask())
     asyncio.run(test_ask_always_writes_narrow_grant())
+    asyncio.run(test_ask_offer_sanitizes_terminal_control_bytes())
     asyncio.run(test_ask_yes_is_once_policy_untouched())
     asyncio.run(test_ask_no_grant_only_binary())
     asyncio.run(test_ask_policy_edit_disabled_only_binary())
