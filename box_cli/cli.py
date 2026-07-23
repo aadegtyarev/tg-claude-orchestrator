@@ -12,7 +12,12 @@
      и закрывает master; мы джойним его поток).
 
 НЕ в этом срезе (честные заглушки, а не тихий no-op — правило прозрачности):
-`--vm`, `--profile`, `-p`, подкоманды `init`/`profile`/`connect`.
+`--vm`, `-p`, подкоманда `connect` (agent-vm/unattended — отдельные треки).
+
+`--profile <name>` — изолированная идентичность claude (свой CLAUDE_CONFIG_DIR и,
+под bwrap, свой $HOME): модель не видит реальные ~/.claude / ~/.ssh оператора,
+профили не пересекаются. Подкоманды `init`/`profile` управляют каталогами
+профилей. Реализация — box_cli/profiles.py.
 
 `--wallet <secret>` — vault-перехват TLS (Launcher §5.2): под капотом поднимается
 standalone MITM-прокси для прокси-секрета и в песочницу докидывается HTTPS_PROXY +
@@ -51,25 +56,31 @@ class EngineConfig:
 
 
 ENGINES = ("bwrap", "off")
-_STUB_SUBCOMMANDS = ("init", "profile", "connect")
+# init/profile реализованы (диспетчеризуются в subcommand_result до parse_args);
+# connect — заглушка (agent-vm-трек заблокирован).
+_STUB_SUBCOMMANDS = ("connect",)
 # Флаги следующих срезов: распознаём, чтобы дать честный отказ, а не «unknown».
-_STUB_FLAGS = ("--vm", "--profile", "-p")
+_STUB_FLAGS = ("--vm", "-p")
 
 DEFAULT_SECRETS = "~/.config/claude-orchestrator/secrets.toml"
 
 _USAGE = (
-    "claude-box [--engine bwrap|off] [--wallet <секрет> [--secrets <файл>]] "
-    "[-- <аргументы claude>]\n"
+    "claude-box [--engine bwrap|off] [--profile <имя>] "
+    "[--wallet <секрет> [--secrets <файл>]] [-- <аргументы claude>]\n"
     "  Запустить claude (или CLAUDE_BIN) в песочнице и отдать терминал.\n"
     "  --engine bwrap   файловая песочница bubblewrap (по умолчанию)\n"
     "  --engine off     без изоляции\n"
+    "  --profile <имя>  изолированная идентичность claude: свой CLAUDE_CONFIG_DIR\n"
+    "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты\n"
     "  --wallet <секрет> vault-перехват TLS для прокси-секрета: трафик к сервису\n"
     "                   идёт через кошелёк, значение секрета в песочницу не входит\n"
     f"  --secrets <файл> путь к secrets.toml (по умолчанию {DEFAULT_SECRETS})\n"
     "  --               всё, что после, пробрасывается в claude\n"
     "  -h, --help       эта справка\n"
-    "\nНе реализовано в этом срезе (следующие срезы): "
-    "--vm, --profile, -p, init/profile/connect."
+    "\nПодкоманды:\n"
+    "  init <имя>       создать профиль (идемпотентно) и напечатать путь\n"
+    "  profile          список профилей;  profile rm <имя>  удалить профиль\n"
+    "\nНе реализовано (следующие треки): --vm, -p, connect."
 )
 
 
@@ -81,6 +92,7 @@ class Options:
     passthrough: list[str]
     wallet: str | None = None
     secrets: Path | None = None
+    profile: str | None = None  # имя профиля (CLAUDE_CONFIG_DIR/HOME-редирект)
 
 
 class CliError(SystemExit):
@@ -116,13 +128,15 @@ def parse_args(argv: Sequence[str]) -> Options:
 
     if opts and opts[0] in _STUB_SUBCOMMANDS:
         raise CliError(
-            f"подкоманда «{opts[0]}» ещё не реализована (следующие срезы). "
-            "Пока доступен только запуск: claude-box [--engine bwrap|off] [-- …]."
+            f"подкоманда «{opts[0]}» ещё не реализована (agent-vm-трек заблокирован). "
+            "Доступно: запуск claude-box [--engine bwrap|off] [--profile <имя>] "
+            "[-- …], init <имя>, profile."
         )
 
     engine = "bwrap"
     wallet: str | None = None
     secrets: Path | None = None
+    profile: str | None = None
 
     def _value(flag: str, idx: int, inline: str | None) -> tuple[str, int]:
         """Значение флага: из `--flag=val` (inline) либо из следующего аргумента."""
@@ -150,6 +164,9 @@ def parse_args(argv: Sequence[str]) -> Options:
             raw, i = _value("--secrets", i, inline)
             secrets = Path(raw).expanduser()
             continue
+        if key == "--profile":
+            profile, i = _value("--profile", i, inline)
+            continue
         if a in _STUB_FLAGS:
             raise CliError(
                 f"флаг «{a}» ещё не реализован (следующие срезы: "
@@ -163,13 +180,27 @@ def parse_args(argv: Sequence[str]) -> Options:
         raise CliError(f"--engine={engine!r} — допустимо: {' | '.join(ENGINES)}")
     if secrets is not None and wallet is None:
         raise CliError("--secrets имеет смысл только с --wallet <секрет>.")
-    return Options(engine=engine, passthrough=passthrough, wallet=wallet, secrets=secrets)
+    return Options(
+        engine=engine, passthrough=passthrough, wallet=wallet,
+        secrets=secrets, profile=profile,
+    )
 
 
 # ── Сборка запуска ───────────────────────────────────────────────────────────
-def make_engine_runner(engine: str, root: Path) -> Runner:
-    """Раннер Engine (Слой 0) по минимальному конфигу."""
-    config = EngineConfig(sandbox=engine, claude_config_dir=_config_dir_from_env())
+def make_engine_runner(
+    engine: str, root: Path, *, claude_config_dir: Path | None = None,
+) -> Runner:
+    """Раннер Engine (Слой 0) по минимальному конфигу.
+
+    claude_config_dir — куда указывает CLAUDE_CONFIG_DIR (профиль передаёт свой
+    <profile>/.claude). Без него — из окружения. Важно для bwrap: раннер биндит
+    ИМЕННО этот каталог RW; если оставить None у профиля, раннер прибиндил бы
+    реальный ~/.claude оператора (утечка) — поэтому профиль всегда его задаёт.
+    """
+    config = EngineConfig(
+        sandbox=engine,
+        claude_config_dir=claude_config_dir or _config_dir_from_env(),
+    )
     return make_runner(config, root)
 
 
@@ -289,7 +320,30 @@ async def main_async(argv: Sequence[str]) -> int:
     opts = parse_args(argv)
     engine = opts.engine
     root = repo_root()
-    runner = make_engine_runner(engine, root)
+
+    # Профиль (--profile): изолированная идентичность claude. Резолвим ДО раннера,
+    # чтобы передать ему <profile>/.claude как CLAUDE_CONFIG_DIR (иначе раннер
+    # прибиндил бы реальный ~/.claude). env-довесок (CLAUDE_CONFIG_DIR + HOME под
+    # bwrap) и RW-бинд каталога профиля добавляются ниже.
+    profile_env_extra: dict[str, str] = {}
+    profile_rw: list[Path] = []
+    profile_config_dir: Path | None = None
+    if opts.profile is not None:
+        from .profiles import ProfileError, profile_env
+        if engine != "bwrap":
+            sys.stderr.write(
+                "claude-box: --profile без bwrap НЕ изолирует $HOME — модель видит "
+                "реальную домашку оператора; редирект CLAUDE_CONFIG_DIR работает, но "
+                "полную изоляцию профиля даёт только --engine bwrap.\n")
+        try:
+            profile_env_extra, pdir = profile_env(opts.profile, engine=engine)
+        except ProfileError as e:
+            sys.stderr.write(f"claude-box: --profile: {e}\n")
+            return e.code
+        profile_config_dir = pdir / ".claude"
+        profile_rw = [pdir]
+
+    runner = make_engine_runner(engine, root, claude_config_dir=profile_config_dir)
 
     ok, why = runner.preflight()
     if not ok:
@@ -303,13 +357,18 @@ async def main_async(argv: Sequence[str]) -> int:
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     command = [claude_bin, *opts.passthrough]
     env = build_env(engine)
+    # Профиль-редирект поверх окружения (CLAUDE_CONFIG_DIR + HOME под bwrap);
+    # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
+    env.update(profile_env_extra)
 
     # Vault-перехват (--wallet): поднять standalone-прокси ДО песочницы и получить
     # env-довесок (HTTPS_PROXY + CA-bundle) + доп. RW-бинд каталога bundle. Отказ
     # (нет секрета/не прокси/сбой окружения) — честное сообщение + код из WalletError,
     # без трейсбека. Teardown — в finally ниже (снять прокси, снести временный каталог).
     intercept = None
-    extra_rw: list[Path] = []
+    # extra_rw начинается с каталога профиля (RW-бинд src==dst → HOME/CONFIG_DIR
+    # валидны изнутри песочницы); wallet при наличии докидывает свой bundle-каталог.
+    extra_rw: list[Path] = list(profile_rw)
     if opts.wallet is not None:
         from .wallet import WalletError, setup_wallet_intercept
         if engine != "bwrap":
@@ -324,7 +383,7 @@ async def main_async(argv: Sequence[str]) -> int:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
         env.update(intercept.env)
-        extra_rw = intercept.extra_rw
+        extra_rw.extend(intercept.extra_rw)
 
     # try/finally оборачивает ВСЁ после подъёма перехвата (build_argv, замер
     # терминала, запуск) — иначе исключение в этом узком окне утекло бы прокси-порт
@@ -373,8 +432,73 @@ async def main_async(argv: Sequence[str]) -> int:
             await intercept.close()
 
 
+# ── Подкоманды управления профилями ──────────────────────────────────────────
+# init/profile НЕ запускают claude (нет PTY/asyncio) — диспетчеризуются в main до
+# запуска рантайма. Логика профилей — в box_cli.profiles (stdlib, без оркестратора).
+def cmd_init(args: Sequence[str]) -> int:
+    """`init <имя>`: идемпотентно создать профиль и напечатать его путь (код 0)."""
+    from .profiles import ProfileError, ensure_profile
+    if len(args) != 1:
+        raise CliError("init требует ровно один аргумент: init <имя>.")
+    try:
+        path = ensure_profile(args[0])
+    except ProfileError as e:
+        raise CliError(str(e)) from e
+    sys.stdout.write(f"{path}\n")
+    return 0
+
+
+def cmd_profile(args: Sequence[str]) -> int:
+    """`profile` — список профилей; `profile rm <имя>` — удалить каталог профиля."""
+    from .profiles import ProfileError, list_profiles, remove_profile
+    if not args:
+        names = list_profiles()
+        if not names:
+            sys.stdout.write("нет профилей (создай: claude-box init <имя>)\n")
+        else:
+            sys.stdout.write("\n".join(names) + "\n")
+        return 0
+    if args[0] == "rm":
+        if len(args) != 2:
+            raise CliError("profile rm требует имя: profile rm <имя>.")
+        try:
+            path = remove_profile(args[1])
+        except ProfileError as e:
+            raise CliError(str(e)) from e
+        sys.stdout.write(f"удалён профиль: {path}\n")
+        return 0
+    raise CliError(
+        f"неизвестный подарг profile «{args[0]}». Доступно: profile, profile rm <имя>.")
+
+
+def subcommand_result(argv: Sequence[str]) -> int | None:
+    """Если argv — подкоманда, выполнить её и вернуть код; иначе None (запуск claude).
+
+    Подкомандой считаем только первый токен-НЕ-флаг из известного набора, чтобы
+    `--engine`/`--profile …` уходили в обычный разбор parse_args.
+    """
+    if not argv:
+        return None
+    cmd = argv[0]
+    if cmd == "init":
+        return cmd_init(argv[1:])
+    if cmd == "profile":
+        return cmd_profile(argv[1:])
+    if cmd == "connect":
+        # Заглушка: agent-vm-трек заблокирован. Честный отказ (код 2), не no-op.
+        raise CliError(
+            "подкоманда «connect» ещё не реализована (agent-vm-трек заблокирован).")
+    return None
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        sub = subcommand_result(args)
+    except SystemExit as e:  # CliError (код 2) — уже напечатал в stderr
+        return e.code if isinstance(e.code, int) else 2
+    if sub is not None:
+        return sub
     try:
         return asyncio.run(main_async(args))
     except KeyboardInterrupt:
