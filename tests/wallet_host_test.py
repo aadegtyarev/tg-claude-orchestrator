@@ -191,11 +191,18 @@ def _policy_editor():
     import os
     import tempfile
     from orchestrator.modules.wallet.policy import PolicyEditor
-    d = Path(tempfile.mkdtemp(prefix="ask_grant_"))
+    d = Path(tempfile.mkdtemp(prefix="wallet_host_ask_"))
     path = d / "secrets.toml"
     path.write_text(_SRC)
     os.chmod(path, 0o600)
     return PolicyEditor(path), path
+
+
+def _cleanup(path: Path) -> None:
+    """Убрать временный каталог теста (ТОЧНЫЙ путь, созданный им же). Только при
+    успехе: после падения каталог остаётся для разбора."""
+    import shutil
+    shutil.rmtree(path.parent, ignore_errors=True)
 
 
 def _grant(secret="svc", value="https://api.svc/admin/reboot"):
@@ -208,7 +215,7 @@ def test_always_button_offered_and_shows_what_is_written():
     """Есть узкий грант + правка policy включена → третья кнопка предлагается, и
     оператор ВИДИТ в тексте, что именно уйдёт в policy (секрет/ключ/значение)."""
     core, calls = _core(SESSION, choice="allow")
-    ed, _ = _policy_editor()
+    ed, path = _policy_editor()
     h = OrchestratorVaultHost(core, policy=ed, allow_policy_edit=True)
     run(h.ask("dev", "нужен /admin", "POST https://api.svc/admin/reboot", _grant()))
     _, _, desc, _, _, always_label = calls["choice"][0]
@@ -216,6 +223,7 @@ def test_always_button_offered_and_shows_what_is_written():
     assert "wallet_ask_always_offer" in desc
     # Ключевые поля гранта видны ДО нажатия (в фейке t их подставляет kwargs).
     assert "svc" in desc and "url_prefixes" in desc and "api.svc/admin/reboot" in desc
+    _cleanup(path)
     print("OK «навсегда»: кнопка есть, в тексте видно что именно запишется")
 
 
@@ -233,18 +241,20 @@ def test_always_button_hidden_when_policy_edit_off():
     # Фейк-relay без кнопки исход allow_always превращает в deny (как ядро).
     assert bool(res) is False and res.persisted is False
     assert path.read_text() == before, "policy не должна меняться"
+    _cleanup(path)
     print("OK «навсегда»: WALLET_POLICY_EDIT=0 → кнопки нет, policy не тронута")
 
 
 def test_always_button_hidden_without_narrow_grant():
     """Коннектор не дал узкого гранта (grant=None) → кнопки нет и объяснено почему."""
     core, calls = _core(SESSION, choice="allow")
-    ed, _ = _policy_editor()
+    ed, path = _policy_editor()
     h = OrchestratorVaultHost(core, policy=ed, allow_policy_edit=True)
     run(h.ask("dev", "d", "GET https://api.svc/", None))
     _, _, desc, _, _, always_label = calls["choice"][0]
     assert always_label is None
     assert "narrow" in desc, "нет объяснения про невыводимый узкий грант"
+    _cleanup(path)
     print("OK «навсегда»: без узкого гранта кнопки нет, причина названа")
 
 
@@ -265,6 +275,7 @@ def test_always_writes_narrow_grant_and_notifies():
     assert calls["notice"], "оператору не сказали, что записано"
     assert "wallet_ask_written" in calls["notice"][0][1]
     assert calls["record"], "запись гранта не попала в аудит"
+    _cleanup(path)
     print("OK «навсегда»: узкая запись в policy + notice оператору + persisted=True")
 
 
@@ -279,6 +290,7 @@ def test_always_write_failure_is_honest():
     assert bool(res) is True, "разовый доступ оператор уже одобрил"
     assert res.persisted is False, "прокси не должен думать, что грант записан"
     assert calls["notice"] and "wallet_ask_write_failed" in calls["notice"][0][1]
+    _cleanup(path)
     print("OK «навсегда»: сбой записи → честный notice, persisted=False")
 
 
