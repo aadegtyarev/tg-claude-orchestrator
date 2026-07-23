@@ -36,18 +36,42 @@ def _fds() -> set[int]:
 
 # ── parse_args ───────────────────────────────────────────────────────────────
 def test_parse_default_engine_bwrap():
-    engine, passthrough = cli.parse_args([])
-    assert engine == "bwrap"
-    assert passthrough == []
+    opts = cli.parse_args([])
+    assert opts.engine == "bwrap"
+    assert opts.passthrough == []
+    assert opts.wallet is None and opts.secrets is None
 
 
 def test_parse_engine_and_passthrough():
-    engine, passthrough = cli.parse_args(["--engine", "off", "--", "--model", "opus"])
-    assert engine == "off"
-    assert passthrough == ["--model", "opus"]
+    opts = cli.parse_args(["--engine", "off", "--", "--model", "opus"])
+    assert opts.engine == "off"
+    assert opts.passthrough == ["--model", "opus"]
     # форма --engine=off
-    engine2, _ = cli.parse_args(["--engine=off"])
-    assert engine2 == "off"
+    assert cli.parse_args(["--engine=off"]).engine == "off"
+
+
+def test_parse_wallet_and_secrets():
+    """--wallet <секрет> и --secrets <файл>: обе формы (пробел и =)."""
+    opts = cli.parse_args(["--wallet", "svc", "--", "-p", "hi"])
+    assert opts.wallet == "svc"
+    assert opts.passthrough == ["-p", "hi"], "аргументы после -- не трогаем"
+    opts2 = cli.parse_args(["--wallet=svc", "--secrets=/tmp/s.toml"])
+    assert opts2.wallet == "svc"
+    assert opts2.secrets == Path("/tmp/s.toml")
+    # --secrets без --wallet — бессмысленно → отказ код 2.
+    try:
+        cli.parse_args(["--secrets", "/tmp/s.toml"])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("--secrets без --wallet должен упасть")
+    # --wallet без значения → отказ код 2.
+    try:
+        cli.parse_args(["--wallet"])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("--wallet без значения должен упасть")
 
 
 def test_parse_bad_engine_rejected():
@@ -61,7 +85,8 @@ def test_parse_bad_engine_rejected():
 
 def test_parse_stub_flags_and_subcommands_refused():
     # Заглушки: честный отказ (код 2), не тихий no-op и не «unknown».
-    for args in (["--vm"], ["--profile", "work"], ["--wallet", "x"], ["-p", "task"]):
+    # (--wallet больше НЕ заглушка — реализован; см. test_parse_wallet_and_secrets.)
+    for args in (["--vm"], ["--profile", "work"], ["-p", "task"]):
         try:
             cli.parse_args(args)
         except SystemExit as e:
@@ -291,6 +316,7 @@ def test_nonexistent_claude_bin_honest_error():
 def main() -> None:
     test_parse_default_engine_bwrap()
     test_parse_engine_and_passthrough()
+    test_parse_wallet_and_secrets()
     test_parse_bad_engine_rejected()
     test_parse_stub_flags_and_subcommands_refused()
     test_parse_help_exits_zero()

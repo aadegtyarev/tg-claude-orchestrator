@@ -34,8 +34,6 @@ import json
 import logging
 import os
 import shutil
-import ssl
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +41,15 @@ from typing import TYPE_CHECKING
 # оркестратора) — фаза 1 редизайна, docs/ARCHITECTURE-claude-box.md. Модуль
 # здесь — оркестраторный адаптер над ним (провижн/хуки сессий/старт демона).
 from vault.daemon import VaultDaemon
+# Примитивы TLS-перехвата (CA-bundle, атомарная запись, env-довесок, NO_PROXY) —
+# общие с CLI-лончером claude-box (§5.2), одна реализация на обоих потребителей.
+from vault.inject import (
+    atomic_write as _atomic_write,  # локальное имя: симлинк-безопасная запись bundle/.wallet.json
+    build_ca_bundle,
+    merge_no_proxy,
+    proxy_env_vars,
+    system_ca_pem as _system_ca_pem,  # noqa: F401 — ре-экспорт для тестов
+)
 from vault.proxy_pool import ProxyPoolError, SessionProxyPool
 from vault.redact import _redact_text
 from vault.tls import VaultCA, VaultCAError
@@ -75,52 +82,6 @@ SHIM_DIRNAME = ".wallet-bin"
 # системный trust надо СОХРАНИТЬ и лишь ДОБАВИТЬ к нему корень Vault. Публичный
 # серт (0644), ключа CA в песочнице нет (каталог CA — вне allowlist).
 CA_BUNDLE_NAME = ".vault-ca-bundle.crt"
-
-
-def _atomic_write(path: Path, data: str, mode: int) -> None:
-    """Атомарно записать файл в приватный дом сессии БЕЗ следования симлинку.
-
-    session_home смонтирован в песочницу как $HOME (RW) — модель туда пишет и
-    может подложить симлинк на victim-файл (напр. `ln -s ~/.ssh/authorized_keys
-    ~/.vault-ca-bundle.crt`) под именем нашего файла. Прямой `os.open(path,
-    O_TRUNC)` пошёл бы ПО симлинку и затёр цель правами демона (arbitrary write,
-    сандбокс-эскейп). Поэтому пишем во временный файл в ТОЙ ЖЕ директории и
-    `os.replace`: rename(2) заменяет саму запись назначения (в т.ч. симлинк), НЕ
-    разыменовывая её — victim остаётся нетронутым. Права выставляем ДО replace,
-    чтобы файл ни мгновения не жил с более широкими, чем нужно (mkstemp даёт 0600).
-    """
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _system_ca_pem() -> str | None:
-    """PEM системного набора доверенных корней (для объединения с CA Vault).
-
-    Берём файл по умолчанию OpenSSL (Debian/Ubuntu: /etc/ssl/certs/ca-
-    certificates.crt). None — если файл не найден/не читается: тогда перехват
-    НЕ включаем (лучше без перехвата, чем сломать весь TLS урезанным trust-store).
-    """
-    paths = ssl.get_default_verify_paths()
-    candidates = [paths.cafile, paths.openssl_cafile, "/etc/ssl/certs/ca-certificates.crt"]
-    for p in candidates:
-        if p and os.path.exists(p):
-            try:
-                text = Path(p).read_text(encoding="utf-8")
-            except OSError:
-                continue
-            if text.strip():
-                return text
-    return None
 
 
 class WalletModule:
@@ -291,22 +252,14 @@ class WalletModule:
             await self.daemon.stop_session_proxies(session.name)
             return
         proxy_url = f"http://127.0.0.1:{port}"
-        # HTTP_PROXY НЕ ставим намеренно: прокси обслуживает только CONNECT (HTTPS);
-        # plain-HTTP через него получил бы 501. Сервисы под секретом — HTTPS.
-        # NO_PROXY: контрольный трафик самого claude (loopback + хост оркестратора/
-        # прокси-модели) идёт МИМО MITM — иначе одно-проходный форвард (Connection:
-        # close, без h2, лимит тела) ломал бы его egress. Внешние сервисы под
-        # секретом на loopback не попадают, перехват для них сохраняется.
-        no_proxy = self._no_proxy_value()
-        self._proxy_env[session.name] = {
-            "HTTPS_PROXY": proxy_url,
-            "https_proxy": proxy_url,
-            "NO_PROXY": no_proxy,
-            "no_proxy": no_proxy,
-            "SSL_CERT_FILE": ca_path,
-            "REQUESTS_CA_BUNDLE": ca_path,
-            "CURL_CA_BUNDLE": ca_path,
-        }
+        # env-довесок перехвата — общий примитив vault.inject.proxy_env_vars
+        # (HTTPS_PROXY + *_CA_BUNDLE + NO_PROXY). HTTP_PROXY НЕ ставится: прокси
+        # обслуживает только CONNECT (HTTPS). NO_PROXY уводит контрольный трафик
+        # самого claude (loopback + хост оркестратора/прокси-модели) МИМО MITM —
+        # иначе одно-проходный форвард (Connection: close, без h2, лимит тела) ломал
+        # бы его egress. Внешние сервисы под секретом на loopback не попадают.
+        self._proxy_env[session.name] = proxy_env_vars(
+            proxy_url, ca_path, self._no_proxy_value())
         logger.info(
             "wallet: сессия %s → перехват секрета %s через 127.0.0.1:%d (trust %s)",
             session.name, secret_name, port, ca_path)
@@ -317,14 +270,13 @@ class WalletModule:
 
         Возвращаем None, если системный набор корней не найден: тогда указывать
         SSL_CERT_FILE только на CA Vault нельзя (сломало бы прочий TLS)."""
-        system = _system_ca_pem()
-        if system is None:
+        bundle = build_ca_bundle(self.ca)
+        if bundle is None:
             logger.error(
                 "wallet: системный CA-bundle не найден — перехват TLS для сессии %s "
                 "не включён (SSL_CERT_FILE на один Vault CA сломал бы прочий TLS)",
                 session.name)
             return None
-        bundle = system.rstrip("\n") + "\n" + self.ca.ca_cert_pem().rstrip("\n") + "\n"
         path = self.core.manager.session_home(session) / CA_BUNDLE_NAME
         # Атомарно и БЕЗ следования симлинку (модель могла подложить симлинк на
         # victim-файл под этим именем — см. _atomic_write). 0644: публичный серт.
@@ -337,17 +289,9 @@ class WalletModule:
         оркестратора/прокси-модели, слитые с уже заданным оператором NO_PROXY.
         Контрольный трафик claude идёт мимо строгого одно-проходного форвард-
         прокси; внешние сервисы под секретом на loopback не попадают."""
-        hosts = ["127.0.0.1", "localhost", "::1"]
-        for attr in ("orch_host", "guest_orch_host"):
-            h = getattr(self.config, attr, "") or ""
-            if h and h not in hosts:
-                hosts.append(h)
+        extra = [getattr(self.config, attr, "") or "" for attr in ("orch_host", "guest_orch_host")]
         existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-        parts = [p.strip() for p in existing.split(",") if p.strip()]
-        for h in hosts:
-            if h not in parts:
-                parts.append(h)
-        return ",".join(parts)
+        return merge_no_proxy(extra, existing=existing)
 
     def redact_output(self, text: str) -> str:
         """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
