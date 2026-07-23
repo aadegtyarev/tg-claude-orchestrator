@@ -19,6 +19,10 @@
 профили не пересекаются. Подкоманды `init`/`profile` управляют каталогами
 профилей. Реализация — box_cli/profiles.py.
 
+Границы профиля (честно, а не «полная изоляция»): изолируются ФС-идентичность и
+кредлы в окружении (strip_credentials); НЕ изолируются текущий каталог (он всегда
+RW-бинд — запуск из $HOME вернёт домашку) и установка claude (~/.local/... RO).
+
 `--wallet <secret>` — vault-перехват TLS (Launcher §5.2): под капотом поднимается
 standalone MITM-прокси для прокси-секрета и в песочницу докидывается HTTPS_PROXY +
 объединённый CA-bundle, чтобы трафик к сервису под секретом шёл через кошелёк
@@ -71,7 +75,10 @@ _USAGE = (
     "  --engine bwrap   файловая песочница bubblewrap (по умолчанию)\n"
     "  --engine off     без изоляции\n"
     "  --profile <имя>  изолированная идентичность claude: свой CLAUDE_CONFIG_DIR\n"
-    "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты\n"
+    "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты.\n"
+    "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
+    "                   SSH_AUTH_SOCK), остальное окружение хоста наследуется;\n"
+    "                   текущий каталог и установка claude остаются видны\n"
     "  --wallet <секрет> vault-перехват TLS для прокси-секрета: трафик к сервису\n"
     "                   идёт через кошелёк, значение секрета в песочницу не входит\n"
     f"  --secrets <файл> путь к secrets.toml (по умолчанию {DEFAULT_SECRETS})\n"
@@ -169,9 +176,9 @@ def parse_args(argv: Sequence[str]) -> Options:
             continue
         if a in _STUB_FLAGS:
             raise CliError(
-                f"флаг «{a}» ещё не реализован (следующие срезы: "
-                "профили/VM/unattended). Сейчас — запуск в песочнице с "
-                "опциональным --wallet: claude-box [--engine bwrap|off] "
+                f"флаг «{a}» ещё не реализован (треки VM/unattended). Сейчас — "
+                "запуск в песочнице с опциональными --wallet/--profile: "
+                "claude-box [--engine bwrap|off] [--profile <имя>] "
                 "[--wallet <секрет>] [-- …]."
             )
         raise CliError(f"неизвестный аргумент «{a}». См. claude-box --help.")
@@ -217,17 +224,54 @@ def build_argv(
     return runner.wrap(list(command), chdir=cwd, extra_rw=[cwd, *extra_rw])
 
 
-def build_env(engine: str) -> dict[str, str]:
+# Имена env-переменных, которые не должны уезжать в чужую идентичность (--profile).
+# Денилист по подстроке: покрывает ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+# CLAUDE_VM_PROXY_ACCESS_TOKEN, GH_TOKEN, AWS_SECRET_ACCESS_KEY и т.п.
+_CRED_SUBSTRINGS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY",
+                    "CREDENTIAL", "PRIVATE_KEY", "ACCESS_KEY")
+# Точечно: сокет ssh-агента — это ключи оператора, доступные без файлов в $HOME.
+_CRED_EXACT = ("SSH_AUTH_SOCK",)
+
+
+def strip_credentials(env: dict[str, str]) -> list[str]:
+    """Вырезать кредлы оператора из env на месте; вернуть имена вырезанного.
+
+    Профиль изолирует ФС (свой $HOME/CONFIG_DIR), но окружение наследуется от
+    оператора целиком — и там живут его же токены (живой пример: OAuth-токен
+    прокси). Без этой чистки «изолированная идентичность» аутентифицировалась бы
+    как оператор. Денилист, а не allowlist: allowlist сломал бы PATH/локаль/
+    прокси-настройки, от которых зависит запуск; границу честно проговариваем в
+    --help (остальное окружение хоста наследуется).
+    """
+    dropped = [
+        k for k in env
+        if k in _CRED_EXACT or any(s in k.upper() for s in _CRED_SUBSTRINGS)
+    ]
+    for k in dropped:
+        env.pop(k, None)
+    return sorted(dropped)
+
+
+def build_env(engine: str, *, profile: bool = False) -> dict[str, str]:
     """Окружение процесса: копия текущего + TERM; под bwrap вырезаем X/Wayland.
 
     Зеркалит минимум из sessions._start_claude: без $DISPLAY процесс в песочнице
     не дёрнет хостовый GUI (сеть у bwrap общая с хостом, X-сокет достижим).
+
+    profile=True — ещё и чистка кредлов оператора (см. strip_credentials).
     """
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
     if engine == "bwrap":
         for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
             env.pop(var, None)
+    if profile:
+        dropped = strip_credentials(env)
+        if dropped:
+            # Прозрачность: оператор должен видеть, что из окружения убрано.
+            sys.stderr.write(
+                "claude-box: --profile: из окружения убраны кредлы оператора: "
+                + ", ".join(dropped) + "\n")
     return env
 
 
@@ -356,7 +400,7 @@ async def main_async(argv: Sequence[str]) -> int:
     cwd = os.getcwd()
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     command = [claude_bin, *opts.passthrough]
-    env = build_env(engine)
+    env = build_env(engine, profile=opts.profile is not None)
     # Профиль-редирект поверх окружения (CLAUDE_CONFIG_DIR + HOME под bwrap);
     # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
     env.update(profile_env_extra)

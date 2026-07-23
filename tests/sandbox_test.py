@@ -102,12 +102,11 @@ def test_prefix_allowlist():
     s = " ".join(argv)
     # claude_config_dir из конфига — RW (контролируемое значение)
     assert "--bind-try /home/tester/.claude-proxy" in s
-    # .claude.json живёт РЯДОМ с config-dir (config_dir.parent), а не в реальном
-    # $HOME процесса: для прод-оркестратора config_dir под $HOME → адрес тот же,
-    # но при вынесенном config_dir (как здесь /home/tester/.claude-proxy) .claude.json
-    # едет туда же — реальный ~/.claude.json в песочницу НЕ биндится.
-    assert "--bind-try /home/tester/.claude.json" in s
+    # При заданном config_dir отдельного бинда ~/.claude.json НЕТ: claude кладёт
+    # свой .claude.json ВНУТРЬ config-dir, который уже прибинден выше. Реальный
+    # ~/.claude.json оператора в песочницу не попадает.
     assert f"--bind-try {Path.home() / '.claude.json'}" not in s
+    assert "--bind-try /home/tester/.claude.json" not in s
     assert f"--bind-try {work}" in s                       # рабочая папка RW
     assert "--ro-bind-try" in s and "/.local/share/claude" in s  # бинарь RO
     print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
@@ -234,32 +233,36 @@ def _bwrap_rw_paths(claude_config_dir: Path) -> str:
     return " ".join(argv)
 
 
-def test_bwrap_claude_json_tracks_config_dir():
-    """.claude.json биндится РЯДОМ с config-dir (config_dir.parent), а не из реального
-    $HOME. Так прод-путь оркестратора байт-в-байт прежний, а профиль изолируется:
+def test_bwrap_claude_json_only_without_config_dir():
+    """Реальный ~/.claude.json биндится ТОЛЬКО когда config-dir не задан.
+
+    При заданном CLAUDE_CONFIG_DIR claude ведёт свой .claude.json внутри него, и тот
+    уже покрыт биндом самого config_dir; отдельный бинд утащил бы в песочницу
+    постороннее (под профилем — глобальное состояние оператора):
       1) дефолт (config_dir=None) → home/.claude.json (как раньше);
-      2) оркестратор (config_dir под $HOME) → home/.claude.json (как раньше);
-      3) профиль (config_dir=<profile>/.claude) → <profile>/.claude.json, и реального
-         home/.claude.json в биндах НЕТ (утечка глобального состояния закрыта).
+      2) вынесенный config_dir (оркестратор) → бинда нет, файл внутри config_dir;
+      3) профиль (config_dir=<profile>/.claude) → реального home/.claude.json НЕТ.
     """
     home = Path.home()
 
-    # 1) Дефолт: claude_config_dir=None → config_dir=home/.claude → home/.claude.json.
+    # 1) Дефолт: claude_config_dir=None → нужен явный бинд ~/.claude.json.
     s_default = _bwrap_rw_paths(None)
     assert f"--bind-try {home / '.claude.json'}" in s_default
+    assert f"--bind-try {home / '.claude'} " in s_default + " "
 
-    # 2) Оркестратор прод: CLAUDE_CONFIG_DIR под реальным $HOME → тот же home/.claude.json.
+    # 2) Оркестратор: CLAUDE_CONFIG_DIR задан → биндится он сам, отдельного файла нет.
     s_orch = _bwrap_rw_paths(home / ".claude-proxy")
-    assert f"--bind-try {home / '.claude.json'}" in s_orch
+    assert f"--bind-try {home / '.claude-proxy'}" in s_orch
+    assert f"--bind-try {home / '.claude.json'}" not in s_orch
 
-    # 3) Профиль: config_dir вынесен → .claude.json едет в профиль, реальный скрыт.
+    # 3) Профиль: config_dir вынесен → реальный ~/.claude.json скрыт.
     profile = Path("/tmp/box-profiles/work")
     s_profile = _bwrap_rw_paths(profile / ".claude")
-    assert f"--bind-try {profile / '.claude.json'}" in s_profile
+    assert f"--bind-try {profile / '.claude'}" in s_profile
     assert f"--bind-try {home / '.claude.json'}" not in s_profile, (
         "УТЕЧКА: реальный ~/.claude.json биндится в песочницу профиля"
     )
-    print("OK bwrap: .claude.json трекает config-dir (прод не тронут, профиль изолирован)")
+    print("OK bwrap: ~/.claude.json только при пустом config-dir (профиль изолирован)")
 
 
 def main():
@@ -268,7 +271,7 @@ def main():
     test_build_argv_persistent_home()
     test_prefix_off_empty()
     test_prefix_allowlist()
-    test_bwrap_claude_json_tracks_config_dir()
+    test_bwrap_claude_json_only_without_config_dir()
     test_real_isolation()
     test_available_no_bwrap()
     test_available_probe_raises()

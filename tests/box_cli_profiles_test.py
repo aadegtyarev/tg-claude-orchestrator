@@ -239,6 +239,104 @@ def test_profile_off_warns_no_home_isolation():
         assert "не изолирует $home" in err.getvalue().lower()
 
 
+# ── кредлы оператора не уезжают в чужую идентичность ─────────────────────────
+def test_profile_env_strips_operator_credentials():
+    """Профиль изолирует не только ФС, но и кредлы в окружении: иначе «изолированная
+    идентичность» аутентифицировалась бы как оператор (живой репро ревью: OAuth-токен
+    прокси был виден внутри профиля). Не-кредлы (PATH и т.п.) остаются."""
+    env = {
+        "PATH": "/usr/bin", "LANG": "C.UTF-8",
+        "CLAUDE_VM_PROXY_ACCESS_TOKEN": "sk-ant-oat01-secret",
+        "ANTHROPIC_API_KEY": "sk-ant-api-secret",
+        "GH_TOKEN": "ghp_x", "AWS_SECRET_ACCESS_KEY": "aws",
+        "SSH_AUTH_SOCK": "/run/user/1000/keyring/ssh",
+        "MY_PASSWORD": "p", "SOME_CREDENTIALS_FILE": "/x",
+    }
+    dropped = cli.strip_credentials(env)
+    for gone in ("CLAUDE_VM_PROXY_ACCESS_TOKEN", "ANTHROPIC_API_KEY", "GH_TOKEN",
+                 "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "MY_PASSWORD",
+                 "SOME_CREDENTIALS_FILE"):
+        assert gone not in env, f"кредл {gone} утёк в профиль"
+        assert gone in dropped
+    assert env["PATH"] == "/usr/bin" and env["LANG"] == "C.UTF-8"
+
+    # build_env: чистка только под --profile, обычный запуск окружение не трогает.
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with_profile = cli.build_env("bwrap", profile=True)
+        assert "ANTHROPIC_API_KEY" not in with_profile
+        assert "ANTHROPIC_API_KEY" in err.getvalue()  # прозрачность в stderr
+        assert cli.build_env("bwrap")["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+# ── сбои ФС дают честный отказ, а не трейсбек ────────────────────────────────
+def test_fs_errors_are_honest_not_traceback():
+    """CLAUDE_BOX_HOME указывает в ФАЙЛ / профиль занят файлом → ProfileError код 1
+    и внятное сообщение из CLI, а не сырой NotADirectoryError/FileExistsError."""
+    old = os.environ.get("CLAUDE_BOX_HOME")
+    with tempfile.TemporaryDirectory(prefix="box-profiles-fs-") as d:
+        blocker = Path(d) / "notadir"
+        blocker.write_text("я файл")
+        os.environ["CLAUDE_BOX_HOME"] = str(blocker)
+        try:
+            try:
+                profiles.ensure_profile("work")
+                raise AssertionError("ожидался ProfileError")
+            except profiles.ProfileError as e:
+                assert e.code == 1, "сбой среды — код 1 (не 2: ввод-то корректный)"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert cli.main(["init", "work"]) == 2  # CliError печатает и выходит 2
+            assert "work" in err.getvalue()
+            assert "Traceback" not in err.getvalue()
+
+            # Профиль занят файлом → тоже честный отказ.
+            os.environ["CLAUDE_BOX_HOME"] = d
+            (Path(d) / "profiles").mkdir()
+            (Path(d) / "profiles" / "busy").write_text("файл на месте профиля")
+            try:
+                profiles.ensure_profile("busy")
+                raise AssertionError("ожидался ProfileError")
+            except profiles.ProfileError as e:
+                assert e.code == 1
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_BOX_HOME", None)
+            else:
+                os.environ["CLAUDE_BOX_HOME"] = old
+
+
+def test_relative_box_home_is_absolute():
+    """Относительный CLAUDE_BOX_HOME приводится к абсолютному: иначе HOME/CONFIG_DIR
+    и bind в песочницу молча зависели бы от каталога запуска."""
+    old = os.environ.get("CLAUDE_BOX_HOME")
+    os.environ["CLAUDE_BOX_HOME"] = "relhome"
+    try:
+        root = profiles.profiles_root()
+        assert root.is_absolute(), root
+        assert root == Path.cwd() / "relhome" / "profiles"
+    finally:
+        if old is None:
+            os.environ.pop("CLAUDE_BOX_HOME", None)
+        else:
+            os.environ["CLAUDE_BOX_HOME"] = old
+
+
+def test_remove_dangling_symlink_profile():
+    """Битый симлинк-профиль удаляется (иначе имя заклинивало: init его отвергает,
+    а rm говорил «не найден»)."""
+    with isolated_root() as root:
+        (root / "profiles").mkdir(parents=True, exist_ok=True)
+        link = root / "profiles" / "broken"
+        link.symlink_to(root / "nope-does-not-exist")
+        assert profiles.remove_profile("broken") == link
+        assert not link.is_symlink()
+
+
 # ── автономность box_cli.profiles ────────────────────────────────────────────
 def test_profiles_module_is_stdlib_only():
     """box_cli.profiles импортится в СВЕЖЕМ процессе, НЕ затягивая orchestrator
@@ -271,6 +369,10 @@ def main() -> None:
     test_cmd_profile_list_and_rm()
     test_connect_still_stub()
     test_profile_off_warns_no_home_isolation()
+    test_profile_env_strips_operator_credentials()
+    test_fs_errors_are_honest_not_traceback()
+    test_relative_box_home_is_absolute()
+    test_remove_dangling_symlink_profile()
     test_profiles_module_is_stdlib_only()
     print("ALL BOX-CLI-PROFILES OK")
 
