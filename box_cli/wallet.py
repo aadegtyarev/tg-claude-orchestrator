@@ -7,7 +7,7 @@
     в песочницу уходят HTTPS_PROXY + объединённый CA-bundle; кред подставляется
     прокси между машиной и сервисом, в песочницу значение не попадает (§4.2).
   * host/inject-секрет → ШИМЫ: поднимается standalone-демон кошелька
-    (vault.cli.build_daemon + TtyVaultHost) и в песочницу кладётся каталог
+    (vault.cli.build_daemon + хост лончера, см. box_cli/tty.py) и каталог
     PATH-обёрток (vault.shims): модель зовёт `git push`/`gh`/`curl` как обычно, а
     обёртка уходит в `wallet exec` — команда исполняется НА ХОСТЕ с кредом, в
     песочницу возвращается только (отредактированный) вывод. Плюс WALLET_FILE →
@@ -37,6 +37,7 @@ bundle/шимы/wallet.json в проект оператора — сорить 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -48,8 +49,10 @@ from pathlib import Path
 from vault.cli import build_daemon, write_wallet
 from vault.daemon import VaultDaemon
 from vault.inject import proxy_sandbox_env
+from vault.host import VaultHost
 from vault.proxy_pool import ProxyPoolError, SessionProxyPool
-from vault.shims import SHIM_DIRNAME, cli_shim, tool_names, write_shims
+from vault.secret import Secret
+from vault.shims import SHIM_DIRNAME, install_cli, tool_names, write_shims
 from vault.store import SecretStore
 from vault.tls import VaultCA, VaultCAError
 from vault.tty_host import TtyVaultHost
@@ -110,12 +113,20 @@ class WalletIntercept:
 
 async def setup_wallet_intercept(
     secret_name: str, *, secrets_path: Path, session_name: str = SESSION_NAME,
+    host: VaultHost | None = None,
 ) -> WalletIntercept:
     """Поднять кошелёк под один секрет и вернуть WalletIntercept.
 
     Вид секрета решает КАК: прокси-секрет → MITM-перехват TLS, host/inject →
     PATH-шимы над standalone-демоном. Бросает WalletError (с кодом выхода) на
     любой честный отказ; всё уже поднятое при отказе сворачивается (не течём).
+
+    host — реализация VaultHost для confirm/ASK. У claude-box это ОБЯЗАН быть
+    хост, который делит stdin с PTY-relay через арбитра терминала (box_cli.tty.
+    BoxVaultHost): TtyVaultHost вешает СВОЙ add_reader на тот же fd, что и relay,
+    а в finally снимает читателя целиком — после первого же confirm клавиатура в
+    сессии умирала бы навсегда. Дефолт (None → TtyVaultHost) оставлен только для
+    прямых вызовов из тестов/скриптов, где stdin ничей.
     """
     store = SecretStore(secrets_path)
     secret = store.load().get(secret_name)
@@ -130,14 +141,15 @@ async def setup_wallet_intercept(
             code=2)
     if not secret.is_proxy:
         return await setup_wallet_shims(
-            secret_name, store=store, secrets_path=secrets_path,
-            session_name=session_name)
+            secret_name, secret=secret, secrets_path=secrets_path,
+            session_name=session_name, host=host)
     return await _setup_proxy_intercept(
-        secret_name, store=store, session_name=session_name)
+        secret_name, store=store, session_name=session_name, host=host)
 
 
 async def _setup_proxy_intercept(
     secret_name: str, *, store: SecretStore, session_name: str,
+    host: VaultHost | None = None,
 ) -> WalletIntercept:
     """Прокси-секрет: MITM-перехват TLS (env HTTPS_PROXY + CA-bundle)."""
     # Корень CA для MITM. Нет openssl → перехват невозможен (сбой окружения, код 1).
@@ -149,11 +161,10 @@ async def _setup_proxy_intercept(
             code=1) from e
 
     # upstream_ssl НЕ передаём (системный trust): реориджин проверяет НАСТОЯЩИЙ серт
-    # сервиса — импостор под сервис кред не получит (§4.2). host=TtyVaultHost — ASK
-    # спрашивается на tty (самотаймаут → DENY); confirm/ASK на том же tty, что и
-    # relay, для этого среза не удобны (см. лончер), но scope-разрешённый трафик
-    # generic-bearer идёт без вопросов.
-    pool = SessionProxyPool(ca, store, host=TtyVaultHost())
+    # сервиса — импостор под сервис кред не получит (§4.2). host — арбитр терминала
+    # лончера (BoxVaultHost): ASK спрашивается на той же tty, что держит relay, но
+    # через ЕДИНСТВЕННОГО владельца stdin, с эхом и самотаймаутом → DENY.
+    pool = SessionProxyPool(ca, store, host=host or TtyVaultHost())
     try:
         port = await pool.start(session_name, secret_name)
     except ProxyPoolError as e:
@@ -178,6 +189,17 @@ async def _setup_proxy_intercept(
 
 # ── host/inject-секрет: шимы над standalone-демоном ──────────────────────────
 
+async def _stop_quietly(daemon: VaultDaemon) -> None:
+    """Остановить демон, не дав сбою остановки перекрыть исходную ошибку.
+
+    Teardown на пути отказа обязан отработать до конца: если daemon.stop() сам
+    бросит, мы потеряем причину отказа и оставим висеть порт."""
+    try:
+        await daemon.stop()
+    except Exception:  # noqa: BLE001 — teardown не должен ронять честный отказ
+        logger.warning("wallet: сбой остановки демона при сворачивании", exc_info=True)
+
+
 def wallet_cli_path() -> Path:
     """Путь к stdlib-клиенту `wallet` в репозитории. Репозиторий RO-биндится в
     песочницу тем же путём (BwrapRunner биндит root), поэтому файл достижим и
@@ -189,7 +211,8 @@ def build_shim_dir(tmpdir: Path, tools: set[str]) -> Path:
     """Создать каталог шимов внутри tmpdir: обёртки инструментов + сам `wallet`.
 
     Возвращает путь каталога (он же — первый элемент PATH песочницы). Права:
-    каталог 0700, скрипты 0755 (см. vault.shims.write_shims).
+    каталог 0700, скрипты 0755 (см. vault.shims.write_shims). Клиент `wallet` —
+    симлинк на bin/wallet, как в прод-провижне оркестратора (vault.shims.install_cli).
     """
     shim_dir = tmpdir / SHIM_DIRNAME
     write_shims(shim_dir, tools)
@@ -197,14 +220,27 @@ def build_shim_dir(tmpdir: Path, tools: set[str]) -> Path:
     # любом случае: без него шимы бесполезны, а ручной путь `wallet run` нужен.
     shim_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(shim_dir, 0o700)
-    cli = shim_dir / "wallet"
-    cli.write_text(cli_shim(wallet_cli_path()))
-    os.chmod(cli, 0o755)
+    install_cli(shim_dir, wallet_cli_path())
     return shim_dir
 
 
+def sandbox_path(shim_dir: Path) -> str:
+    """PATH песочницы: каталог шимов ПЕРВЫМ, дальше исходный PATH.
+
+    `os.environ.get("PATH", default)` тут был бы багом: дефолт подставляется
+    только когда переменной НЕТ, а ПУСТОЙ (или заканчивающийся на «:») PATH даёт
+    «пустой элемент» — POSIX трактует его как текущий каталог, и в PATH песочницы
+    приезжал бы cwd (там лежит код проекта — `./fake-tool` подхватился бы вместо
+    системного). Поэтому `or` (пустая строка → дефолт) и отсев пустых элементов.
+    """
+    raw = os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    parts = [p for p in raw.split(os.pathsep) if p]
+    return os.pathsep.join([str(shim_dir), *parts])
+
+
 async def setup_wallet_shims(
-    secret_name: str, *, store: SecretStore, secrets_path: Path, session_name: str,
+    secret_name: str, *, secret: Secret, secrets_path: Path, session_name: str,
+    host: VaultHost | None = None,
 ) -> WalletIntercept:
     """host/inject-секрет: поднять standalone-демон и положить в PATH шимы.
 
@@ -217,12 +253,12 @@ async def setup_wallet_shims(
     (демон подбирает секрет по команде сам — так же, как у оркестратора). Шимы же
     ставим только под запрошенный `--wallet <секрет>`: явный запрос оператора, а
     не «всё, что лежит в secrets.toml».
+
+    Секрет приходит УЖЕ загруженным (его достал вызывающий) — повторно парсить
+    secrets.toml незачем: лишний I/O и окно рассинхрона, если файл поменяли между
+    двумя чтениями. secrets_path остаётся — он нужен демону (policy целиком) и
+    сообщениям об ошибке.
     """
-    secret = store.load().get(secret_name)
-    if secret is None:
-        raise WalletError(
-            f"секрет «{secret_name}» не найден в {secrets_path} "
-            "(проверь имя и права файла 0600). См. `vault policy`.", code=2)
     tools = tool_names(secret.effective_commands)
     if not tools:
         raise WalletError(
@@ -231,18 +267,17 @@ async def setup_wallet_shims(
             'инструмента, напр. commands = ["gh", "git"], — тогда claude-box '
             "положит его обёртку в PATH песочницы. См. `vault policy`.", code=2)
 
-    # Демон standalone (TtyVaultHost): confirm/ASK спрашиваются на ТОЙ ЖЕ tty, что
-    # держит relay claude — для секретов с confirm=true это неудобно (вопрос уедет
-    # в терминал под raw-режимом), поэтому такие секреты в claude-box лучше не
-    # использовать. Отказ по умолчанию сохраняется: без tty confirm = DENY.
-    daemon = build_daemon(secrets_path)
+    # Демон standalone. host — арбитр терминала лончера (BoxVaultHost): confirm/ASK
+    # спрашиваются на ТОЙ ЖЕ tty, что держит relay claude, но через единственного
+    # владельца stdin — терминал на время вопроса возвращается в нормальный режим
+    # (эхо), ответ не воруется у claude, а после ответа ввод снова льётся в PTY.
+    # Молчание оператора = DENY по таймауту. Без host (прямой вызов из тестов) —
+    # TtyVaultHost, как у `vault serve`.
+    daemon = build_daemon(secrets_path, host=host)
     try:
         await daemon.start()
     except Exception as e:  # noqa: BLE001 — сбой окружения, честный отказ (код 1)
-        try:
-            await daemon.stop()  # частично поднятый демон не оставляем висеть
-        except Exception:  # noqa: BLE001
-            pass
+        await _stop_quietly(daemon)  # частично поднятый демон не оставляем висеть
         raise WalletError(
             f"демон кошелька не поднят ({e}) — секрет «{secret_name}» недоступен.",
             code=1) from e
@@ -256,15 +291,26 @@ async def setup_wallet_shims(
         wallet_file = tmpdir / WALLET_FILE_NAME
         write_wallet(wallet_file, daemon.url, token, session_name)
         shim_dir = build_shim_dir(tmpdir, tools)
-    except OSError as e:
-        await daemon.stop()
+    except BaseException as e:
+        # ЛЮБОЕ исключение, не только OSError: имя инструмента с NUL-байтом давало
+        # ValueError из write_text, и тогда teardown не отрабатывал — демон
+        # оставался поднятым, временный каталог переживал выход процесса, а
+        # оператор видел сырой трейсбек. Ловим широко (включая CancelledError/
+        # KeyboardInterrupt: свернуться надо и на Ctrl-C), сворачиваем всё и
+        # пробрасываем честный отказ. Внутренний путь tmpdir из сообщения
+        # вырезаем — оператору он ни о чём не говорит, а в лог уходит целиком.
+        await _stop_quietly(daemon)
         shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.warning("wallet: подготовка обёрток провалилась", exc_info=True)
+        if isinstance(e, (KeyboardInterrupt, asyncio.CancelledError)):
+            raise
+        detail = str(e).replace(str(tmpdir), "<временный каталог>") or type(e).__name__
         raise WalletError(
-            f"не удалось подготовить обёртки кошелька ({e}).", code=1) from e
+            f"не удалось подготовить обёртки кошелька для «{secret_name}» ({detail}). "
+            "Проверь commands в secrets.toml и место на диске.", code=1) from e
 
     env = {
-        "PATH": os.pathsep.join(
-            [str(shim_dir), os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")]),
+        "PATH": sandbox_path(shim_dir),
         "WALLET_FILE": str(wallet_file),
     }
     # Прозрачность: оператор должен видеть, что именно завёрнуто (эти команды

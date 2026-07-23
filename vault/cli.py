@@ -22,6 +22,7 @@ import signal
 from pathlib import Path
 
 from .daemon import VaultDaemon
+from .host import VaultHost
 from .policy import PolicyEditor, PolicyError
 from .store import SecretStore
 from .tty_host import TtyVaultHost
@@ -38,10 +39,17 @@ def _secrets_path(raw: str) -> Path:
 
 def build_daemon(
     secrets_path: Path, *, guard_on: bool = True, assume_yes: bool = False,
+    host: VaultHost | None = None,
 ) -> VaultDaemon:
-    """Собрать standalone-демон: store из secrets.toml + tty-host. Без оркестратора.
-    Короткий shutdown_timeout — чтобы SIGINT не ждал зависший confirm-хендлер."""
-    return VaultDaemon(SecretStore(secrets_path), TtyVaultHost(assume_yes=assume_yes),
+    """Собрать standalone-демон: store из secrets.toml + host. Без оркестратора.
+    Короткий shutdown_timeout — чтобы SIGINT не ждал зависший confirm-хендлер.
+
+    host по умолчанию — TtyVaultHost (`vault serve`: stdin ничей, читаем его сами).
+    Вызывающий, который УЖЕ владеет stdin (claude-box держит на нём PTY-relay),
+    обязан передать свой хост: два независимых add_reader на один fd затирают друг
+    друга, и после первого же confirm ввод в сессию умирает."""
+    return VaultDaemon(SecretStore(secrets_path),
+                       host or TtyVaultHost(assume_yes=assume_yes),
                        guard_on=guard_on, shutdown_timeout=2.0)
 
 

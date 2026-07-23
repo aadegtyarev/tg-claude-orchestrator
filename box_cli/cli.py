@@ -32,6 +32,13 @@ RW-бинд — запуск из $HOME вернёт домашку) и уста
     инструменты как обычно, вызов уходит на хост через `wallet exec`.
 В обоих случаях значение секрета в песочницу не попадает. Реализация —
 box_cli/wallet.py.
+
+Кто владеет stdin. Ровно один арбитр (box_cli/tty.py, StdinArbiter): он и релеит
+нажатия в PTY, и задаёт вопросы кошелька (confirm/ASK) — с эхом, с таймаутом
+(нет ответа = отказ) и с возвратом raw-режима после ответа. Двух независимых
+читателей на одном fd тут быть не может: в asyncio второй add_reader затирает
+колбэк первого, а remove_reader снимает читателя целиком — так первый же confirm
+навсегда убивал бы клавиатуру в сессии.
 """
 
 from __future__ import annotations
@@ -49,6 +56,8 @@ from typing import Callable, Iterable, Sequence
 from box.launch import launch
 from box.pty import TERM_COLS, TERM_ROWS
 from orchestrator.runners import Runner, make_runner
+
+from .tty import StdinArbiter
 
 
 # ── Минимальный Engine-конфиг ────────────────────────────────────────────────
@@ -283,24 +292,6 @@ def build_env(engine: str, *, profile: bool = False) -> dict[str, str]:
 
 
 # ── PTY-relay и очистка терминала ────────────────────────────────────────────
-def copy_ready(src_fd: int, dst_fd: int) -> bool:
-    """Скопировать доступную порцию src_fd → dst_fd. False = EOF/ошибка (стоп).
-
-    Логика relay в изоляции — тестируется на pipe/pty-паре без интерактива.
-    """
-    try:
-        data = os.read(src_fd, 65536)
-    except OSError:
-        return False
-    if not data:  # EOF
-        return False
-    try:
-        os.write(dst_fd, data)
-    except OSError:
-        return False
-    return True
-
-
 @contextlib.contextmanager
 def raw_terminal(fd: int):
     """Перевести tty в raw на время блока, гарантированно вернуть настройки.
@@ -329,42 +320,50 @@ async def run(
     stdin_fd: int = 0,
     rows: int = TERM_ROWS,
     cols: int = TERM_COLS,
+    arbiter: StdinArbiter | None = None,
 ) -> int:
     """Поднять argv под PTY, (при interactive) релеить stdin, дождаться кода.
 
     Драйвер box.launch дренирует вывод процесса в on_output и владеет master-fd;
     мы джойним его поток после смерти процесса — так весь вывод дослан, а master
-    закрыт (fd не течёт). Ввод: add_reader на stdin_fd копирует в master
-    процесса; на EOF stdin — снимаем reader, процесс живёт дальше.
+    закрыт (fd не течёт).
+
+    Ввод идёт через АРБИТРА (box_cli.tty.StdinArbiter) — единственного владельца
+    stdin: он вешает один add_reader и льёт байты в master процесса, а на время
+    вопроса кошелька (confirm/ASK) сам переключает терминал и собирает ответ.
+    Никто больше на этот fd читателя не вешает: второй add_reader затирает
+    колбэк, а remove_reader снимает читателя целиком — так ввод в сессию умирал
+    после первого же confirm. arbiter=None — создать своего (тесты/простой запуск).
     """
     handle = await launch(
         argv, cwd=cwd, env=env, on_output=on_output, name="claude-box",
         rows=rows, cols=cols,
     )
-    loop = asyncio.get_running_loop()
-    reader_added = False
-
+    arb = arbiter
     if interactive:
-        def _on_stdin() -> None:
-            if not copy_ready(stdin_fd, handle.pty_master):
-                with contextlib.suppress(Exception):
-                    loop.remove_reader(stdin_fd)
-        try:
-            loop.add_reader(stdin_fd, _on_stdin)
-            reader_added = True
-        except (OSError, ValueError):
-            reader_added = False  # stdin не селектится — просто без relay ввода
+        if arb is None:
+            arb = StdinArbiter(stdin_fd)
+        arb.set_sink(lambda data: _write_all(handle.pty_master, data))
+        arb.start()  # False (fd не селектится) — просто без relay ввода
 
     try:
         await handle.process.wait()
     finally:
-        if reader_added:
-            with contextlib.suppress(Exception):
-                loop.remove_reader(stdin_fd)
+        if arb is not None:
+            arb.stop()
         # Дать драйверу дочитать буфер PTY и закрыть master (иначе fd утечёт).
         handle.driver_thread.join(timeout=5)
 
     return handle.process.returncode or 0
+
+
+def _write_all(fd: int, data: bytes) -> bool:
+    """Записать порцию в fd. False — писать больше некуда (процесс закрыл PTY)."""
+    try:
+        os.write(fd, data)
+    except OSError:
+        return False
+    return True
 
 
 async def main_async(argv: Sequence[str]) -> int:
@@ -421,17 +420,25 @@ async def main_async(argv: Sequence[str]) -> int:
     # extra_rw начинается с каталога профиля (RW-бинд src==dst → HOME/CONFIG_DIR
     # валидны изнутри песочницы); wallet при наличии докидывает свой bundle-каталог.
     extra_rw: list[Path] = list(profile_rw)
+    # Арбитр stdin создаём ЗДЕСЬ — до raw_terminal (он запоминает нормальные
+    # настройки терминала, чтобы возвращать эхо на время вопроса) и до подъёма
+    # кошелька (демону нужен хост, который спрашивает через арбитра).
+    arbiter = StdinArbiter(0)
     if opts.wallet is not None:
+        from .tty import BoxVaultHost
         from .wallet import WalletError, setup_wallet_intercept
         if engine != "bwrap":
             sys.stderr.write(
-                "claude-box: --wallet без bwrap НЕ изолирует $HOME — модель читает "
-                "secrets.toml/окружение напрямую и может обойти обёртки (настоящие "
-                "git/gh лежат дальше в PATH); кошелёк включён, но страхует он "
-                "только вместе с --engine bwrap.\n")
+                "claude-box: --wallet с --engine off: песочницы НЕТ. Модель и так "
+                "работает на хосте оператора без изоляции, а кошелёк ДОБАВЛЯЕТ ей "
+                "поверх этого рабочий аутентифицированный канал (git push/gh с "
+                "реальными кредами) — это расширение прав, а не страховка. "
+                "Кошелёк страхует только вместе с --engine bwrap.\n")
         secrets_path = opts.secrets or Path(DEFAULT_SECRETS).expanduser()
         try:
-            intercept = await setup_wallet_intercept(opts.wallet, secrets_path=secrets_path)
+            intercept = await setup_wallet_intercept(
+                opts.wallet, secrets_path=secrets_path,
+                host=BoxVaultHost(arbiter))
         except WalletError as e:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
@@ -468,6 +475,7 @@ async def main_async(argv: Sequence[str]) -> int:
                 return await run(
                     full_argv, cwd=cwd, env=env, on_output=on_output,
                     interactive=interactive, stdin_fd=stdin_fd, rows=rows, cols=cols,
+                    arbiter=arbiter,
                 )
             except OSError as e:
                 sys.stderr.write(
@@ -479,8 +487,10 @@ async def main_async(argv: Sequence[str]) -> int:
                 sys.stderr.write(f"claude-box: сбой запуска: {e}\n")
                 return 1
     finally:
-        # Снять прокси (порт освобождается) и снести временный каталог bundle —
-        # даже при исключении/Ctrl-C. Не течём.
+        # Снять читатель stdin (кошелёк мог поднять его раньше запуска, спросив
+        # confirm), снять прокси (порт освобождается) и снести временный каталог
+        # bundle — даже при исключении/Ctrl-C. Не течём.
+        arbiter.stop()
         if intercept is not None:
             await intercept.close()
 
