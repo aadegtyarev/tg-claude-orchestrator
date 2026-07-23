@@ -219,18 +219,23 @@ def test_corrupt_file_keeps_last_valid_scope():
     print("OK битый файл: fail-safe — последний валидный scope, без падения и без расширения")
 
 
-# ── 5. исчез файл целиком → тот же fail-safe ─────────────────────
+# ── 5. удалили файл целиком → ЭКСТРЕННЫЙ ОТЗЫВ (не held) ──────────
 
-def test_missing_file_keeps_last_valid_scope():
+def test_deleted_file_revokes_live():
+    """`rm secrets.toml` — экстренный отзыв, действует на лету. Легитимная запись
+    (PolicyEditor: mkstemp+os.replace) атомарна и ENOENT-окна не создаёт, поэтому
+    отсутствие файла = намеренное удаление → доступ отзываем, а не держим снимок
+    (иначе оператор думал бы, что отрубил доступ, а прокси пускал бы — нашло ревью).
+    Отзыв = honest-degrade (пустой scope): хост перестаёт быть «своим», кред не
+    подставляется — сквозной форвард, а не ALLOW."""
     proxy, store, path = _mk()
     assert _decide(proxy, "GET", "https://api.svc/v1/x") == "allow"
-    good = dict(proxy._last_valid_scope)
     path.unlink()
-    assert store.load() == {} and store.last_load_ok is False
-    assert proxy._current_scope() == good
-    assert _decide(proxy, "GET", "https://api.svc/v1/x") == "allow"
+    assert store.load() == {} and store.last_load_ok is True, "удаление ≠ ошибка чтения"
+    assert proxy._current_scope() == {}, "удалённый файл → пустой scope (отзыв)"
+    assert _decide(proxy, "GET", "https://api.svc/v1/x") != "allow", "доступ отозван на лету"
     _cleanup(path)
-    print("OK файл исчез: fail-safe — держим последний валидный scope, не падаем")
+    print("OK файл удалён: экстренный отзыв на лету (не held), доступ снят")
 
 
 # ── 6. секрет исчез из валидного файла → honest degrade ──────────
@@ -325,7 +330,7 @@ def main():
     test_narrowing_scope_denies_live()
     test_own_grant_visible_immediately()
     test_corrupt_file_keeps_last_valid_scope()
-    test_missing_file_keeps_last_valid_scope()
+    test_deleted_file_revokes_live()
     test_secret_gone_from_valid_file_degrades()
     test_secret_changed_connector_or_kind_degrades()
     test_static_mode_without_store_unchanged()
