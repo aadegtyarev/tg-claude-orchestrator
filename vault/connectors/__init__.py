@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from .contract import Connector, HttpReq, ScopeVerdict, with_header
+from .contract import Connector, HttpReq, ScopeGrant, ScopeVerdict, with_header
 from .gdocs import GDocsConnector
 from .generic_bearer import GenericBearerConnector
 
@@ -55,6 +55,7 @@ register(GDocsConnector())
 __all__ = [
     "Connector",
     "HttpReq",
+    "ScopeGrant",
     "ScopeVerdict",
     "with_header",
     "GenericBearerConnector",

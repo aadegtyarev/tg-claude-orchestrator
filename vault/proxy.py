@@ -63,11 +63,12 @@ import asyncio
 import logging
 import ssl
 from contextlib import suppress
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 from .connectors import HttpReq
-from .connectors.contract import Connector, ScopeVerdict
-from .host import VaultHost, deny_remedy
+from .connectors.contract import Connector, ScopeGrant, ScopeVerdict
+from .host import VaultHost, ask_grant, deny_remedy
 from .secret import Secret
 from .tls import VaultCA, VaultCAError
 
@@ -614,22 +615,58 @@ class VaultProxy:
         ЭТОТ запрос. Р0 «не висеть»: host.ask обязан иметь свой таймаут, но
         дополнительно страхуем wait_for'ом (`ask_timeout`); молчание/сбой/некому
         спросить → False (DENY). preview — факт запроса (метод+URL), значение
-        секрета в спрос НЕ передаём."""
+        секрета в спрос НЕ передаём.
+
+        Постоянный грант (§4.6, «навсегда»): хост может ЗАПИСАТЬ узкую запись из
+        `verdict.grant` в policy и сообщить об этом (`AskResult.persisted`) —
+        тогда синхронно расширяем и СВОЙ живой scope (`_apply_grant`), иначе
+        следующий такой же запрос снова поднял бы спрос, хотя в файле грант уже
+        стоит. Имя секрета штампуем здесь: коннектор его не знает, а прокси
+        поднят ровно под один секрет."""
         if self.host is None:
             return False  # standalone-сборка без host — спрашивать некому → DENY
         preview = f"{method} {url}"
+        grant = verdict.grant
+        if grant is not None and not grant.secret:
+            grant = replace(grant, secret=self.secret.name)
         try:
-            granted = await asyncio.wait_for(
-                self.host.ask(self.session_name, verdict.descr or "", preview),
+            result = await asyncio.wait_for(
+                ask_grant(self.host, self.session_name, verdict.descr or "", preview, grant),
                 timeout=self._ask_timeout,
             )
-            return bool(granted)
         except asyncio.TimeoutError:
             logger.info("VaultProxy: ASK без ответа (таймаут) → DENY %s %s", method, url)
             return False
         except Exception:  # noqa: BLE001 — сбой host не должен ронять прокси → DENY
             logger.exception("VaultProxy: host.ask упал → DENY %s %s", method, url)
             return False
+        if result.persisted and grant is not None:
+            self._apply_grant(grant)
+        return bool(result)
+
+    def _apply_grant(self, grant: ScopeGrant) -> None:
+        """Расширить ЖИВОЙ scope записанным в policy грантом (без перезапуска).
+
+        Прокси держит снимок scope, снятый при подъёме (см. proxy_pool), поэтому
+        запись в secrets.toml сама по себе на него не влияет. Дублирование
+        безвредно, но проверяем — иначе повторные гранты пухли бы списком.
+
+        ЧЕСТНОЕ ограничение: прокси ДРУГИХ сессий (или другой прокси того же
+        секрета) о записи не узнают и переспросят до своего перезапуска. Источник
+        правды — файл; синхронизировать все живые прокси = отдельный срез
+        (перечитывание scope по mtime, как SecretStore)."""
+        values = list(self.scope.get(grant.key) or [])
+        if grant.value not in values:
+            values.append(grant.value)
+            self.scope[grant.key] = values
+            # service_hosts выведены из url_prefixes при инициализации: грант на
+            # НОВЫЙ хост без этого не считался бы «своим» для секрета.
+            host = urlsplit(grant.value).hostname
+            if host:
+                self.service_hosts.add(host.lower())
+            logger.info(
+                "VaultProxy: постоянный грант записан в policy и применён к живому "
+                "scope: %s += %s (секрет %s)", grant.key, grant.value, grant.secret)
 
     async def _respond_ask(
         self, writer: asyncio.StreamWriter, verdict: ScopeVerdict

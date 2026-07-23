@@ -5,7 +5,8 @@
                   ~/.wallet.json (url+token) — дальше клиент `wallet` (bin/wallet)
                   работает против него без всякого оркестратора.
   vault policy  — просмотр/правка secrets.toml (PolicyEditor): new/cmd/sessions/
-                  deny/confirm/rm. То же, что `/wallet` в боте, но из терминала.
+                  deny/confirm/scope/rm. То же, что `/wallet` в боте, но из
+                  терминала (в т.ч. отзыв ASK-гранта: `policy scope <имя> -<url>`).
 
 Клиентские команды (ls/run/exec/get/env) остаются в stdlib-only `bin/wallet` —
 он работает и внутри песочницы, где vault-пакет/venv недоступны.

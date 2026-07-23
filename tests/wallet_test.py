@@ -104,6 +104,9 @@ def make_env(tmp: Path):
     config = SimpleNamespace(
         wallet_secrets_file=secrets_file, sandbox="bwrap", sessions_dir=tmp,
         wallet_guard=True,
+        # Тумблер правки policy: модуль отдаёт его VaultHost'у (ASK-грант
+        # «навсегда»). В этом харнесе кошелёк проверяется без ASK — держим off.
+        wallet_policy_edit=False,
     )
     return core, config, home, secrets_file, confirm_answer
 
