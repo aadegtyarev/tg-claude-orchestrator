@@ -44,7 +44,13 @@ class BwrapRunner:
         rw = [
             *extra_rw,
             config_dir,
-            home / ".claude.json",  # глобальное состояние claude (может писаться)
+            # Глобальное состояние claude (может писаться). Живёт РЯДОМ с config-dir,
+            # поэтому берём его из того же базового каталога, а не из реального $HOME:
+            # для дефолта и оркестратора (config_dir под $HOME) адрес байт-в-байт тот
+            # же, а под профилем claude-box (config_dir = <profile>/.claude) едет в
+            # профиль — реальный ~/.claude.json больше не биндится в песочницу (иначе
+            # модель прочла бы глобальное состояние оператора в обход изоляции профиля).
+            config_dir.parent / ".claude.json",
             *self.config.sandbox_extra_rw,
         ]
         ro = [
