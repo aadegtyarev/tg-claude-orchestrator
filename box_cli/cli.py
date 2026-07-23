@@ -12,7 +12,35 @@
      и закрывает master; мы джойним его поток).
 
 НЕ в этом срезе (честные заглушки, а не тихий no-op — правило прозрачности):
-`--vm`, `-p`, подкоманда `connect` (agent-vm/unattended — отдельные треки).
+`-p`, подкоманда `connect` (unattended/коннекторы Vault — отдельные треки).
+
+`--vm` — тот же запуск, но в microVM (Engine agent-vm). Это РОВНО короткая форма
+`--engine agent-vm`: по UX-доку (§5.1) «то же в microVM — ЕДИНСТВЕННОЕ отличие»,
+поэтому оба пути ведут в один и тот же код, а не в две ветки. Одновременное
+`--vm --engine bwrap|off` — честный отказ (код 2), а не молчаливый приоритет
+одного флага над другим: оператор должен узнать, что его просьбу поняли не так.
+
+Границы VM-режима (честно, см. «Проверенные факты» F1/F4/F10 в
+docs/ARCHITECTURE-claude-box.md) — под `--vm` НЕ работают и потому отвергаются:
+  * `--profile` — agent-vm ИГНОРИРУЕТ CLAUDE_CONFIG_DIR и сеет креды из $HOME
+    процесса agent-vm (F4); наш env-редирект под VM был бы враньём. Подмена
+    $HOME сюда не заведена осознанно: по §4.7 она может пересеять отработанный
+    одноразовый refresh-токен и РАЗЛОГИНИТЬ учётку оператора — нужен отдельный
+    живой smoke.
+  * `--wallet` — под VM env в гостя не течёт (F1), а весь egress гостя прозрачно
+    MITM-ит собственный CA agent-vm (F10), т.е. HTTPS_PROXY нашего перехвата
+    просто не сработает; шимов под VM тоже нет (§5.2: git/gh ведёт сам agent-vm).
+    Рабочий путь — `--egress-proxy/--egress-ca` форка agent-vm (раннер их уже
+    умеет), но прокси кошелька слушает 127.0.0.1, а гостю нужен LAN-адрес хоста
+    (F2) — сведение этого в один флаг остаётся следующему срезу.
+
+Что уезжает в гостя под `--vm`: ТОЛЬКО текущий каталог (его монтирует сам
+agent-vm). Корень установки claude-box в VM не монтируется — раннер строится с
+`mount_root=False`. Оркестратору этот mount нужен (в госте из него стартует
+channel_server.py), нам — нет, а у `--mount` в agent-vm нет режима
+только-чтение: гость получил бы запись в код и в `.env` оператора с боевыми
+токенами. Под bwrap корень репозитория, наоборот, нужен (шимы кошелька) и
+биндится только на чтение — там ничего не меняется.
 
 `--profile <name>` — изолированная идентичность claude (свой CLAUDE_CONFIG_DIR и,
 под bwrap, свой $HOME): модель не видит реальные ~/.claude / ~/.ssh оператора,
@@ -49,7 +77,7 @@ import os
 import sys
 import termios
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -62,32 +90,65 @@ from .tty import StdinArbiter
 
 # ── Минимальный Engine-конфиг ────────────────────────────────────────────────
 # make_runner читает только .sandbox; BwrapRunner.wrap — .claude_config_dir,
-# .sandbox_extra_rw, .sandbox_dbus; DirectRunner (off) — ничего. Полный
-# orchestrator.config.Config для этого не нужен (и требовал бы TELEGRAM_BOT_TOKEN
-# и десятки полей UX-оркестратора — это Слой 3). Здесь ровно нужный минимум.
+# .sandbox_extra_rw, .sandbox_dbus; DirectRunner (off) — ничего; AgentVmRunner —
+# .claude_env и группу .agent_vm_* (см. ниже). Полный orchestrator.config.Config
+# для этого не нужен (и требовал бы TELEGRAM_BOT_TOKEN и десятки полей
+# UX-оркестратора — это Слой 3). Здесь ровно нужный минимум.
 @dataclass(frozen=True)
 class EngineConfig:
-    sandbox: str  # "bwrap" | "off"
+    sandbox: str  # "bwrap" | "off" | "agent-vm"
     claude_config_dir: Path | None = None
     sandbox_extra_rw: tuple[Path, ...] = ()
     sandbox_dbus: bool = True
+    # ── agent-vm ────────────────────────────────────────────────────────────
+    # claude_env в standalone CLI ПУСТ: CLAUDE_ENV_* — механизм оркестратора
+    # (он доставляет их в гостя через env-блок settings, F1), а тут никакого
+    # settings-провижна нет. Раннер это переживает без обходных путей:
+    # auth_problem({}) → None (нет своего ANTHROPIC_BASE_URL — значит и
+    # конфликта с кред-прокси agent-vm нет, F3), egress_hosts({}, ip) → []
+    # (открывать гостю адрес хоста незачем, к нам никто не ходит).
+    claude_env: dict[str, str] = field(default_factory=dict)
+    agent_vm_host_ip: str | None = None
+    agent_vm_memory_gib: int | None = None  # целые GiB (agent-vm: --memory <GIB>)
+    agent_vm_cpus: int | None = None
+    agent_vm_image: str | None = None
+    agent_vm_egress_proxy: str | None = None
+    agent_vm_egress_ca: Path | None = None
 
 
-ENGINES = ("bwrap", "off")
+ENGINE_VM = "agent-vm"
+ENGINES = ("bwrap", "off", ENGINE_VM)
 # init/profile реализованы (диспетчеризуются в subcommand_result до parse_args);
-# connect — заглушка (agent-vm-трек заблокирован).
+# connect — заглушка (коннекторы Vault — отдельный трек).
 _STUB_SUBCOMMANDS = ("connect",)
 # Флаги следующих срезов: распознаём, чтобы дать честный отказ, а не «unknown».
-_STUB_FLAGS = ("--vm", "-p")
+_STUB_FLAGS = ("-p",)
 
 DEFAULT_SECRETS = "~/.config/claude-orchestrator/secrets.toml"
 
 _USAGE = (
-    "claude-box [--engine bwrap|off] [--profile <имя>] "
+    "claude-box [--engine bwrap|off|agent-vm | --vm] [--profile <имя>] "
     "[--wallet <секрет> [--secrets <файл>]] [-- <аргументы claude>]\n"
     "  Запустить claude (или CLAUDE_BIN) в песочнице и отдать терминал.\n"
     "  --engine bwrap   файловая песочница bubblewrap (по умолчанию)\n"
     "  --engine off     без изоляции\n"
+    "  --engine agent-vm  microVM (нужны бинарь agent-vm и /dev/kvm)\n"
+    "  --vm             короткая форма --engine agent-vm (то же в microVM).\n"
+    "                   Ресурсы/образ VM — из AGENT_VM_MEMORY_GIB, AGENT_VM_CPUS,\n"
+    "                   AGENT_VM_IMAGE, AGENT_VM_EGRESS_PROXY/CA, AGENT_VM_HOST_IP.\n"
+    "                   Что НЕ сочетается с --vm (запуск откажет с кодом 2, а не\n"
+    "                   сделает вид, что флаг применён):\n"
+    "                     --profile — внутри VM свой claude со своим ~/.claude,\n"
+    "                       и профиль хоста туда не пробросить: agent-vm\n"
+    "                       игнорирует CLAUDE_CONFIG_DIR и держит креды у себя.\n"
+    "                       Нужны профили — запускай без --vm (движок bwrap).\n"
+    "                     --wallet — окружение и наш HTTPS_PROXY в гостя не\n"
+    "                       попадают, а весь его egress расшифровывает сам\n"
+    "                       agent-vm, так что перехват секрета не состоится.\n"
+    "                       Нужен кошелёк — запускай без --vm (движок bwrap).\n"
+    "                   В госте claude ходит в сеть и в git/gh средствами\n"
+    "                   agent-vm; каталог запуска монтируется в VM, ничего\n"
+    "                   другого с хоста туда не уезжает\n"
     "  --profile <имя>  изолированная идентичность claude: свой CLAUDE_CONFIG_DIR\n"
     "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты.\n"
     "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
@@ -103,7 +164,7 @@ _USAGE = (
     "\nПодкоманды:\n"
     "  init <имя>       создать профиль (идемпотентно) и напечатать путь\n"
     "  profile          список профилей;  profile rm <имя>  удалить профиль\n"
-    "\nНе реализовано (следующие треки): --vm, -p, connect."
+    "\nНе реализовано (следующие треки): -p, connect."
 )
 
 
@@ -151,12 +212,14 @@ def parse_args(argv: Sequence[str]) -> Options:
 
     if opts and opts[0] in _STUB_SUBCOMMANDS:
         raise CliError(
-            f"подкоманда «{opts[0]}» ещё не реализована (agent-vm-трек заблокирован). "
-            "Доступно: запуск claude-box [--engine bwrap|off] [--profile <имя>] "
-            "[-- …], init <имя>, profile."
+            f"подкоманда «{opts[0]}» ещё не реализована (коннекторы Vault — "
+            "отдельный трек). Доступно: запуск claude-box "
+            "[--engine bwrap|off|agent-vm | --vm] [--profile <имя>] [-- …], "
+            "init <имя>, profile."
         )
 
-    engine = "bwrap"
+    engine_flag: str | None = None  # что задано явным --engine (None = не задан)
+    vm = False  # был ли --vm (короткая форма --engine agent-vm)
     wallet: str | None = None
     secrets: Path | None = None
     profile: str | None = None
@@ -178,7 +241,13 @@ def parse_args(argv: Sequence[str]) -> Options:
             sys.stdout.write(_USAGE + "\n")
             raise SystemExit(0)
         if key == "--engine":
-            engine, i = _value("--engine", i, inline)
+            engine_flag, i = _value("--engine", i, inline)
+            continue
+        if a == "--vm":
+            # Не отдельный режим, а именно короткая форма --engine agent-vm:
+            # один путь исполнения, одно поведение (§5.1 «единственное отличие»).
+            vm = True
+            i += 1
             continue
         if key == "--wallet":
             wallet, i = _value("--wallet", i, inline)
@@ -199,10 +268,41 @@ def parse_args(argv: Sequence[str]) -> Options:
             )
         raise CliError(f"неизвестный аргумент «{a}». См. claude-box --help.")
 
+    # --vm == --engine agent-vm. Конфликт («--vm --engine bwrap») — честный отказ,
+    # а не молчаливый приоритет: оба флага про одно и то же поле, и угадывать, чего
+    # хотел оператор, значит запустить его НЕ там, где он просил.
+    if vm and engine_flag not in (None, ENGINE_VM):
+        raise CliError(
+            f"--vm и --engine {engine_flag} несовместимы: --vm — это короткая форма "
+            f"--engine {ENGINE_VM}. Оставь что-то одно."
+        )
+    engine = ENGINE_VM if vm else (engine_flag or "bwrap")
+
     if engine not in ENGINES:
         raise CliError(f"--engine={engine!r} — допустимо: {' | '.join(ENGINES)}")
     if secrets is not None and wallet is None:
         raise CliError("--secrets имеет смысл только с --wallet <секрет>.")
+
+    # Границы VM-режима. Отказываем ЗДЕСЬ (код 2), а не «применяем как получится»:
+    # под agent-vm оба флага выглядели бы работающими, ничего при этом не делая, —
+    # это ровно то враньё, которое запрещает правило прозрачности.
+    if engine == ENGINE_VM and profile is not None:
+        raise CliError(
+            "--profile под --vm не работает: agent-vm ИГНОРИРУЕТ CLAUDE_CONFIG_DIR "
+            "и сеет креды из $HOME своего процесса (замер F4). Подмену $HOME мы "
+            "сознательно не включаем: по §4.7 архитектуры она может пересеять "
+            "отработанный одноразовый refresh-токен и разлогинить учётку — нужен "
+            "живой smoke на машине с KVM. Профили работают под --engine bwrap."
+        )
+    if engine == ENGINE_VM and wallet is not None:
+        raise CliError(
+            "--wallet под --vm пока не работает: env процесса в гостя не попадает "
+            "(F1), а весь egress гостя прозрачно MITM-ит собственный CA agent-vm "
+            "(F10) — наш HTTPS_PROXY был бы обойдён; PATH-шимов под VM тоже нет "
+            "(git/gh ведёт сам agent-vm, §5.2). Рабочий путь — --egress-proxy форка "
+            "agent-vm на LAN-адрес хоста (F2), это следующий срез. Сейчас: кошелёк "
+            "под --engine bwrap, либо --vm без --wallet."
+        )
     return Options(
         engine=engine, passthrough=passthrough, wallet=wallet,
         secrets=secrets, profile=profile,
@@ -210,6 +310,43 @@ def parse_args(argv: Sequence[str]) -> Options:
 
 
 # ── Сборка запуска ───────────────────────────────────────────────────────────
+def agent_vm_env_config() -> dict[str, object]:
+    """Поля agent-vm из окружения — ТЕ ЖЕ имена и та же семантика, что в
+    orchestrator/config.py (пустая строка = не задано, `~` разворачивается).
+
+    Единственное расхождение с оркестратором сознательное: `agent_vm_host_ip` мы
+    берём ТОЛЬКО из явного AGENT_VM_HOST_IP и не запускаем автоопределение
+    (`host_lan_ip()` дёргает `ip route`). Причина: раннер использует этот адрес
+    ровно в одном месте — `egress_hosts(claude_env, host_ip)`, чтобы открыть
+    гостю доступ к хостовому прокси оператора; в standalone CLI claude_env пуст,
+    и автоопределение было бы гарантированно мёртвым кодом. Явный оверрайд
+    оставлен — он ничего не стоит и понадобится, когда сюда приедет кошелёк.
+
+    Плохое число (AGENT_VM_CPUS=abc) — честный отказ CLI (код 2), а не трейсбек
+    посреди запуска. Память и vCPU — ЦЕЛЫЕ (agent-vm 0.1.25: «--memory <GIB>»
+    парсится как целое, «2.5» он отвергает — принять дробное значило бы обещать
+    то, чего не будет, и уронить запуск уже внутри agent-vm).
+    """
+    def _num(name: str, cast):
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return cast(raw)
+        except ValueError as e:
+            raise CliError(f"{name}={raw!r} — ожидалось целое число ({e}).") from e
+
+    ca = os.getenv("AGENT_VM_EGRESS_CA", "").strip()
+    return {
+        "agent_vm_memory_gib": _num("AGENT_VM_MEMORY_GIB", int),
+        "agent_vm_cpus": _num("AGENT_VM_CPUS", int),
+        "agent_vm_image": os.getenv("AGENT_VM_IMAGE", "").strip() or None,
+        "agent_vm_host_ip": os.getenv("AGENT_VM_HOST_IP", "").strip() or None,
+        "agent_vm_egress_proxy": os.getenv("AGENT_VM_EGRESS_PROXY", "").strip() or None,
+        "agent_vm_egress_ca": Path(ca).expanduser() if ca else None,
+    }
+
+
 def make_engine_runner(
     engine: str, root: Path, *, claude_config_dir: Path | None = None,
 ) -> Runner:
@@ -219,11 +356,28 @@ def make_engine_runner(
     <profile>/.claude). Без него — из окружения. Важно для bwrap: раннер биндит
     ИМЕННО этот каталог RW; если оставить None у профиля, раннер прибиндил бы
     реальный ~/.claude оператора (утечка) — поэтому профиль всегда его задаёт.
+    (Под agent-vm это поле не читается вообще: F4 — CLAUDE_CONFIG_DIR он
+    игнорирует; поэтому же --profile под --vm отвергается в parse_args.)
+
+    AGENT_VM_* читаем только для agent-vm — «выключено = не существует»: под
+    bwrap/off этих полей в конфиге нет и быть не должно.
+
+    Под agent-vm раннер строим НАПРЯМУЮ, с mount_root=False. Причина в том, что
+    у `--mount` в agent-vm нет режима только-чтение: корень установки
+    claude-box уехал бы в гостя НА ЗАПИСЬ вместе с `.env` оператора (боевые
+    токены). Оркестратору этот mount нужен (в госте из него стартует
+    channel_server.py), standalone CLI — нет: тут ни сессии, ни канала, ни
+    хуков (см. build_argv). Под bwrap корень репозитория, наоборот, нужен и
+    биндится только на чтение — тот путь не трогаем.
     """
     config = EngineConfig(
         sandbox=engine,
         claude_config_dir=claude_config_dir or _config_dir_from_env(),
+        **(agent_vm_env_config() if engine == ENGINE_VM else {}),
     )
+    if engine == ENGINE_VM:
+        from orchestrator.runners.agentvm import AgentVmRunner
+        return AgentVmRunner(config, root, mount_root=False)
     return make_runner(config, root)
 
 
@@ -275,12 +429,21 @@ def build_env(engine: str, *, profile: bool = False) -> dict[str, str]:
     не дёрнет хостовый GUI (сеть у bwrap общая с хостом, X-сокет достижим).
 
     profile=True — ещё и чистка кредлов оператора (см. strip_credentials).
+
+    Под agent-vm убираем AGENT_VM_MEMORY_GIB/AGENT_VM_CPUS: это env-алиасы
+    флагов самого agent-vm, и мы их уже прочитали и превратили во флаги. Оставь
+    мы их в окружении — наша нормализация («мусор/пусто = не задано») стала бы
+    враньём: значение доехало бы до agent-vm, и его парсер упал бы на том, что
+    CLI обещал проигнорировать. Единственный источник истины — наш разбор.
     """
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
     if engine == "bwrap":
         for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
             env.pop(var, None)
+    if engine == ENGINE_VM:
+        from orchestrator.runners.agentvm import strip_own_env
+        strip_own_env(env)
     if profile:
         dropped = strip_credentials(env)
         if dropped:
@@ -395,12 +558,18 @@ async def main_async(argv: Sequence[str]) -> int:
 
     runner = make_engine_runner(engine, root, claude_config_dir=profile_config_dir)
 
+    # Preflight движка. Для agent-vm он и проверяет отсутствие бинаря/KVM (и
+    # egress-флаги форка) — на этой машине это самый частый исход, и оператор
+    # обязан увидеть внятную причину, а не трейсбек и не молчаливый откат в
+    # bwrap: «в VM» и «не в VM» — разные гарантии, подменять их нельзя.
     ok, why = runner.preflight()
     if not ok:
-        sys.stderr.write(
-            f"claude-box: движок «{engine}» не готов: {why}\n"
+        fallback = (
+            "Без microVM: claude-box (bwrap) — файловая песочница на этой машине.\n"
+            if engine == ENGINE_VM else
             "Попробуй --engine off (без изоляции).\n"
         )
+        sys.stderr.write(f"claude-box: движок «{engine}» не готов: {why}\n" + fallback)
         return 1
 
     cwd = os.getcwd()
@@ -548,9 +717,10 @@ def subcommand_result(argv: Sequence[str]) -> int | None:
     if cmd == "profile":
         return cmd_profile(argv[1:])
     if cmd == "connect":
-        # Заглушка: agent-vm-трек заблокирован. Честный отказ (код 2), не no-op.
+        # Заглушка: коннекторы Vault — отдельный трек. Честный отказ (код 2).
         raise CliError(
-            "подкоманда «connect» ещё не реализована (agent-vm-трек заблокирован).")
+            "подкоманда «connect» ещё не реализована (коннекторы Vault — "
+            "отдельный трек).")
     return None
 
 
@@ -564,5 +734,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         return sub
     try:
         return asyncio.run(main_async(args))
+    except SystemExit as e:
+        # CliError изнутри main_async (напр. кривой AGENT_VM_CPUS при сборке
+        # конфига движка) — сообщение уже в stderr; отдаём её код как обычный
+        # результат, чтобы SystemExit не летел сквозь sys.exit(main()).
+        return e.code if isinstance(e.code, int) else 2
     except KeyboardInterrupt:
         return 130

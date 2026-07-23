@@ -84,8 +84,8 @@ def test_parse_bad_engine_rejected():
 
 def test_parse_stub_flags_and_subcommands_refused():
     # Заглушки: честный отказ (код 2), не тихий no-op и не «unknown».
-    # (--wallet/--profile больше НЕ заглушки — реализованы; init/profile — тоже.)
-    for args in (["--vm"], ["-p", "task"]):
+    # (--wallet/--profile/--vm больше НЕ заглушки — реализованы; init/profile тоже.)
+    for args in (["-p", "task"],):
         try:
             cli.parse_args(args)
         except SystemExit as e:

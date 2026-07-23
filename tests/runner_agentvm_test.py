@@ -55,7 +55,10 @@ def main():
         root,
     ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
     s = " ".join(argv)
-    assert "--memory 8G" in s and "--cpus 4" in s and "--image ghcr.io/x:pin" in s
+    # `--memory <GIB>` — ГОЛОЕ число: суффикс «G» agent-vm 0.1.25 отвергает
+    # («invalid value '8G' for '--memory <GIB>'») и VM не поднимается вовсе.
+    assert "--memory 8 " in s + " " and "--memory 8G" not in s, s
+    assert "--cpus 4" in s and "--image ghcr.io/x:pin" in s
     print("OK agent-vm: ресурсы и пин образа из конфига")
 
     # Префикс-режим (/bash): пусто — вторую VM на тот же cwd поднимать нельзя.
@@ -67,6 +70,10 @@ def main():
     assert d.wrap(["x", "y"], chdir=Path("/p"), extra_rw=[]) == ["x", "y"]
     print("OK direct: argv как есть")
 
+    test_root_equal_cwd_not_mounted_twice()
+    test_mount_root_false_drops_repo_mount()
+    test_memory_is_bare_number()
+    test_strip_own_env()
     test_preflight_no_binary()
     test_preflight_no_kvm()
     test_preflight_ok()
@@ -172,6 +179,74 @@ def test_preflight_rejects_missing_ca():
             ok, why = r.preflight()
         assert ok is True, why
     print("OK preflight: отсутствующий --egress-ca отвергается на старте")
+
+
+def test_root_equal_cwd_not_mounted_twice():
+    """root == chdir (standalone claude-box из корня репозитория) → НЕ дублируем
+    --mount: cwd монтирует сам agent-vm и второй том на тот же гостевой путь он
+    отвергает («multiple volumes cannot mount the same guest path»). Поймано живым
+    прогоном `claude-box --vm` в этом репозитории — VM не поднималась вообще."""
+    root = Path("/opt/orch")
+    argv = AgentVmRunner(cfg(), root).wrap(
+        ["claude"], chdir=root, extra_rw=[root, Path("/s")], publish_ports=[])
+    s = " ".join(argv)
+    assert "--mount /opt/orch:/opt/orch" not in s, argv
+    assert "--mount /s:/s" in s, "прочие пути монтируются как раньше"
+    print("OK agent-vm: cwd не монтируется вторым томом (даже если он же root)")
+
+
+def test_mount_root_false_drops_repo_mount():
+    """mount_root=False → корень установки в гостя НЕ монтируется.
+
+    У `--mount` в agent-vm нет режима только-чтение, поэтому корень уехал бы в
+    VM НА ЗАПИСЬ вместе с `.env` оператора. Standalone `claude-box --vm` кода
+    оркестратора в госте не использует (ни канала, ни хуков) — значит и mount
+    ему не нужен. Прод-путь (mount_root по умолчанию) обязан остаться прежним.
+    """
+    root = Path("/opt/orch")
+    argv = AgentVmRunner(cfg(), root, mount_root=False).wrap(
+        ["claude"], chdir=Path("/proj"), extra_rw=[Path("/proj")], publish_ports=[])
+    s = " ".join(argv)
+    assert "--mount /opt/orch:/opt/orch" not in s, argv
+    assert "--mount" not in s, "монтировать в standalone нечего вообще: " + s
+
+    # Явно заданные рабочие пути монтируются и в этом режиме (это не про root).
+    argv = AgentVmRunner(cfg(), root, mount_root=False).wrap(
+        ["claude"], chdir=Path("/proj"), extra_rw=[Path("/proj"), Path("/data")],
+        publish_ports=[])
+    s = " ".join(argv)
+    assert "--mount /data:/data" in s and "--mount /opt/orch" not in s, argv
+
+    # Умолчание (оркестратор) не поехало.
+    s = " ".join(AgentVmRunner(cfg(), root).wrap(
+        ["claude"], chdir=Path("/proj"), extra_rw=[Path("/proj")], publish_ports=[]))
+    assert "--mount /opt/orch:/opt/orch" in s, s
+    print("OK agent-vm: mount_root=False не монтирует корень установки")
+
+
+def test_memory_is_bare_number():
+    """`--memory` — голое число GiB при любом значении, без суффиксов и хвостов."""
+    for gib, want in ((1, "1"), (16, "16"), (64, "64")):
+        argv = AgentVmRunner(cfg(agent_vm_memory_gib=gib), Path("/opt/orch")).wrap(
+            ["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+        got = argv[argv.index("--memory") + 1]
+        assert got == want, got
+    print("OK agent-vm: --memory без суффикса")
+
+
+def test_strip_own_env():
+    """Переменные-алиасы флагов agent-vm вычищаются из окружения ребёнка.
+
+    Иначе наша нормализация («пусто/мусор = не задано») врёт: agent-vm прочитал
+    бы AGENT_VM_CPUS= сам и упал бы на «cannot parse integer from empty string».
+    AGENT_VM_IMAGE трогать нельзя — agent-vm читает AGENT_VM_IMAGE_TAG.
+    """
+    from orchestrator.runners.agentvm import strip_own_env
+    env = {"AGENT_VM_CPUS": "", "AGENT_VM_MEMORY_GIB": "abc",
+           "AGENT_VM_IMAGE": "ghcr.io/x:pin", "PATH": "/usr/bin"}
+    strip_own_env(env)
+    assert env == {"AGENT_VM_IMAGE": "ghcr.io/x:pin", "PATH": "/usr/bin"}, env
+    print("OK agent-vm: AGENT_VM_CPUS/MEMORY_GIB не текут в дочерний процесс")
 
 
 def test_preflight_no_binary():
