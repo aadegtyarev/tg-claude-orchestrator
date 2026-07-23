@@ -67,6 +67,7 @@ def main():
     assert d.wrap(["x", "y"], chdir=Path("/p"), extra_rw=[]) == ["x", "y"]
     print("OK direct: argv как есть")
 
+    test_root_equal_cwd_not_mounted_twice()
     test_preflight_no_binary()
     test_preflight_no_kvm()
     test_preflight_ok()
@@ -172,6 +173,20 @@ def test_preflight_rejects_missing_ca():
             ok, why = r.preflight()
         assert ok is True, why
     print("OK preflight: отсутствующий --egress-ca отвергается на старте")
+
+
+def test_root_equal_cwd_not_mounted_twice():
+    """root == chdir (standalone claude-box из корня репозитория) → НЕ дублируем
+    --mount: cwd монтирует сам agent-vm и второй том на тот же гостевой путь он
+    отвергает («multiple volumes cannot mount the same guest path»). Поймано живым
+    прогоном `claude-box --vm` в этом репозитории — VM не поднималась вообще."""
+    root = Path("/opt/orch")
+    argv = AgentVmRunner(cfg(), root).wrap(
+        ["claude"], chdir=root, extra_rw=[root, Path("/s")], publish_ports=[])
+    s = " ".join(argv)
+    assert "--mount /opt/orch:/opt/orch" not in s, argv
+    assert "--mount /s:/s" in s, "прочие пути монтируются как раньше"
+    print("OK agent-vm: cwd не монтируется вторым томом (даже если он же root)")
 
 
 def test_preflight_no_binary():

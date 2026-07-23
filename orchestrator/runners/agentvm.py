@@ -165,7 +165,16 @@ class AgentVmRunner:
                 out += ["--egress-ca", str(self.config.agent_vm_egress_ca)]
         for port in publish_ports:
             out += ["--publish", f"{port}:{port}"]
-        mounts = {str(self.root), *(str(p) for p in extra_rw if p != chdir)}
+        # cwd монтирует сам agent-vm — второй --mount на тот же гостевой путь он
+        # отвергает («multiple volumes cannot mount the same guest path») ещё до
+        # загрузки образа. Отсеиваем chdir из ВСЕГО набора, включая root: у
+        # оркестратора репозиторий и рабочий каталог сессии разные, а у
+        # standalone `claude-box` из корня самого репозитория они совпадают —
+        # и запуск падал (поймано живым прогоном --vm).
+        mounts = {
+            m for m in {str(self.root), *(str(p) for p in extra_rw)}
+            if m != str(chdir)
+        }
         for m in sorted(mounts):
             out += ["--mount", f"{m}:{m}"]
         if self.config.agent_vm_memory_gib:
