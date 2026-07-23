@@ -75,6 +75,19 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def _ask_and_drain(h, *args):
+    """ASK + дождаться фоновой доставки notice в ТОМ ЖЕ loop.
+
+    notice уходит фоновой задачей (host не блокирует вердикт на доставке — см.
+    _persist_grant), поэтому проверять calls["notice"] сразу после ask нельзя:
+    задача ещё не прокрутилась. Дренируем её здесь."""
+    res = await h.ask(*args)
+    pending = list(getattr(h, "_notify_tasks", ()) or ())
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return res
+
+
 def test_live_session_proxies_to_core():
     core, calls = _core(SESSION)
     h = OrchestratorVaultHost(core)
@@ -234,7 +247,7 @@ def test_always_button_hidden_when_policy_edit_off():
     ed, path = _policy_editor()
     before = path.read_text()
     h = OrchestratorVaultHost(core, policy=ed, allow_policy_edit=False)
-    res = run(h.ask("dev", "d", "POST https://api.svc/admin/reboot", _grant()))
+    res = run(_ask_and_drain(h, "dev", "d", "POST https://api.svc/admin/reboot", _grant()))
     _, _, desc, _, _, always_label = calls["choice"][0]
     assert always_label is None, "кнопка не должна появляться при выключенной правке"
     assert "wallet_ask_always_off" in desc and "disabled" in desc
@@ -264,7 +277,7 @@ def test_always_writes_narrow_grant_and_notifies():
     core, calls = _core(SESSION, choice="allow_always")
     ed, path = _policy_editor()
     h = OrchestratorVaultHost(core, policy=ed, allow_policy_edit=True)
-    res = run(h.ask("dev", "d", "POST https://api.svc/admin/reboot", _grant()))
+    res = run(_ask_and_drain(h, "dev", "d", "POST https://api.svc/admin/reboot", _grant()))
     assert bool(res) is True and res.persisted is True
     text = path.read_text()
     prefixes = [ln for ln in text.splitlines() if ln.startswith("url_prefixes")][0]
@@ -286,7 +299,7 @@ def test_always_write_failure_is_honest():
     ed, path = _policy_editor()
     path.unlink()                      # файла нет → секрет не найден → PolicyError
     h = OrchestratorVaultHost(core, policy=ed, allow_policy_edit=True)
-    res = run(h.ask("dev", "d", "POST https://api.svc/admin/reboot", _grant()))
+    res = run(_ask_and_drain(h, "dev", "d", "POST https://api.svc/admin/reboot", _grant()))
     assert bool(res) is True, "разовый доступ оператор уже одобрил"
     assert res.persisted is False, "прокси не должен думать, что грант записан"
     assert calls["notice"] and "wallet_ask_write_failed" in calls["notice"][0][1]

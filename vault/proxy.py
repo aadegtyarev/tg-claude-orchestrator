@@ -629,6 +629,19 @@ class VaultProxy:
         grant = verdict.grant
         if grant is not None and not grant.secret:
             grant = replace(grant, secret=self.secret.name)
+        # Таймаут-вотчдог оборачивает ВЕСЬ ask_grant (ожидание клика + запись в
+        # policy + notice оператору) — но через shield: истечение бюджета НЕ
+        # обрывает уже начатую работу хоста. Иначе возникала гонка (нашло ревью):
+        # оператор кликает «навсегда» у самой границы бюджета, хост успевает
+        # записать грант в secrets.toml, но CancelledError из wait_for рвёт ask
+        # ДО возврата — грант в файле есть, а этот запрос получает DENY, живой
+        # scope не расширяется и оператор не уведомлён (ровно тот исход, который
+        # _persist_grant клялся исключить). Условие «нет гонки»: host ОБЯЗАН
+        # вернуть вердикт сразу после записи гранта, не блокируясь на доставке
+        # notice оператору (наш OrchestratorVaultHost шлёт notice фоном — см. его
+        # _persist_grant). Тогда ask_grant успевает вернуться в бюджет ask_timeout,
+        # и запись+DENY-гонка не возникает; watchdog остаётся простой страховкой
+        # Р0 от host, который завис на самом ожидании клика.
         try:
             result = await asyncio.wait_for(
                 ask_grant(self.host, self.session_name, verdict.descr or "", preview, grant),

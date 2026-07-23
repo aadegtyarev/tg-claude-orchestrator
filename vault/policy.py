@@ -313,6 +313,15 @@ class PolicyEditor:
             raise PolicyError(
                 "URL-префикс сравнивается буквально — глоб-символы (*, ?, []) в нём "
                 "не работают; укажи полный префикс вида https://api.svc/v1/x")
+        # Управляющие символы и backtick в URL аномальны (в ASK-гранте значение
+        # приходит из URL запроса, которым управляет модель). Запрет их прямо на
+        # записи закрывает разом две вещи: перевод строки/`%0a` не расщепит
+        # secrets.toml, а backtick не исказит markdown-notice оператору и
+        # копируемую команду отзыва (нашло ревью). Легитимный URL их не содержит.
+        if "`" in value or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+            raise PolicyError(
+                "URL-префикс содержит управляющие символы или backtick — "
+                "недопустимо для записи в policy")
         parts = urlsplit(value)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise PolicyError(

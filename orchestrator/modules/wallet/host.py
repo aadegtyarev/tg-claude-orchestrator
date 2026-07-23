@@ -18,6 +18,7 @@ WALLET_POLICY_EDIT и от способа доставки кнопок (permiss
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from vault.connectors.contract import ScopeGrant
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 # всех адаптерах (иначе прокси уже вернул бы DENY, а «висящие» ✅/❌ вводили бы
 # оператора в заблуждение). Оператор не ответил → False (DENY, Р0).
 _ASK_CONFIRM_TIMEOUT = 150.0
+
+# Потолок доставки notice оператору. Клик (150с) + запись + notice обязаны
+# укладываться в потолок прокси (180с), иначе висящий адаптер обрубил бы уже
+# успешную запись гранта. 150 + ~1 + 15 < 180 — с запасом.
+_NOTIFY_TIMEOUT = 15.0
 
 
 class OrchestratorVaultHost:
@@ -52,6 +58,10 @@ class OrchestratorVaultHost:
         self._core = core
         self._policy = policy
         self._allow_policy_edit = allow_policy_edit
+        # Фоновые задачи доставки notice: держим ссылки, чтобы их не собрал GC до
+        # завершения (см. _persist_grant — notice уходит фоном, не в критическом
+        # пути ответа на ASK).
+        self._notify_tasks: set = set()
 
     async def confirm(self, session_name: str, description: str, preview: str) -> bool:
         session = self._core.manager.get(session_name)
@@ -142,6 +152,13 @@ class OrchestratorVaultHost:
         отдельным notice, а persisted=False оставляет прокси со старым scope —
         следующий такой запрос честно спросит снова. Ситуации «оператор думает,
         что грант выдан навсегда, а его нет» не возникает.
+
+        Доставка notice — ФОНОМ (_notify_async), не в критическом пути ответа.
+        Иначе возникала гонка (нашло ревью): оператор кликает у самой границы
+        ASK-вотчдога прокси, грант уже записан, а зависшая доставка notice не даёт
+        ask вернуться в бюджет — прокси рвёт вызов по таймауту, и грант остаётся в
+        файле, но запрос получает DENY. Раз вердикт известен сразу после записи —
+        возвращаем его немедленно, а оператору сообщаем асинхронно.
         """
         assert grant is not None  # кнопка «навсегда» без гранта не рисуется
         try:
@@ -151,10 +168,10 @@ class OrchestratorVaultHost:
             logger.error(
                 "wallet: постоянный грант НЕ записан (%s.%s += %s): %s",
                 grant.secret, grant.key, grant.value, e)
-            await self._notify(
+            self._notify_bg(
                 session, self._core.t("wallet_ask_write_failed", error=e))
             return AskResult(granted=True, persisted=False)
-        await self._notify(
+        self._notify_bg(
             session,
             self._core.t(
                 "wallet_ask_written",
@@ -165,15 +182,20 @@ class OrchestratorVaultHost:
             cmd=f"policy scope.{grant.key} += {grant.value}", allowed=True)
         return AskResult(granted=True, persisted=True)
 
-    async def _notify(self, session, text: str) -> None:
-        """Сообщение оператору, которое НЕ должно ломать вердикт.
+    def _notify_bg(self, session, text: str) -> None:
+        """Запустить доставку notice ФОНОМ и вернуться сразу (см. _persist_grant).
 
-        Отвал доставки (упавший адаптер) здесь стоил бы дорого: исключение из
-        host.ask прокси трактует как DENY (см. proxy._ask_grant), и получилось бы
-        «грант в policy записан, а запрос отклонён» — худший из возможных
-        исходов. Поэтому пишем в лог и идём дальше."""
+        Ссылку на задачу держим в _notify_tasks до её завершения, иначе GC мог бы
+        собрать её на полпути (asyncio задачи слабо удерживаются)."""
+        task = asyncio.ensure_future(self._notify_async(session, text))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_async(self, session, text: str) -> None:
+        """Фоновая доставка notice оператору. Сбой/зависание не влияют на вердикт:
+        ловим всё и логируем, плюс собственный таймаут против зависшего адаптера."""
         try:
-            await self._core.notice(session, text)
+            await asyncio.wait_for(self._core.notice(session, text), timeout=_NOTIFY_TIMEOUT)
         except Exception:  # noqa: BLE001 — доставка notice не влияет на вердикт
             logger.exception("wallet: не удалось доставить notice оператору")
 

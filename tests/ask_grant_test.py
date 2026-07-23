@@ -211,7 +211,11 @@ def test_write_rejects_broad_and_bogus_values():
     увидел бы в policy правило, которое матчится не так, как читается)."""
     ed, path = _editor()
     before = path.read_text()
-    for bad in ("*", "https://api.svc/*", "api.svc/admin", "  "):
+    for bad in ("*", "https://api.svc/*", "api.svc/admin", "  ",
+                # backtick/перевод строки/таб/DEL — исказили бы markdown-notice и
+                # копируемую команду отзыва, либо расщепили бы secrets.toml (ревью).
+                "https://api.svc/x`inject", "https://api.svc/x\nSECOND=1",
+                "https://api.svc/x\ty", "https://api.svc/x\x7f"):
         try:
             ed.grant_scope("svc", "url_prefixes", bad)
             assert False, f"«{bad}» не должен был записаться"
@@ -352,6 +356,68 @@ def test_after_grant_same_request_passes_without_asking():
     print("OK после гранта: тот же запрос без спроса, другой ресурс — спрашивает снова")
 
 
+def test_persisted_grant_notice_is_off_the_critical_path():
+    """Инвариант §4.6 против гонки (нашло ревью): доставка notice оператору НЕ
+    должна блокировать возврат вердикта — иначе клик у границы ask-вотчдога дал бы
+    «грант записан, а запрос DENY». Проверяем на РЕАЛЬНОМ OrchestratorVaultHost с
+    заведомо зависшим `notice`: ask обязан вернуться сразу, грант — persisted.
+    """
+    from orchestrator.modules.wallet.host import OrchestratorVaultHost
+
+    ed, path = _editor()
+    notice_started = asyncio.Event()
+
+    class _Session:
+        name = "dev"
+
+    class _Core:
+        def t(self, _text_key, **kw):
+            return _text_key
+        def _record(self, *a, **k):
+            pass
+        async def notice(self, session, text):
+            notice_started.set()
+            await asyncio.sleep(3600)  # доставка «висит» — не должна держать ask
+
+    host = OrchestratorVaultHost.__new__(OrchestratorVaultHost)
+    host._core = _Core()
+    host._policy = ed
+    host._allow_policy_edit = True
+    host._notify_tasks = set()
+
+    grant = ScopeGrant(key="url_prefixes", value="https://api.svc/admin/reboot",
+                       label="x", secret="svc")
+
+    async def run():
+        # вердикт обязан вернуться, не дожидаясь висящего notice
+        res = await asyncio.wait_for(
+            host._persist_grant(_Session(), grant), timeout=2.0)
+        assert res.granted and res.persisted, res
+        # notice запущен фоном (задача есть), но возврат его НЕ ждал
+        assert host._notify_tasks, "notice не поставлен в фон"
+        # даём loop прокрутиться — фоновая доставка реально стартует и «виснет»
+        await asyncio.sleep(0.05)
+        assert notice_started.is_set(), "фоновый notice не стартовал"
+        return res
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run())
+        assert "https://api.svc/admin/reboot" in path.read_text(), "грант не записан"
+    finally:
+        # снять висящую фоновую задачу notice, чтобы loop закрылся чисто
+        pending = list(host._notify_tasks)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+        asyncio.set_event_loop(None)
+    _cleanup(path)
+    print("OK гонка: notice фоном — вердикт возвращается сразу, грант записан")
+
+
 def test_legacy_host_without_grant_still_works():
     """Хост старого контракта (bool, без параметра grant) не ломается: ASK
     работает как раньше, persisted=False, живой scope не расширяется."""
@@ -400,6 +466,7 @@ def main():
     test_concurrent_grants_do_not_lose_each_other()
     test_revoke_via_wallet_scope()
     test_after_grant_same_request_passes_without_asking()
+    test_persisted_grant_notice_is_off_the_critical_path()
     test_legacy_host_without_grant_still_works()
     test_ask_grant_normalizes_results()
     print("ALL ASK-GRANT OK")
