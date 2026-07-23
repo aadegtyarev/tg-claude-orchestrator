@@ -99,6 +99,11 @@ class SessionProxyPool:
             connector,
             secret,
             dict(secret.scope),
+            # Тот же store, что у пула/демона: прокси перечитывает СВЕЖИЙ scope
+            # секрета из secrets.toml по mtime (единый источник правды). Так грант,
+            # записанный другим живым прокси того же секрета, и операторский отзыв
+            # действуют на этот прокси на лету, без перезапуска (§4.6).
+            store=self._store,
             host=self._host,
             session_name=session_name,
             upstream_ssl=self._upstream_ssl,

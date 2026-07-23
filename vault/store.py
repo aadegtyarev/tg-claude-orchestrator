@@ -49,13 +49,48 @@ class SecretStore:
         self._path = path
         self._cache_key: tuple | None = None
         self._secrets: dict[str, Secret] = {}
+        # Можно ли доверять результату ПОСЛЕДНЕГО load() как факту policy. False
+        # до первого чтения и при ОШИБКЕ чтения (права шире 0600 / битый TOML /
+        # непонятный сбой stat). True — файл прочитан и распарсен ИЛИ намеренно
+        # удалён (ENOENT, см. load). Потребитель, которому важно отличить «читать
+        # нечем» от «политика говорит: секрета нет» (живой прокси — fail-safe
+        # scope), смотрит сюда: на False держит последний валидный снимок (ошибка
+        # чтения НЕ расширяет доступ и не роняет сессию), на True доверяет
+        # содержимому целиком (в т.ч. отзыву через `rm`).
+        self._last_load_ok = False
+
+    @property
+    def last_load_ok(self) -> bool:
+        """Успешно ли ПОСЛЕДНИЙ load() прочитал валидный policy-файл.
+
+        False → права шире 0600 / битый TOML / непонятная ошибка stat: содержимому
+        доверять нельзя — это ошибка чтения, а не факт policy.
+        True → файл прочитан и распарсен, ЛИБО файла нет вовсе (намеренно удалён —
+        см. load: легитимная запись атомарна, ENOENT её не создаёт). В обоих
+        случаях «секрета нет» — намеренное состояние, которому можно доверять
+        (живой прокси на этом отзывает доступ). На cache-hit (файл не менялся)
+        значение сохраняется от прошлого чтения, без повторного парсинга."""
+        return self._last_load_ok
 
     def load(self) -> dict[str, Secret]:
         try:
             st = self._path.stat()
-        except OSError:
-            # Файла нет — кошелёк работает, но секретов нет (warning на старте).
+        except FileNotFoundError:
+            # Файла НЕТ — это определённое состояние «политики нет», а НЕ
+            # транзиентная ошибка чтения. Легитимная запись (PolicyEditor:
+            # mkstemp + os.replace) атомарна и НИКОГДА не создаёт окна отсутствия
+            # файла, поэтому ENOENT = файл намеренно удалён (экстренный отзыв
+            # `rm secrets.toml`). Доверяем факту «секретов нет» (last_load_ok=True):
+            # живой прокси честно отзовёт доступ, а не будет держать устаревший
+            # снимок (иначе rm молча не отзывал бы — нашло ревью).
             self._cache_key, self._secrets = None, {}
+            self._last_load_ok = True
+            return {}
+        except OSError:
+            # Прочие ошибки stat (EACCES на пути, ELOOP…) — транзиентные/непонятные:
+            # содержимому доверять нельзя → fail-safe hold у потребителя.
+            self._cache_key, self._secrets = None, {}
+            self._last_load_ok = False
             return {}
         key = (st.st_mtime_ns, st.st_mode, st.st_size)
         if key == self._cache_key:
@@ -68,11 +103,13 @@ class SecretStore:
                 "wallet: %s доступен group/other (права %o) — секреты НЕ загружены; "
                 "выполни chmod 600", self._path, st.st_mode & 0o777,
             )
+            self._last_load_ok = False
             return {}
         try:
             data = tomllib.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
             logger.error("wallet: не удалось прочитать %s: %s", self._path, e)
+            self._last_load_ok = False
             return {}
         for name, raw in (data.get("secrets") or {}).items():
             if not isinstance(raw, dict):
@@ -147,4 +184,5 @@ class SecretStore:
                 connector=connector,
                 scope=scope,
             )
+        self._last_load_ok = True
         return self._secrets
