@@ -45,7 +45,10 @@ from ..config import Config
 # _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
 from box import transcript_path as box_transcript
 from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
-from box.pty import open_pty, start_driver
+from box.launch import launch as box_launch
+# open_pty/start_driver больше не зовутся здесь напрямую (спавн+драйвер собраны
+# в box.launch), но реэкспортятся для обратной совместимости кода/тестов.
+from box.pty import open_pty, start_driver  # noqa: F401
 from box.ready import (  # noqa: F401
     READY_SILENCE_SEC,
     READY_TIMEOUT_MAX,
@@ -652,11 +655,20 @@ class SessionManager:
 
         self._rotate_log(session.session_dir / "claude.log")
         session.log_file = open(session.session_dir / "claude.log", "ab")
-        # Размер терминала ставит box.open_pty (иначе winsize = 0×0, и Claude Code
-        # зондирует размер через CPR — под agent-vm его ответы текут в stdin
-        # мусором и спурьёзными сообщениями). Драйвер PTY (дренаж + авто-ответы на
-        # стартовые диалоги) — тоже box; он владеет master-fd и закроет его сам.
-        master, slave = open_pty()
+        # box-драйвер отдаёт вывод claude через колбэк — пишем его в лог сессии.
+        # Захватываем конкретный log_file (не session.log_file): при рестарте
+        # сессии там окажется новый файл, а этот драйвер владеет прежним PTY и
+        # должен писать в прежний лог, как и раньше. ValueError глотаем — лог мог
+        # закрыться при остановке сессии (драйвер ещё дочитывает буфер PTY).
+        log_file = session.log_file
+
+        def _on_output(chunk: bytes) -> None:
+            try:
+                log_file.write(chunk)
+                log_file.flush()
+            except ValueError:  # лог уже закрыт при остановке сессии
+                pass
+
         try:
             # cwd = папка проекта (если задан линк): натуральное поведение —
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
@@ -698,40 +710,21 @@ class SessionManager:
                 home_dir=self.session_home(session),
                 publish_ports=[session.port],
             )
-            session.process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=env,
-                start_new_session=True,
+            # Спавн процесса под PTY + запуск драйвера (дренаж вывода + авто-ответы
+            # на стартовые диалоги) собран в box.launch: он открывает PTY нужного
+            # размера (иначе winsize = 0×0 и claude мусорит зондами CPR), спавнит
+            # процесс на slave и владеет master-fd (закроет сам). Оркестратор даёт
+            # готовые argv/env/cwd и колбэк вывода, забирает ручки из handle.
+            # Сбой спавна launch чистит свои fd (master/slave); лог закрываем мы.
+            handle = await box_launch(
+                argv, cwd=cwd, env=env, on_output=_on_output, name=session.name
             )
         except Exception:
-            os.close(master)
             self._close_log(session)
             raise
-        finally:
-            os.close(slave)
-        session.pty_master = master
-        session.dialog_answerer = _DialogAnswerer()
-        # box-драйвер отдаёт вывод claude через колбэк — пишем его в лог сессии.
-        # Захватываем конкретный log_file (не session.log_file): при рестарте
-        # сессии там окажется новый файл, а этот драйвер владеет прежним PTY и
-        # должен писать в прежний лог, как и раньше. ValueError глотаем — лог мог
-        # закрыться при остановке сессии (драйвер ещё дочитывает буфер PTY).
-        log_file = session.log_file
-
-        def _on_output(chunk: bytes) -> None:
-            try:
-                log_file.write(chunk)
-                log_file.flush()
-            except ValueError:  # лог уже закрыт при остановке сессии
-                pass
-
-        start_driver(
-            master, _on_output, session.dialog_answerer, name=session.name
-        )
+        session.process = handle.process
+        session.pty_master = handle.pty_master
+        session.dialog_answerer = handle.answerer
 
     def _rotate_log(self, path: Path) -> None:
         """Если лог перерос лимит — сдвинуть в .old (одна копия), начать заново."""
