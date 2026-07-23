@@ -27,7 +27,7 @@ from typing import NamedTuple
 from aiohttp import web
 
 from .execute import run_secret_command
-from .host import VaultHost
+from .host import VaultHost, deny_remedy
 from .proxy_pool import SessionProxyPool
 from .redact import _redact
 from .secret import Secret, _prints_token
@@ -212,8 +212,12 @@ class VaultDaemon:
                 f"wallet get {name}",
             )
             if not ok:
+                # Причину знает host: «оператор нажал ✗» и «спрашивать некого
+                # (unattended)» — разные вещи, и модель должна видеть какая
+                # именно (см. vault.host.deny_remedy).
                 return web.json_response(
-                    {"error": "denied", "reason": "отклонено кнопкой подтверждения"},
+                    {"error": "denied",
+                     "reason": deny_remedy(self.host) or "отклонено кнопкой подтверждения"},
                     status=403,
                 )
         # Наблюдаемость: выдача видна строкой (без значения).
@@ -283,7 +287,8 @@ class VaultDaemon:
         if not allowed:
             # verdict.reason покрывает policy-отказ; None → отказ пришёл от
             # confirm-кнопки (движок пропустил policy, но оператор нажал ✗).
-            reason = verdict.reason if verdict.reason is not None else "отклонено кнопкой подтверждения"
+            reason = verdict.reason if verdict.reason is not None else (
+                deny_remedy(self.host) or "отклонено кнопкой подтверждения")
             # Operator-notice — только для отказов, требующих его внимания.
             # `gh auth token`/`--show-token` (печать токена) НЕ шлём: отказ
             # самокорректирующийся, а фоновый поллер Claude Code зовёт её
