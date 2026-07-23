@@ -16,18 +16,13 @@ set_model) сериализованы её локом `Session.ops` — пара
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import inspect
 import json
 import logging
 import os
-import pty
 import shutil
 import socket
-import struct
 import sys
-import termios
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -49,6 +44,7 @@ from ..config import Config
 # совместимости: код/тесты ссылаются на sessions._DIALOGS/_DialogAnswerer/
 # _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
 from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
+from box.pty import open_pty, start_driver
 from box.ready import (  # noqa: F401
     READY_SILENCE_SEC,
     READY_TIMEOUT_MAX,
@@ -80,46 +76,13 @@ class SessionError(Exception):
     """Ошибка создания/работы сессией — текст показывается пользователю."""
 
 
-# _DIALOGS/_DialogAnswerer и _ReadyDeadline/READY_* переехали в пакет box/
-# (box.dialog, box.ready) — самодостаточные launch-хелперы без зависимостей от
-# SessionManager. Реэкспортированы в шапке модуля для обратной совместимости.
-
-
-def _pty_driver(
-    master: int, log_file: IO[bytes], name: str, answerer: _DialogAnswerer
-) -> None:
-    """Поток при PTY: дренирует вывод claude (иначе буфер pty переполнится
-    и процесс встанет), пишет его в лог и отвечает на стартовые диалоги.
-
-    Поток владеет master-fd и сам закрывает его на выходе — закрытие из
-    event loop могло бы освободить номер fd, пока поток блокирован в read.
-    """
-    try:
-        while True:
-            try:
-                chunk = os.read(master, 65536)
-            except OSError:
-                return
-            if not chunk:
-                return
-            try:
-                log_file.write(chunk)
-                log_file.flush()
-            except ValueError:  # лог уже закрыт при остановке сессии
-                pass
-            for keys in answerer.feed(chunk):
-                logger.info("Сессия %s: отвечаю на стартовый диалог", name)
-                for key in keys:
-                    try:
-                        os.write(master, bytes([key]))
-                    except OSError:
-                        return
-                    time.sleep(0.3)
-    finally:
-        try:
-            os.close(master)
-        except OSError:
-            pass
+# _DIALOGS/_DialogAnswerer, _ReadyDeadline/READY_* и ядро PTY-запуска (open_pty/
+# start_driver — openpty+winsize и поток-драйвер) переехали в пакет box/
+# (box.dialog, box.ready, box.pty) — самодостаточные launch-хелперы без
+# зависимостей от SessionManager. _DialogAnswerer/_ReadyDeadline/READY_*
+# реэкспортированы в шапке модуля для обратной совместимости. Драйвер box'а
+# отдаёт вывод через колбэк on_output — оркестратор пишет его в claude.log
+# (см. _start_claude), а «куда/как поднят процесс» остаётся здесь же.
 
 
 @dataclass
@@ -688,16 +651,11 @@ class SessionManager:
 
         self._rotate_log(session.session_dir / "claude.log")
         session.log_file = open(session.session_dir / "claude.log", "ab")
-        master, slave = pty.openpty()
-        # Задать размер терминала. Без него winsize = 0×0, и Claude Code
-        # агрессивно зондирует размер через CPR (\x1b[6n); под agent-vm (двойной
-        # PTY через attach) ответы на зонды текут одиночными цифрами в stdin —
-        # мусор в экране, а изредка (если следом CR) уходит спурьёзным
-        # сообщением («your message was just 2»). Фиксированный размер это гасит.
-        try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        except OSError:
-            pass
+        # Размер терминала ставит box.open_pty (иначе winsize = 0×0, и Claude Code
+        # зондирует размер через CPR — под agent-vm его ответы текут в stdin
+        # мусором и спурьёзными сообщениями). Драйвер PTY (дренаж + авто-ответы на
+        # стартовые диалоги) — тоже box; он владеет master-fd и закроет его сам.
+        master, slave = open_pty()
         try:
             # cwd = папка проекта (если задан линк): натуральное поведение —
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
@@ -756,12 +714,23 @@ class SessionManager:
             os.close(slave)
         session.pty_master = master
         session.dialog_answerer = _DialogAnswerer()
-        threading.Thread(
-            target=_pty_driver,
-            args=(master, session.log_file, session.name, session.dialog_answerer),
-            name=f"pty-{session.name}",
-            daemon=True,
-        ).start()
+        # box-драйвер отдаёт вывод claude через колбэк — пишем его в лог сессии.
+        # Захватываем конкретный log_file (не session.log_file): при рестарте
+        # сессии там окажется новый файл, а этот драйвер владеет прежним PTY и
+        # должен писать в прежний лог, как и раньше. ValueError глотаем — лог мог
+        # закрыться при остановке сессии (драйвер ещё дочитывает буфер PTY).
+        log_file = session.log_file
+
+        def _on_output(chunk: bytes) -> None:
+            try:
+                log_file.write(chunk)
+                log_file.flush()
+            except ValueError:  # лог уже закрыт при остановке сессии
+                pass
+
+        start_driver(
+            master, _on_output, session.dialog_answerer, name=session.name
+        )
 
     def _rotate_log(self, path: Path) -> None:
         """Если лог перерос лимит — сдвинуть в .old (одна копия), начать заново."""
