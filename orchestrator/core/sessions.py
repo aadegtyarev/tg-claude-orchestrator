@@ -44,6 +44,17 @@ from .slug import slugify  # реэкспорт: адаптеры и тесты 
 from .. import runners as runner_mod
 from ..config import Config
 
+# Launch-механика вынесена в автономный пакет box/ (Слой 2 редизайна,
+# docs/ARCHITECTURE-claude-box.md §5/§11). Реэкспорт для обратной
+# совместимости: код/тесты ссылаются на sessions._DIALOGS/_DialogAnswerer/
+# _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
+from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
+from box.ready import (  # noqa: F401
+    READY_SILENCE_SEC,
+    READY_TIMEOUT_MAX,
+    _ReadyDeadline,
+)
+
 logger = logging.getLogger(__name__)
 
 # Каталог пакета orchestrator/ (channel_server.py) и корень репозитория
@@ -51,15 +62,10 @@ logger = logging.getLogger(__name__)
 PKG_DIR = Path(__file__).resolve().parent.parent
 ROOT = PKG_DIR.parent
 
-# Готовность сессии ждём по ТИШИНЕ, а не по общему времени: сколько секунд
-# терпим отсутствие признаков жизни (claude.log не растёт). Холодный старт
-# agent-vm тянет OCI-образ минутами, и фиксированный общий таймаут убивал бы
-# сессию до старта Claude; при этом реально зависший процесс должен падать
-# быстро, а не через потолок.
-READY_SILENCE_SEC = 60.0
-# Абсолютный потолок ожидания — чтобы бесконечно «прогрессирующий» процесс
-# (напр. бесконечная перекачка образа по битой сети) не висел вечно.
-READY_TIMEOUT_MAX = 900.0
+# READY_SILENCE_SEC/READY_TIMEOUT_MAX переехали в box.ready (реэкспорт выше) —
+# они неотделимы от _ReadyDeadline. Ниже — launch-timing, который читают методы
+# SessionManager (resume/send); эти методы пока живут здесь, поэтому и константы
+# остаются в sessions.py до соответствующих срезов.
 # Пауза после resume: «claude --resume» без транскрипта умирает не сразу,
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
@@ -74,123 +80,9 @@ class SessionError(Exception):
     """Ошибка создания/работы сессией — текст показывается пользователю."""
 
 
-# Стартовые диалоги интерактивного claude и клавиши-ответы.
-# Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
-_DIALOGS = [
-    ("trustthisfolder", b"\r"),        # «Yes, I trust this folder» — пункт по умолчанию
-    # ВАЖНО: маркер — по тексту ПУНКТА диалога («Yes, I accept»), НЕ по
-    # «bypasspermissions»: последнее ложно совпадает со строкой СТАТУСА
-    # «⏵⏵ bypass permissions on» (постоянная UI-плашка, не диалог) → слался «2»
-    # как сообщение в чат (замечено под agent-vm).
-    ("yes,iaccept", b"2\r"),           # bypass-permissions диалог: «2. Yes, I accept»
-    ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
-    # agent-vm ставит managed-настройки (CLAUDE_CODE_MAX_RETRIES/RETRY_WATCHDOG) —
-    # Claude на старте просит их подтвердить. Доверяем (это настройки самого
-    # sandbox-инструмента, benign retry-конфиг): пункт 1 «Yes, I trust» по умолч.
-    ("managedsettingsrequireapproval", b"\r"),
-]
-
-
-class _ReadyDeadline:
-    """Дедлайн готовности, который продлевается признаками жизни.
-
-    Признак жизни — рост `claude.log`: под agent-vm туда льётся прогресс
-    загрузки образа и бута VM, под bwrap — вывод самого Claude. Пока лог
-    растёт, ждём дальше; замолчал дольше READY_SILENCE_SEC — сдаёмся. Сверху
-    абсолютный потолок READY_TIMEOUT_MAX.
-    """
-
-    def __init__(
-        self,
-        started_at: float,
-        silence: float = READY_SILENCE_SEC,
-        cap: float = READY_SILENCE_SEC,
-    ):
-        # cap по умолчанию = окно тишины: без явного запаса ведём себя ровно как
-        # прежний фиксированный таймаут. Запас даём только там, где он оправдан
-        # (agent-vm с загрузкой образа) — иначе «живой» спиннер зависшего Claude
-        # растил бы лог и держал нас до потолка на самом частом пути (bwrap).
-        self._silence = silence
-        self._cap = started_at + max(cap, silence)
-        self._last_alive = started_at
-        self._last_size = -1
-
-    def note_progress(self, size: int, now: float) -> None:
-        """Сообщить текущий размер лога. Рост = признак жизни."""
-        if size > self._last_size:
-            self._last_size = size
-            self._last_alive = now
-
-    def expired(self, now: float) -> str | None:
-        """None — ждём дальше; 'silence' | 'cap' — причина сдаться."""
-        # Тишина важнее потолка: она точнее описывает, что произошло. При
-        # cap == silence (дефолт, без запаса) обе причины наступают разом —
-        # сообщать надо «молчит», а не «упёрся в потолок».
-        if now - self._last_alive > self._silence:
-            return "silence"
-        if now > self._cap:
-            return "cap"
-        return None
-
-
-class _DialogAnswerer:
-    """Матчер стартовых диалогов: экран → клавиши-ответы.
-
-    Работает ТОЛЬКО до готовности сессии и выключается досрочно, когда все
-    диалоги отвечены. Это принципиально: маркеры ищутся в скользящем окне
-    вывода, а вывод после старта — это уже беседа. Матчер «на всю жизнь сессии»
-    впечатывал клавиши в stdin Claude, когда текст беседы случайно содержал
-    маркер (модель пишет «yes, I accept» → в сессию уходит «2\\r» и вылезает
-    спурьёзным сообщением «your message was just 2»).
-
-    Выключение — по событию, а не по таймеру: `stop()` зовётся, когда
-    channel-сервер ответил на /ping. Это ТОЧНЫЙ признак, что Claude полностью
-    поднялся и стартовые диалоги позади, и он не зависит от того, сколько
-    длился старт (под agent-vm первая загрузка OCI-образа занимает минуты —
-    любое фиксированное окно там оставило бы диалог без ответа).
-
-    Живёт в потоке _pty_driver; `stop()` зовётся из event loop — поэтому
-    флаг проверяется/ставится под локом.
-    """
-
-    def __init__(self) -> None:
-        self._answered: set[str] = set()
-        self._buf = b""
-        self._lock = threading.Lock()
-        self._active = True
-
-    @property
-    def active(self) -> bool:
-        with self._lock:
-            return self._active
-
-    def stop(self) -> None:
-        """Сессия готова — больше не трогаем stdin (весь вывод дальше — беседа)."""
-        with self._lock:
-            self._active = False
-            self._buf = b""
-
-    def feed(self, chunk: bytes) -> list[bytes]:
-        """Скормить кусок вывода. Вернуть клавиши, которые надо послать."""
-        with self._lock:
-            if not self._active:
-                return []
-            self._buf = (self._buf + chunk)[-16384:]
-            screen = strip_ansi(self._buf).replace(b" ", b"")
-            screen_text = screen.decode(errors="replace").lower()
-            out: list[bytes] = []
-            # Один чанк может принести несколько диалогов сразу (под agent-vm
-            # вывод идёт через проброшенный PTY и перерисовки склеиваются) —
-            # отвечаем на все, а не только на первый.
-            for marker, keys in _DIALOGS:
-                if marker in screen_text and marker not in self._answered:
-                    self._answered.add(marker)
-                    out.append(keys)
-            if out:
-                self._buf = b""
-            if len(self._answered) == len(_DIALOGS):
-                self._active = False
-            return out
+# _DIALOGS/_DialogAnswerer и _ReadyDeadline/READY_* переехали в пакет box/
+# (box.dialog, box.ready) — самодостаточные launch-хелперы без зависимостей от
+# SessionManager. Реэкспортированы в шапке модуля для обратной совместимости.
 
 
 def _pty_driver(
