@@ -622,6 +622,14 @@ class SessionManager:
         # и т.п.). Сами CLAUDE_ENV_* в дочерний процесс не тащим.
         for key in [k for k in env if k.startswith("CLAUDE_ENV_")]:
             del env[key]
+        # AGENT_VM_MEMORY_GIB/CPUS — env-алиасы флагов самого agent-vm, а мы их
+        # уже прочитали (config) и превратили во флаги (раннер). Оставлять их в
+        # окружении ребёнка значит держать второй источник истины: наш разбор
+        # («0/пусто = не задано, флаг не эмитим») агент-vm бы не увидел и взял
+        # значение сам. Один источник — наш.
+        if self.config.sandbox == "agent-vm":
+            from ..runners.agentvm import strip_own_env
+            strip_own_env(env)
         env.update(self.config.claude_env)
         # Модульные env-вклады (wallet: $NAME для секретов). Env процесса claude
         # наследуют его Bash-тул и сервисы, что он запускает — значит переменная

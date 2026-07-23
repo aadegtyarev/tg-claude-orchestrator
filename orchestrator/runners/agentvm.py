@@ -32,6 +32,23 @@ AGENT_VM_BIN = "agent-vm"
 # Чем claude может авторизоваться у СВОЕГО (не agent-vm) эндпоинта.
 AUTH_KEYS = {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}
 
+# Переменные, которые agent-vm читает САМ (env-алиасы своих флагов, см.
+# `agent-vm claude --help`: «[env: …]») И которые читаем мы, чтобы решить,
+# эмитить ли соответствующий флаг. Раз решение наше, окружение дочернего
+# процесса должно быть от них очищено: иначе наша нормализация («пусто или
+# мусор = не задано, флаг не эмитим») врёт — переменная доезжает до agent-vm,
+# и его собственный, более строгий парсер падает на том, что мы обещали
+# проигнорировать (`AGENT_VM_CPUS=` → «cannot parse integer from empty
+# string»). AGENT_VM_IMAGE сюда НЕ входит: agent-vm читает AGENT_VM_IMAGE_TAG,
+# это другое имя и другой смысл — коллизии нет.
+OWN_ENV_VARS = ("AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS")
+
+
+def strip_own_env(env: dict[str, str]) -> None:
+    """Убрать из env переменные, которые мы уже превратили во флаги (на месте)."""
+    for name in OWN_ENV_VARS:
+        env.pop(name, None)
+
 
 def auth_problem(claude_env: dict[str, str]) -> str | None:
     """Почему свой ANTHROPIC_BASE_URL не заработает под agent-vm (или None).
@@ -73,9 +90,23 @@ class AgentVmRunner:
     # без изоляции (см. run_bash).
     supports_prefix = False
 
-    def __init__(self, config: "Config", root: Path):
+    def __init__(self, config: "Config", root: Path, *, mount_root: bool = True):
+        """root — корень установки оркестратора; mount_root — монтировать ли его
+        в гостя RW.
+
+        mount_root=True (умолчание, прод-путь оркестратора): в госте нужен код
+        оркестратора — хуки сессии запускают оттуда channel_server.py.
+
+        mount_root=False — для запусков, которым код оркестратора в госте не
+        нужен (standalone `claude-box --vm`: ни сессии, ни канала, ни хуков).
+        Флаг обязателен, потому что у `--mount` в agent-vm НЕТ режима
+        только-чтение: смонтировать корень значит отдать гостю запись в код и
+        в `.env` оператора (боевые токены бота). Для чужого проекта под
+        `claude-box --vm` это чистая утечка, поэтому там монтирования нет.
+        """
         self.config = config
         self.root = root
+        self.mount_root = mount_root
 
     def preflight(self) -> tuple[bool, str]:
         if shutil.which(AGENT_VM_BIN) is None:
@@ -129,8 +160,9 @@ class AgentVmRunner:
     ) -> list[str]:
         """agent-vm <cmd> [--опции] -- <аргументы cmd>.
 
-        cwd монтируется самим agent-vm; докидываем рабочие пути сессии и
-        репозиторий оркестратора (channel_server внутри гостя). home_dir
+        cwd монтируется самим agent-vm; докидываем рабочие пути сессии и —
+        только при mount_root — корень оркестратора (channel_server внутри
+        гостя; в standalone CLI он не нужен и не монтируется). home_dir
         не пробрасывается: у гостя свой $HOME (Debian-образ), персистентность
         дома решается state-каталогом agent-vm, не нами.
         """
@@ -171,14 +203,20 @@ class AgentVmRunner:
         # оркестратора репозиторий и рабочий каталог сессии разные, а у
         # standalone `claude-box` из корня самого репозитория они совпадают —
         # и запуск падал (поймано живым прогоном --vm).
+        # root монтируем ТОЛЬКО при mount_root (см. __init__): у --mount нет
+        # режима RO, и в standalone CLI корень репозитория — это .env оператора.
+        roots = {str(self.root)} if self.mount_root else set()
         mounts = {
-            m for m in {str(self.root), *(str(p) for p in extra_rw)}
+            m for m in {*roots, *(str(p) for p in extra_rw)}
             if m != str(chdir)
         }
         for m in sorted(mounts):
             out += ["--mount", f"{m}:{m}"]
         if self.config.agent_vm_memory_gib:
-            out += ["--memory", f"{self.config.agent_vm_memory_gib:g}G"]
+            # `--memory <GIB>` — ГОЛОЕ число (agent-vm 0.1.25: «Sandbox memory,
+            # in GiB»). Суффикс «G» тот же бинарь отвергает: «invalid value
+            # '8G' for '--memory <GIB>': invalid digit found in string».
+            out += ["--memory", f"{self.config.agent_vm_memory_gib:g}"]
         if self.config.agent_vm_cpus:
             out += ["--cpus", str(self.config.agent_vm_cpus)]
         if self.config.agent_vm_image:

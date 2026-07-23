@@ -6,6 +6,10 @@
   • --vm вместе с другим --engine → честный отказ (код 2);
   • AGENT_VM_* читаются в EngineConfig теми же именами, что в orchestrator/config;
   • argv действительно собирается AgentVmRunner'ом (флаги VM доезжают);
+  • корень установки claude-box в гостя НЕ монтируется (у --mount нет RO —
+    иначе гость получал бы запись в код и в .env оператора);
+  • AGENT_VM_MEMORY_GIB/CPUS не текут в окружение дочернего agent-vm (иначе он
+    прочитает их сам и упадёт на том, что мы обещали проигнорировать);
   • нет бинаря/KVM → внятный отказ preflight и код 1, а не трейсбек;
   • --profile/--wallet под --vm отвергаются (F4/F1/F10), а не делают вид, что
     применились;
@@ -131,7 +135,16 @@ def test_bad_agent_vm_number_is_honest_error():
         code = _exit_code(cli.make_engine_runner, "agent-vm", cli.repo_root())
     assert code == 2
     assert "AGENT_VM_CPUS" in err.getvalue(), err.getvalue()
-    print("OK кривой AGENT_VM_CPUS → честный отказ")
+
+    # Дробная память тоже отказ: agent-vm принимает только целые GiB («invalid
+    # value '2.5' for '--memory <GIB>'»), и пропустить её значило бы уронить
+    # запуск уже внутри agent-vm — после того как CLI сделал вид, что понял.
+    err = io.StringIO()
+    with env(AGENT_VM_MEMORY_GIB="2.5"), contextlib.redirect_stderr(err):
+        code = _exit_code(cli.make_engine_runner, "agent-vm", cli.repo_root())
+    assert code == 2
+    assert "AGENT_VM_MEMORY_GIB" in err.getvalue(), err.getvalue()
+    print("OK кривой AGENT_VM_CPUS/MEMORY_GIB → честный отказ")
 
 
 # ── argv: флаги VM доезжают ──────────────────────────────────────────────────
@@ -150,14 +163,69 @@ def test_vm_argv_via_agentvm_runner():
     s = " ".join(argv)
     assert argv[:2] == ["agent-vm", "claude"], argv[:2]
     assert "--allow-host" in argv
-    assert f"--mount {cli.repo_root()}:{cli.repo_root()}" in s, s
+    # Корень установки claude-box в гостя НЕ монтируется: у --mount в agent-vm
+    # нет режима RO, а в корне лежит .env оператора с боевыми токенами бота.
+    # Standalone CLI код оркестратора в госте не запускает (ни канала, ни хуков).
+    assert f"--mount {cli.repo_root()}" not in s, "утечка корня установки в VM: " + s
     assert "--mount /tmp:/tmp" not in s, "cwd монтирует сам agent-vm"
-    assert "--memory 8G" in s and "--cpus 4" in s and "--image ghcr.io/x:pin" in s, s
+    assert "--mount" not in s, "монтировать в standalone нечего: " + s
+    assert "--memory 8 " in s + " " and "--memory 8G" not in s, s
+    assert "--cpus 4" in s and "--image ghcr.io/x:pin" in s, s
     assert "--egress-proxy http://192.168.1.44:9000" in s, s
     assert "--egress-ca /tmp/vault-ca.pem" in s, s
     tail = argv[argv.index("--") + 1:]
     assert tail == ["--model", "opus"], tail
     print("OK argv VM: " + s)
+
+
+def test_vm_argv_from_foreign_project_has_no_repo_mount():
+    """Запуск над ЧУЖИМ проектом: в гостя едет только его каталог.
+
+    Раньше wrap() безусловно добавлял `--mount <корень claude-box>`, а у
+    `--mount` нет режима только-чтение — агент над любым чужим проектом получал
+    RW-доступ к коду оркестратора и к `.env` с боевыми токенами оператора.
+    """
+    runner = cli.make_engine_runner("agent-vm", cli.repo_root())
+    argv = cli.build_argv(runner, ["claude"], Path("/tmp/foreign-project"))
+    s = " ".join(argv)
+    assert str(cli.repo_root()) not in s, "корень установки утёк в VM: " + s
+    assert "--mount" not in s, s
+    assert argv[:2] == ["agent-vm", "claude"] and "--allow-host" in argv, argv
+    print("OK чужой проект: корень claude-box в VM не монтируется")
+
+
+def test_build_env_strips_agent_vm_aliases():
+    """AGENT_VM_MEMORY_GIB/CPUS не доезжают до дочернего agent-vm.
+
+    Эти имена agent-vm читает сам (env-алиасы своих флагов). Мы обещаем, что
+    пустое/мусорное значение считается «не задано» — значит и в окружении его
+    остаться не должно, иначе agent-vm упадёт на нём своим парсером
+    («cannot parse integer from empty string»). AGENT_VM_IMAGE — наше имя
+    (у agent-vm это AGENT_VM_IMAGE_TAG), его не трогаем.
+    """
+    with env(AGENT_VM_CPUS="", AGENT_VM_MEMORY_GIB="8",
+             AGENT_VM_IMAGE="ghcr.io/x:pin"):
+        vm_env = cli.build_env("agent-vm")
+        assert "AGENT_VM_CPUS" not in vm_env, vm_env.get("AGENT_VM_CPUS")
+        assert "AGENT_VM_MEMORY_GIB" not in vm_env
+        assert vm_env["AGENT_VM_IMAGE"] == "ghcr.io/x:pin"
+        # Под bwrap чистка не нужна и не делается («выключено = не существует»).
+        assert cli.build_env("bwrap")["AGENT_VM_CPUS"] == ""
+    print("OK build_env: алиасы agent-vm вычищены из окружения ребёнка")
+
+
+def test_main_returns_code_on_bad_number_without_traceback():
+    """cli.main([...]) с кривым AGENT_VM_CPUS отдаёт 2, а не выбрасывает SystemExit.
+
+    Отказ рождается в main_async (внутри asyncio.run) — без перехвата SystemExit
+    в main() он летел бы наружу сквозь sys.exit(main()).
+    """
+    err = io.StringIO()
+    with env(AGENT_VM_CPUS="abc"), contextlib.redirect_stderr(err):
+        code = cli.main(["--vm", "--", "--version"])
+    assert code == 2, code
+    assert "AGENT_VM_CPUS" in err.getvalue(), err.getvalue()
+    print("OK main(): кривой AGENT_VM_CPUS → код 2 без трейсбека")
 
 
 # ── preflight: нет agent-vm / нет KVM ────────────────────────────────────────
@@ -232,6 +300,30 @@ def test_help_does_not_call_vm_unimplemented():
     print("OK --help: --vm больше не в «не реализовано»")
 
 
+def test_help_vm_boundaries_are_readable():
+    """Текст границ --vm — законченные фразы, понятные без архитектурного дока.
+
+    Была оборванная фраза («…CLI откажет и объяснит» → сразу описание --profile)
+    и объяснение через внутренние термины (F4/F10/MITM/CLAUDE_CONFIG_DIR).
+    """
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        try:
+            cli.parse_args(["--help"])
+        except SystemExit as e:
+            assert e.code == 0
+    text = out.getvalue()
+    vm_block = text.split("\n  --vm ", 1)[1].split("\n  --profile <", 1)[0]
+    assert "--profile" in vm_block and "--wallet" in vm_block, vm_block
+    # Сказано, ЧТО будет (отказ с кодом) и ЧТО делать вместо этого.
+    assert "кодом 2" in vm_block, vm_block
+    assert vm_block.count("без --vm") >= 2, vm_block
+    # Обрыв на полуслове больше не проходит: каждая строка блока — либо конец
+    # предложения, либо продолжение (не «объяснит» в никуда).
+    assert "откажет и объяснит\n" not in vm_block, vm_block
+    print("OK --help: границы --vm объяснены целыми фразами")
+
+
 def main() -> None:
     test_vm_is_short_form_of_engine_agent_vm()
     test_vm_conflicts_with_other_engine()
@@ -239,6 +331,10 @@ def main() -> None:
     test_engine_config_reads_agent_vm_env()
     test_bad_agent_vm_number_is_honest_error()
     test_vm_argv_via_agentvm_runner()
+    test_vm_argv_from_foreign_project_has_no_repo_mount()
+    test_build_env_strips_agent_vm_aliases()
+    test_main_returns_code_on_bad_number_without_traceback()
+    test_help_vm_boundaries_are_readable()
     test_vm_preflight_refuses_without_binary()
     test_vm_preflight_refuses_without_kvm()
     test_profile_under_vm_refused()

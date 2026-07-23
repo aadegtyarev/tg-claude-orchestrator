@@ -25,14 +25,22 @@ docs/ARCHITECTURE-claude-box.md) — под `--vm` НЕ работают и по
   * `--profile` — agent-vm ИГНОРИРУЕТ CLAUDE_CONFIG_DIR и сеет креды из $HOME
     процесса agent-vm (F4); наш env-редирект под VM был бы враньём. Подмена
     $HOME сюда не заведена осознанно: по §4.7 она может пересеять отработанный
-    одноразовый refresh-токен и РАЗЛОГИНИТЬ учётку оператора, а живой smoke на
-    этой машине невозможен (нет agent-vm/KVM).
+    одноразовый refresh-токен и РАЗЛОГИНИТЬ учётку оператора — нужен отдельный
+    живой smoke.
   * `--wallet` — под VM env в гостя не течёт (F1), а весь egress гостя прозрачно
     MITM-ит собственный CA agent-vm (F10), т.е. HTTPS_PROXY нашего перехвата
     просто не сработает; шимов под VM тоже нет (§5.2: git/gh ведёт сам agent-vm).
     Рабочий путь — `--egress-proxy/--egress-ca` форка agent-vm (раннер их уже
     умеет), но прокси кошелька слушает 127.0.0.1, а гостю нужен LAN-адрес хоста
     (F2) — сведение этого в один флаг остаётся следующему срезу.
+
+Что уезжает в гостя под `--vm`: ТОЛЬКО текущий каталог (его монтирует сам
+agent-vm). Корень установки claude-box в VM не монтируется — раннер строится с
+`mount_root=False`. Оркестратору этот mount нужен (в госте из него стартует
+channel_server.py), нам — нет, а у `--mount` в agent-vm нет режима
+только-чтение: гость получил бы запись в код и в `.env` оператора с боевыми
+токенами. Под bwrap корень репозитория, наоборот, нужен (шимы кошелька) и
+биндится только на чтение — там ничего не меняется.
 
 `--profile <name>` — изолированная идентичность claude (свой CLAUDE_CONFIG_DIR и,
 под bwrap, свой $HOME): модель не видит реальные ~/.claude / ~/.ssh оператора,
@@ -101,7 +109,7 @@ class EngineConfig:
     # (открывать гостю адрес хоста незачем, к нам никто не ходит).
     claude_env: dict[str, str] = field(default_factory=dict)
     agent_vm_host_ip: str | None = None
-    agent_vm_memory_gib: float | None = None
+    agent_vm_memory_gib: int | None = None  # целые GiB (agent-vm: --memory <GIB>)
     agent_vm_cpus: int | None = None
     agent_vm_image: str | None = None
     agent_vm_egress_proxy: str | None = None
@@ -128,9 +136,19 @@ _USAGE = (
     "  --vm             короткая форма --engine agent-vm (то же в microVM).\n"
     "                   Ресурсы/образ VM — из AGENT_VM_MEMORY_GIB, AGENT_VM_CPUS,\n"
     "                   AGENT_VM_IMAGE, AGENT_VM_EGRESS_PROXY/CA, AGENT_VM_HOST_IP.\n"
-    "                   Границы: с --profile и --wallet НЕ сочетается (agent-vm\n"
-    "                   игнорирует CLAUDE_CONFIG_DIR и сам MITM-ит egress гостя) —\n"
-    "                   вместо тихой видимости работы CLI откажет и объяснит\n"
+    "                   Что НЕ сочетается с --vm (запуск откажет с кодом 2, а не\n"
+    "                   сделает вид, что флаг применён):\n"
+    "                     --profile — внутри VM свой claude со своим ~/.claude,\n"
+    "                       и профиль хоста туда не пробросить: agent-vm\n"
+    "                       игнорирует CLAUDE_CONFIG_DIR и держит креды у себя.\n"
+    "                       Нужны профили — запускай без --vm (движок bwrap).\n"
+    "                     --wallet — окружение и наш HTTPS_PROXY в гостя не\n"
+    "                       попадают, а весь его egress расшифровывает сам\n"
+    "                       agent-vm, так что перехват секрета не состоится.\n"
+    "                       Нужен кошелёк — запускай без --vm (движок bwrap).\n"
+    "                   В госте claude ходит в сеть и в git/gh средствами\n"
+    "                   agent-vm; каталог запуска монтируется в VM, ничего\n"
+    "                   другого с хоста туда не уезжает\n"
     "  --profile <имя>  изолированная идентичность claude: свой CLAUDE_CONFIG_DIR\n"
     "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты.\n"
     "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
@@ -305,7 +323,9 @@ def agent_vm_env_config() -> dict[str, object]:
     оставлен — он ничего не стоит и понадобится, когда сюда приедет кошелёк.
 
     Плохое число (AGENT_VM_CPUS=abc) — честный отказ CLI (код 2), а не трейсбек
-    посреди запуска.
+    посреди запуска. Память и vCPU — ЦЕЛЫЕ (agent-vm 0.1.25: «--memory <GIB>»
+    парсится как целое, «2.5» он отвергает — принять дробное значило бы обещать
+    то, чего не будет, и уронить запуск уже внутри agent-vm).
     """
     def _num(name: str, cast):
         raw = os.getenv(name, "").strip()
@@ -314,11 +334,11 @@ def agent_vm_env_config() -> dict[str, object]:
         try:
             return cast(raw)
         except ValueError as e:
-            raise CliError(f"{name}={raw!r} — ожидалось число ({e}).") from e
+            raise CliError(f"{name}={raw!r} — ожидалось целое число ({e}).") from e
 
     ca = os.getenv("AGENT_VM_EGRESS_CA", "").strip()
     return {
-        "agent_vm_memory_gib": _num("AGENT_VM_MEMORY_GIB", float),
+        "agent_vm_memory_gib": _num("AGENT_VM_MEMORY_GIB", int),
         "agent_vm_cpus": _num("AGENT_VM_CPUS", int),
         "agent_vm_image": os.getenv("AGENT_VM_IMAGE", "").strip() or None,
         "agent_vm_host_ip": os.getenv("AGENT_VM_HOST_IP", "").strip() or None,
@@ -341,12 +361,23 @@ def make_engine_runner(
 
     AGENT_VM_* читаем только для agent-vm — «выключено = не существует»: под
     bwrap/off этих полей в конфиге нет и быть не должно.
+
+    Под agent-vm раннер строим НАПРЯМУЮ, с mount_root=False. Причина в том, что
+    у `--mount` в agent-vm нет режима только-чтение: корень установки
+    claude-box уехал бы в гостя НА ЗАПИСЬ вместе с `.env` оператора (боевые
+    токены). Оркестратору этот mount нужен (в госте из него стартует
+    channel_server.py), standalone CLI — нет: тут ни сессии, ни канала, ни
+    хуков (см. build_argv). Под bwrap корень репозитория, наоборот, нужен и
+    биндится только на чтение — тот путь не трогаем.
     """
     config = EngineConfig(
         sandbox=engine,
         claude_config_dir=claude_config_dir or _config_dir_from_env(),
         **(agent_vm_env_config() if engine == ENGINE_VM else {}),
     )
+    if engine == ENGINE_VM:
+        from orchestrator.runners.agentvm import AgentVmRunner
+        return AgentVmRunner(config, root, mount_root=False)
     return make_runner(config, root)
 
 
@@ -398,12 +429,21 @@ def build_env(engine: str, *, profile: bool = False) -> dict[str, str]:
     не дёрнет хостовый GUI (сеть у bwrap общая с хостом, X-сокет достижим).
 
     profile=True — ещё и чистка кредлов оператора (см. strip_credentials).
+
+    Под agent-vm убираем AGENT_VM_MEMORY_GIB/AGENT_VM_CPUS: это env-алиасы
+    флагов самого agent-vm, и мы их уже прочитали и превратили во флаги. Оставь
+    мы их в окружении — наша нормализация («мусор/пусто = не задано») стала бы
+    враньём: значение доехало бы до agent-vm, и его парсер упал бы на том, что
+    CLI обещал проигнорировать. Единственный источник истины — наш разбор.
     """
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
     if engine == "bwrap":
         for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
             env.pop(var, None)
+    if engine == ENGINE_VM:
+        from orchestrator.runners.agentvm import strip_own_env
+        strip_own_env(env)
     if profile:
         dropped = strip_credentials(env)
         if dropped:

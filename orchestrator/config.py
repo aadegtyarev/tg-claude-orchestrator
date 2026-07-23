@@ -57,6 +57,32 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")
 LOOPBACK_HOSTS_PLAIN = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
+def env_number(name: str, cast):
+    """Число из переменной окружения; пусто/не задано → None.
+
+    Мусорное значение — SystemExit с внятным сообщением, а не сырой ValueError
+    из недр загрузки конфига: оператор должен увидеть, КАКАЯ переменная плохая
+    и что от неё ждут. То же поведение даёт standalone `claude-box`
+    (box_cli/cli.py agent_vm_env_config) — расходиться на одних и тех же
+    именах переменных нельзя.
+
+    AGENT_VM_MEMORY_GIB/AGENT_VM_CPUS читаем как ЦЕЛЫЕ: сам agent-vm дробные
+    отвергает («invalid value '2.5' for '--memory <GIB>'»), а раньше «8.5» в
+    .env проходил конфиг, чтобы уронить КАЖДУЮ сессию уже внутри agent-vm.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        kind = "целое число" if cast is int else "число"
+        raise SystemExit(
+            f"{name}={raw!r} — ожидалось {kind}. Исправь значение в .env "
+            f"или убери переменную (тогда возьмётся умолчание)."
+        ) from None
+
+
 def host_lan_ip() -> str | None:
     """LAN-адрес хоста, по которому его видит гость microVM.
 
@@ -142,7 +168,7 @@ class Config:
     # оставить (если модели действительно нужен X в песочнице).
     sandbox_x11: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
-    agent_vm_memory_gib: float | None
+    agent_vm_memory_gib: int | None  # целые GiB: agent-vm дробные отвергает
     agent_vm_cpus: int | None
     agent_vm_image: str | None
     # LAN-адрес хоста для гостя (см. host_lan_ip). Фиксируется ОДИН раз на
@@ -300,12 +326,8 @@ class Config:
             # X/Wayland в песочницу по умолчанию НЕ прокидываем (закрываем доступ
             # к хостовому GUI); SANDBOX_X11=1 — оставить, если модели нужен X.
             sandbox_x11=cls._parse_bool(os.getenv("SANDBOX_X11", "false")),
-            agent_vm_memory_gib=(
-                float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
-            ),
-            agent_vm_cpus=(
-                int(raw) if (raw := os.getenv("AGENT_VM_CPUS", "").strip()) else None
-            ),
+            agent_vm_memory_gib=env_number("AGENT_VM_MEMORY_GIB", int),
+            agent_vm_cpus=env_number("AGENT_VM_CPUS", int),
             agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),
             agent_vm_host_ip=agent_vm_host_ip,
             agent_vm_egress_proxy=(
