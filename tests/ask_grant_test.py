@@ -19,6 +19,7 @@
 """
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,12 @@ def _editor(src: str = _SRC):
     path.write_text(src)
     os.chmod(path, 0o600)
     return PolicyEditor(path), path
+
+
+def _cleanup(path: Path) -> None:
+    """Убрать временный каталог теста (ТОЧНЫЙ путь, созданный этим же тестом).
+    Зовётся в конце УСПЕШНОГО теста: после падения каталог остаётся для разбора."""
+    shutil.rmtree(path.parent, ignore_errors=True)
 
 
 # ── 1. узость гранта (коннектор) ─────────────────────────────────
@@ -195,6 +202,7 @@ def test_write_is_atomic_symlink_safe_and_0600():
     leftovers = [p.name for p in path.parent.iterdir()
                  if p.name.endswith(".tmp") and not p.is_symlink()]
     assert leftovers == [], f"остался временный файл: {leftovers}"
+    _cleanup(path)
     print("OK запись гранта: 0600, атомарно, симлинк рядом не разыменован")
 
 
@@ -215,6 +223,7 @@ def test_write_rejects_broad_and_bogus_values():
     except PolicyError:
         pass
     assert path.read_text() == before, "файл не должен был измениться"
+    _cleanup(path)
     print("OK валидация: глоб/не-URL/чужой ключ scope отвергнуты, файл цел")
 
 
@@ -238,6 +247,7 @@ def test_concurrent_grants_do_not_lose_each_other():
     text = path.read_text()
     missing = [i for i in range(6) if f"https://api.svc/admin/r{i}" not in text]
     assert not missing, f"гранты потеряны при гонке: {missing}\n{text}"
+    _cleanup(path)
     print("OK гонка: 6 одновременных грантов записаны все (межпроцессный лок)")
 
 
@@ -256,6 +266,7 @@ def test_revoke_via_wallet_scope():
         assert False, "правка при WALLET_POLICY_EDIT=0 должна отклоняться"
     except PolicyError:
         pass
+    _cleanup(path)
     print("OK отзыв: /wallet scope -<url> убирает грант, render его показывает")
 
 
@@ -337,6 +348,7 @@ def test_after_grant_same_request_passes_without_asking():
     finally:
         loop.close()
         asyncio.set_event_loop(None)
+    _cleanup(path)
     print("OK после гранта: тот же запрос без спроса, другой ресурс — спрашивает снова")
 
 
