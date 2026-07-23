@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Sequence, TYPE_CHECKING
 
@@ -86,7 +87,36 @@ class AgentVmRunner:
         problem = auth_problem(self.config.claude_env)
         if problem:
             return False, problem
+        if self.config.agent_vm_egress_proxy and not self._supports_egress_flags():
+            return False, (
+                "AGENT_VM_EGRESS_PROXY задан, но установленный agent-vm не знает "
+                "--egress-proxy: это флаги форка (docs/FORK-agent-vm-egress-proxy.md). "
+                "Апстримный бинарь упал бы на «unexpected argument», а без флага "
+                "egress гостя молча MITM-ит собственный прокси agent-vm и кошелёк "
+                "обойдён — поэтому отказываем сразу. Поставь форк или убери "
+                "AGENT_VM_EGRESS_PROXY."
+            )
+        ca = self.config.agent_vm_egress_ca
+        if ca and not ca.is_file():
+            return False, f"AGENT_VM_EGRESS_CA={ca} — файла нет (нужен PEM CA прокси)."
         return True, "ok"
+
+    def _supports_egress_flags(self) -> bool:
+        """Знает ли установленный agent-vm про --egress-proxy (форк или апстрим).
+
+        Спрашиваем сам бинарь (`--help`), а не версию: флаг может приехать в
+        апстрим, и тогда форк перестанет быть нужен — проверка переживёт это
+        без правок. Сбой запуска считаем «не знает»: лучше честный отказ на
+        старте, чем падение каждой сессии.
+        """
+        try:
+            out = subprocess.run(
+                [AGENT_VM_BIN, "claude", "--help"],
+                capture_output=True, timeout=20,
+            )
+        except Exception:  # noqa: BLE001 — любой сбой = считаем, что флага нет
+            return False
+        return b"--egress-proxy" in out.stdout + out.stderr
 
     def wrap(
         self,
@@ -122,6 +152,17 @@ class AgentVmRunner:
             self.config.claude_env, self.config.agent_vm_host_ip
         ):
             out += ["--allow-egress", host_ip]
+        # Egress гостя на наш прокси (кошелёк). Без этого весь HTTPS гостя
+        # прозрачно MITM-ит собственный прокси agent-vm своим CA, и наш
+        # перехват обойдён (замер F10 в ARCHITECTURE-claude-box.md). Флаги
+        # понимает форк (docs/FORK-agent-vm-egress-proxy.md); preflight
+        # проверяет их наличие, чтобы апстримный бинарь не падал на
+        # «unexpected argument» без объяснения.
+        if self.config.agent_vm_egress_proxy:
+            out += ["--egress-proxy", self.config.agent_vm_egress_proxy]
+            if self.config.agent_vm_egress_ca:
+                # CA доверяется на UPSTREAM-плече перехвата, в гостя не едет.
+                out += ["--egress-ca", str(self.config.agent_vm_egress_ca)]
         for port in publish_ports:
             out += ["--publish", f"{port}:{port}"]
         mounts = {str(self.root), *(str(p) for p in extra_rw if p != chdir)}

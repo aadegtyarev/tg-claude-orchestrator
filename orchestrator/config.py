@@ -150,6 +150,13 @@ class Config:
     # записан в claude_env, иначе при смене маршрута (VPN/DHCP) URL и
     # --allow-egress разъедутся и гость молча не достучится.
     agent_vm_host_ip: str | None
+    # Egress гостя на ВНЕШНИЙ прокси (форк agent-vm, docs/FORK-agent-vm-egress-proxy.md).
+    # Без них agent-vm ведёт себя как апстрим: весь egress гостя MITM-ит его
+    # собственный прокси, и наш кошелёк обойдён (F10). С ними egress
+    # переоткрывается на указанный прокси, а CA доверяется на UPSTREAM-плече
+    # (гость его не видит — он по-прежнему доверяет CA перехвата agent-vm).
+    agent_vm_egress_proxy: str | None
+    agent_vm_egress_ca: Path | None
     # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
     # allowlist песочницы).
     wallet_secrets_file: Path
@@ -301,6 +308,14 @@ class Config:
             ),
             agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),
             agent_vm_host_ip=agent_vm_host_ip,
+            agent_vm_egress_proxy=(
+                os.getenv("AGENT_VM_EGRESS_PROXY", "").strip() or None
+            ),
+            agent_vm_egress_ca=(
+                Path(raw).expanduser()
+                if (raw := os.getenv("AGENT_VM_EGRESS_CA", "").strip())
+                else None
+            ),
             wallet_secrets_file=Path(
                 os.getenv(
                     "WALLET_SECRETS_FILE",
