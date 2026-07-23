@@ -23,10 +23,15 @@
 кредлы в окружении (strip_credentials); НЕ изолируются текущий каталог (он всегда
 RW-бинд — запуск из $HOME вернёт домашку) и установка claude (~/.local/... RO).
 
-`--wallet <secret>` — vault-перехват TLS (Launcher §5.2): под капотом поднимается
-standalone MITM-прокси для прокси-секрета и в песочницу докидывается HTTPS_PROXY +
-объединённый CA-bundle, чтобы трафик к сервису под секретом шёл через кошелёк
-(значение секрета в песочницу не попадает). Реализация — box_cli/wallet.py.
+`--wallet <secret>` — кошелёк для одного секрета (Launcher §5.2). Что именно
+поднимается, решает вид секрета:
+  * прокси-секрет (connector) → MITM-перехват TLS: standalone-прокси + HTTPS_PROXY
+    и объединённый CA-bundle в песочнице;
+  * host/inject-секрет → PATH-шимы: standalone-демон кошелька на хосте, а в
+    песочнице каталог обёрток (git/gh/curl…) первым в PATH — модель зовёт
+    инструменты как обычно, вызов уходит на хост через `wallet exec`.
+В обоих случаях значение секрета в песочницу не попадает. Реализация —
+box_cli/wallet.py.
 """
 
 from __future__ import annotations
@@ -79,8 +84,10 @@ _USAGE = (
     "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
     "                   SSH_AUTH_SOCK), остальное окружение хоста наследуется;\n"
     "                   текущий каталог и установка claude остаются видны\n"
-    "  --wallet <секрет> vault-перехват TLS для прокси-секрета: трафик к сервису\n"
-    "                   идёт через кошелёк, значение секрета в песочницу не входит\n"
+    "  --wallet <секрет> дать сессии секрет, не показывая его значение:\n"
+    "                   прокси-секрет (connector) → перехват TLS (HTTPS_PROXY+CA),\n"
+    "                   host/inject-секрет → обёртки git/gh/curl первыми в PATH\n"
+    "                   (вызов уходит на хост через кошелёк, `wallet` тоже в PATH)\n"
     f"  --secrets <файл> путь к secrets.toml (по умолчанию {DEFAULT_SECRETS})\n"
     "  --               всё, что после, пробрасывается в claude\n"
     "  -h, --help       эта справка\n"
@@ -405,10 +412,11 @@ async def main_async(argv: Sequence[str]) -> int:
     # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
     env.update(profile_env_extra)
 
-    # Vault-перехват (--wallet): поднять standalone-прокси ДО песочницы и получить
-    # env-довесок (HTTPS_PROXY + CA-bundle) + доп. RW-бинд каталога bundle. Отказ
-    # (нет секрета/не прокси/сбой окружения) — честное сообщение + код из WalletError,
-    # без трейсбека. Teardown — в finally ниже (снять прокси, снести временный каталог).
+    # Кошелёк (--wallet): поднять ДО песочницы прокси-перехват (прокси-секрет) либо
+    # демон+шимы (host/inject-секрет) и получить env-довесок (HTTPS_PROXY+CA либо
+    # PATH+WALLET_FILE) + доп. RW-бинд временного каталога. Отказ (нет секрета/не
+    # разрешён/нечего заворачивать/сбой окружения) — честное сообщение + код из
+    # WalletError, без трейсбека. Teardown — в finally ниже.
     intercept = None
     # extra_rw начинается с каталога профиля (RW-бинд src==dst → HOME/CONFIG_DIR
     # валидны изнутри песочницы); wallet при наличии докидывает свой bundle-каталог.
@@ -418,8 +426,9 @@ async def main_async(argv: Sequence[str]) -> int:
         if engine != "bwrap":
             sys.stderr.write(
                 "claude-box: --wallet без bwrap НЕ изолирует $HOME — модель читает "
-                "secrets.toml/окружение напрямую; перехват включён, но используй "
-                "его только с --engine bwrap.\n")
+                "secrets.toml/окружение напрямую и может обойти обёртки (настоящие "
+                "git/gh лежат дальше в PATH); кошелёк включён, но страхует он "
+                "только вместе с --engine bwrap.\n")
         secrets_path = opts.secrets or Path(DEFAULT_SECRETS).expanduser()
         try:
             intercept = await setup_wallet_intercept(opts.wallet, secrets_path=secrets_path)
