@@ -12,7 +12,12 @@
      и закрывает master; мы джойним его поток).
 
 НЕ в этом срезе (честные заглушки, а не тихий no-op — правило прозрачности):
-`--vm`, `--profile`, `--wallet`, `-p`, подкоманды `init`/`profile`/`connect`.
+`--vm`, `--profile`, `-p`, подкоманды `init`/`profile`/`connect`.
+
+`--wallet <secret>` — vault-перехват TLS (Launcher §5.2): под капотом поднимается
+standalone MITM-прокси для прокси-секрета и в песочницу докидывается HTTPS_PROXY +
+объединённый CA-bundle, чтобы трафик к сервису под секретом шёл через кошелёк
+(значение секрета в песочницу не попадает). Реализация — box_cli/wallet.py.
 """
 
 from __future__ import annotations
@@ -48,18 +53,34 @@ class EngineConfig:
 ENGINES = ("bwrap", "off")
 _STUB_SUBCOMMANDS = ("init", "profile", "connect")
 # Флаги следующих срезов: распознаём, чтобы дать честный отказ, а не «unknown».
-_STUB_FLAGS = ("--vm", "--profile", "--wallet", "-p")
+_STUB_FLAGS = ("--vm", "--profile", "-p")
+
+DEFAULT_SECRETS = "~/.config/claude-orchestrator/secrets.toml"
 
 _USAGE = (
-    "claude-box [--engine bwrap|off] [-- <аргументы claude>]\n"
+    "claude-box [--engine bwrap|off] [--wallet <секрет> [--secrets <файл>]] "
+    "[-- <аргументы claude>]\n"
     "  Запустить claude (или CLAUDE_BIN) в песочнице и отдать терминал.\n"
-    "  --engine bwrap  файловая песочница bubblewrap (по умолчанию)\n"
-    "  --engine off    без изоляции\n"
-    "  --              всё, что после, пробрасывается в claude\n"
-    "  -h, --help      эта справка\n"
+    "  --engine bwrap   файловая песочница bubblewrap (по умолчанию)\n"
+    "  --engine off     без изоляции\n"
+    "  --wallet <секрет> vault-перехват TLS для прокси-секрета: трафик к сервису\n"
+    "                   идёт через кошелёк, значение секрета в песочницу не входит\n"
+    f"  --secrets <файл> путь к secrets.toml (по умолчанию {DEFAULT_SECRETS})\n"
+    "  --               всё, что после, пробрасывается в claude\n"
+    "  -h, --help       эта справка\n"
     "\nНе реализовано в этом срезе (следующие срезы): "
-    "--vm, --profile, --wallet, -p, init/profile/connect."
+    "--vm, --profile, -p, init/profile/connect."
 )
+
+
+@dataclass(frozen=True)
+class Options:
+    """Разобранные аргументы CLI. wallet=None — перехват не запрошен."""
+
+    engine: str
+    passthrough: list[str]
+    wallet: str | None = None
+    secrets: Path | None = None
 
 
 class CliError(SystemExit):
@@ -81,8 +102,8 @@ def _config_dir_from_env() -> Path | None:
 
 
 # ── Разбор аргументов ────────────────────────────────────────────────────────
-def parse_args(argv: Sequence[str]) -> tuple[str, list[str]]:
-    """Разобрать argv → (engine, passthrough). Заглушки/ошибки → CliError.
+def parse_args(argv: Sequence[str]) -> Options:
+    """Разобрать argv → Options. Заглушки/ошибки → CliError.
 
     Всё после первого `--` — сквозные аргументы claude (не парсятся здесь).
     """
@@ -100,33 +121,49 @@ def parse_args(argv: Sequence[str]) -> tuple[str, list[str]]:
         )
 
     engine = "bwrap"
+    wallet: str | None = None
+    secrets: Path | None = None
+
+    def _value(flag: str, idx: int, inline: str | None) -> tuple[str, int]:
+        """Значение флага: из `--flag=val` (inline) либо из следующего аргумента."""
+        if inline is not None:
+            return inline, idx + 1
+        if idx + 1 >= len(opts):
+            raise CliError(f"{flag} требует значение")
+        return opts[idx + 1], idx + 2
+
     i = 0
     while i < len(opts):
         a = opts[i]
+        key, eq, inline_val = a.partition("=")
+        inline = inline_val if eq else None
         if a in ("-h", "--help"):
             sys.stdout.write(_USAGE + "\n")
             raise SystemExit(0)
-        if a == "--engine":
-            if i + 1 >= len(opts):
-                raise CliError("--engine требует значение (bwrap|off)")
-            engine = opts[i + 1]
-            i += 2
+        if key == "--engine":
+            engine, i = _value("--engine", i, inline)
             continue
-        if a.startswith("--engine="):
-            engine = a.split("=", 1)[1]
-            i += 1
+        if key == "--wallet":
+            wallet, i = _value("--wallet", i, inline)
+            continue
+        if key == "--secrets":
+            raw, i = _value("--secrets", i, inline)
+            secrets = Path(raw).expanduser()
             continue
         if a in _STUB_FLAGS:
             raise CliError(
                 f"флаг «{a}» ещё не реализован (следующие срезы: "
-                "профили/кошелёк/VM/unattended). Сейчас — только запуск в "
-                "песочнице: claude-box [--engine bwrap|off] [-- …]."
+                "профили/VM/unattended). Сейчас — запуск в песочнице с "
+                "опциональным --wallet: claude-box [--engine bwrap|off] "
+                "[--wallet <секрет>] [-- …]."
             )
         raise CliError(f"неизвестный аргумент «{a}». См. claude-box --help.")
 
     if engine not in ENGINES:
         raise CliError(f"--engine={engine!r} — допустимо: {' | '.join(ENGINES)}")
-    return engine, passthrough
+    if secrets is not None and wallet is None:
+        raise CliError("--secrets имеет смысл только с --wallet <секрет>.")
+    return Options(engine=engine, passthrough=passthrough, wallet=wallet, secrets=secrets)
 
 
 # ── Сборка запуска ───────────────────────────────────────────────────────────
@@ -136,12 +173,17 @@ def make_engine_runner(engine: str, root: Path) -> Runner:
     return make_runner(config, root)
 
 
-def build_argv(runner: Runner, command: Sequence[str], cwd: Path) -> list[str]:
-    """Завернуть команду раннером: cwd — рабочий каталог и единственный RW-путь.
+def build_argv(
+    runner: Runner, command: Sequence[str], cwd: Path,
+    extra_rw: Sequence[Path] = (),
+) -> list[str]:
+    """Завернуть команду раннером: cwd — рабочий каталог и RW-путь; extra_rw —
+    дополнительные RW-бинды (напр. временный каталог CA-bundle для --wallet, чтобы
+    он был виден в песочнице тем же путём).
 
     Без session/channel/hooks: только «запусти это в песочнице в этом каталоге».
     """
-    return runner.wrap(list(command), chdir=cwd, extra_rw=[cwd])
+    return runner.wrap(list(command), chdir=cwd, extra_rw=[cwd, *extra_rw])
 
 
 def build_env(engine: str) -> dict[str, str]:
@@ -244,7 +286,8 @@ async def run(
 
 
 async def main_async(argv: Sequence[str]) -> int:
-    engine, passthrough = parse_args(argv)
+    opts = parse_args(argv)
+    engine = opts.engine
     root = repo_root()
     runner = make_engine_runner(engine, root)
 
@@ -258,9 +301,32 @@ async def main_async(argv: Sequence[str]) -> int:
 
     cwd = os.getcwd()
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
-    command = [claude_bin, *passthrough]
-    full_argv = build_argv(runner, command, Path(cwd))
+    command = [claude_bin, *opts.passthrough]
     env = build_env(engine)
+
+    # Vault-перехват (--wallet): поднять standalone-прокси ДО песочницы и получить
+    # env-довесок (HTTPS_PROXY + CA-bundle) + доп. RW-бинд каталога bundle. Отказ
+    # (нет секрета/не прокси/сбой окружения) — честное сообщение + код из WalletError,
+    # без трейсбека. Teardown — в finally ниже (снять прокси, снести временный каталог).
+    intercept = None
+    extra_rw: list[Path] = []
+    if opts.wallet is not None:
+        from .wallet import WalletError, setup_wallet_intercept
+        if engine != "bwrap":
+            sys.stderr.write(
+                "claude-box: --wallet без bwrap НЕ изолирует $HOME — модель читает "
+                "secrets.toml/окружение напрямую; перехват включён, но используй "
+                "его только с --engine bwrap.\n")
+        secrets_path = opts.secrets or Path(DEFAULT_SECRETS).expanduser()
+        try:
+            intercept = await setup_wallet_intercept(opts.wallet, secrets_path=secrets_path)
+        except WalletError as e:
+            sys.stderr.write(f"claude-box: --wallet: {e}\n")
+            return e.code
+        env.update(intercept.env)
+        extra_rw = intercept.extra_rw
+
+    full_argv = build_argv(runner, command, Path(cwd), extra_rw)
 
     stdin_fd, stdout_fd = 0, 1
     interactive = os.isatty(stdin_fd)
@@ -281,21 +347,27 @@ async def main_async(argv: Sequence[str]) -> int:
     # печатаем ошибку). Сбой спавна/запуска (напр. CLAUDE_BIN на несуществующий
     # бинарь) → честный отказ в stderr + код 1, а не сырой трейсбек: остальной
     # CLI держит эту планку (CliError), держим и здесь.
-    with raw_terminal(stdin_fd):
-        try:
-            return await run(
-                full_argv, cwd=cwd, env=env, on_output=on_output,
-                interactive=interactive, stdin_fd=stdin_fd, rows=rows, cols=cols,
-            )
-        except OSError as e:
-            sys.stderr.write(
-                f"claude-box: не удалось запустить «{claude_bin}»: {e}\n"
-                "Проверь CLAUDE_BIN и что бинарь есть в PATH.\n"
-            )
-            return 1
-        except Exception as e:  # noqa: BLE001 — любой сбой запуска = честный отказ
-            sys.stderr.write(f"claude-box: сбой запуска: {e}\n")
-            return 1
+    try:
+        with raw_terminal(stdin_fd):
+            try:
+                return await run(
+                    full_argv, cwd=cwd, env=env, on_output=on_output,
+                    interactive=interactive, stdin_fd=stdin_fd, rows=rows, cols=cols,
+                )
+            except OSError as e:
+                sys.stderr.write(
+                    f"claude-box: не удалось запустить «{claude_bin}»: {e}\n"
+                    "Проверь CLAUDE_BIN и что бинарь есть в PATH.\n"
+                )
+                return 1
+            except Exception as e:  # noqa: BLE001 — любой сбой запуска = честный отказ
+                sys.stderr.write(f"claude-box: сбой запуска: {e}\n")
+                return 1
+    finally:
+        # Снять прокси (порт освобождается) и снести временный каталог bundle —
+        # даже при исключении/Ctrl-C. Не течём.
+        if intercept is not None:
+            await intercept.close()
 
 
 def main(argv: Iterable[str] | None = None) -> int:
