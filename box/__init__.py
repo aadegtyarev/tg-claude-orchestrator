@@ -17,7 +17,10 @@ claude. Оркестратор — надстройка над этим паке
                 (READY_SILENCE_SEC, READY_TIMEOUT_MAX);
   • pty.py    — ядро PTY-запуска: open_pty (openpty + размер терминала) и
                 драйвер (дренаж вывода + авто-ответы на стартовые диалоги),
-                отдающий вывод наружу через колбэк on_output.
+                отдающий вывод наружу через колбэк on_output;
+  • transcript_path.py — «конфиг клиента»: КУДА claude пишет транскрипт
+                (профиль CLAUDE_CONFIG_DIR/$HOME + кодирование cwd), §5.2.
+                Чистые функции resolve_config_dir/transcript_path.
 
 `launch(task)->Handle` (единый фасад запуска: сборка argv/env, ожидание
 готовности, resume/clear) и CLI `claude-box` переезжают следующими срезами;
