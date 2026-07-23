@@ -276,11 +276,26 @@ async def main_async(argv: Sequence[str]) -> int:
         with contextlib.suppress(OSError):
             os.write(stdout_fd, chunk)
 
+    # raw_terminal возвращает терминал в finally — обёртка исключений НЕ должна
+    # его перекрыть, поэтому try внутри with (терминал восстановлен раньше, чем
+    # печатаем ошибку). Сбой спавна/запуска (напр. CLAUDE_BIN на несуществующий
+    # бинарь) → честный отказ в stderr + код 1, а не сырой трейсбек: остальной
+    # CLI держит эту планку (CliError), держим и здесь.
     with raw_terminal(stdin_fd):
-        return await run(
-            full_argv, cwd=cwd, env=env, on_output=on_output,
-            interactive=interactive, stdin_fd=stdin_fd, rows=rows, cols=cols,
-        )
+        try:
+            return await run(
+                full_argv, cwd=cwd, env=env, on_output=on_output,
+                interactive=interactive, stdin_fd=stdin_fd, rows=rows, cols=cols,
+            )
+        except OSError as e:
+            sys.stderr.write(
+                f"claude-box: не удалось запустить «{claude_bin}»: {e}\n"
+                "Проверь CLAUDE_BIN и что бинарь есть в PATH.\n"
+            )
+            return 1
+        except Exception as e:  # noqa: BLE001 — любой сбой запуска = честный отказ
+            sys.stderr.write(f"claude-box: сбой запуска: {e}\n")
+            return 1
 
 
 def main(argv: Iterable[str] | None = None) -> int:

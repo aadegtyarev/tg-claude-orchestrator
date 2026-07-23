@@ -13,8 +13,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import os
+import pty
 import sys
+import termios
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -187,6 +191,103 @@ async def test_e2e_bwrap_boxok_or_skip():
     assert not leaked, f"утекли fd: {leaked}"
 
 
+# ── raw_terminal: не сломать терминал ────────────────────────────────────────
+def test_raw_terminal_restores_on_normal_exit():
+    """tty-настройки после нормального выхода из with == до входа."""
+    master, slave = pty.openpty()
+    try:
+        before = termios.tcgetattr(slave)
+        with cli.raw_terminal(slave):
+            pass  # внутри — raw (termios изменён)
+        after = termios.tcgetattr(slave)
+        assert after == before, "raw_terminal не восстановил tty при нормальном выходе"
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_raw_terminal_restores_on_exception():
+    """Исключение внутри with НЕ оставляет терминал сломанным (restore в finally)."""
+    master, slave = pty.openpty()
+
+    class _Boom(Exception):
+        pass
+
+    try:
+        before = termios.tcgetattr(slave)
+        try:
+            with cli.raw_terminal(slave):
+                raise _Boom()
+        except _Boom:
+            pass
+        after = termios.tcgetattr(slave)
+        assert after == before, "raw_terminal не восстановил tty при исключении"
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_raw_terminal_noop_on_non_tty():
+    """Не-tty (pipe) — no-op, не падает (isatty False)."""
+    r, w = os.pipe()
+    try:
+        with cli.raw_terminal(r):
+            pass
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+# ── интерактивный relay: stdin доходит до процесса ───────────────────────────
+async def test_interactive_relay_stdin_reaches_process():
+    """interactive=True: байты из stdin_fd доезжают в pty процесса (add_reader/
+    copy_ready), процесс их отражает, fd после чисты."""
+    stdin_r, stdin_w = os.pipe()
+    before = _fds()
+    buf = bytearray()
+    argv = cli.build_argv(
+        cli.make_engine_runner("off", cli.repo_root()),
+        ["sh", "-c", "read x; echo GOT-$x"],
+        Path(os.getcwd()),
+    )
+    # Данные готовы ДО запуска — add_reader сработает сразу, как поднимется цикл.
+    os.write(stdin_w, b"HELLO\n")
+    try:
+        code = await cli.run(
+            argv, cwd=os.getcwd(), env=os.environ.copy(),
+            on_output=buf.extend, interactive=True, stdin_fd=stdin_r,
+        )
+    finally:
+        os.close(stdin_w)
+        os.close(stdin_r)
+    assert code == 0, f"код возврата {code}"
+    assert b"GOT-HELLO" in bytes(buf), f"stdin не дошёл до процесса: {bytes(buf)!r}"
+    # stdin_r/stdin_w уже были в before (созданы раньше) → в leaked не попадут;
+    # проверяем, что pty_master драйвер закрыл (не течёт).
+    leaked = _fds() - before
+    assert not leaked, f"утекли fd: {leaked}"
+
+
+# ── честный отказ вместо трейсбека при сбое запуска ──────────────────────────
+def test_nonexistent_claude_bin_honest_error():
+    """CLAUDE_BIN на несуществующий бинарь → внятная ошибка + код 1, не трейсбек."""
+    old = os.environ.get("CLAUDE_BIN")
+    os.environ["CLAUDE_BIN"] = "/nonexistent/claude-xyz-42"
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            code = cli.main(["--engine", "off"])
+    finally:
+        if old is None:
+            os.environ.pop("CLAUDE_BIN", None)
+        else:
+            os.environ["CLAUDE_BIN"] = old
+    assert code == 1, f"ожидался ненулевой код, получен {code}"
+    assert "не удалось запустить" in err.getvalue(), (
+        f"нет честного сообщения об ошибке: {err.getvalue()!r}"
+    )
+
+
 def main() -> None:
     test_parse_default_engine_bwrap()
     test_parse_engine_and_passthrough()
@@ -198,6 +299,11 @@ def main() -> None:
     test_build_argv_bwrap_wraps_and_cwd_rw()
     test_copy_ready_moves_bytes_and_detects_eof()
     test_copy_ready_write_error_returns_false()
+    test_raw_terminal_restores_on_normal_exit()
+    test_raw_terminal_restores_on_exception()
+    test_raw_terminal_noop_on_non_tty()
+    test_nonexistent_claude_bin_honest_error()
+    asyncio.run(test_interactive_relay_stdin_reaches_process())
     asyncio.run(test_e2e_off_boxok_reaches_output())
     asyncio.run(test_e2e_bwrap_boxok_or_skip())
     print("ALL BOX-CLI OK")
