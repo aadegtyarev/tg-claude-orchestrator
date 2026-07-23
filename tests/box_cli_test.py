@@ -5,7 +5,6 @@
 Что покрыто:
   • parse_args — engine, passthrough, заглушки (--vm/init/…) → честный отказ;
   • build_argv — bwrap-обёртка на месте, cwd RW; off — команда как есть;
-  • copy_ready — relay-логика на pipe-паре (данные + EOF), без интерактива;
   • run() e2e — команда в песочнице/direct: вывод «BOXOK» доходит через
     on_output, код 0, fd не текут (мягкий скип bwrap при отсутствии).
 """
@@ -142,40 +141,6 @@ def test_build_argv_bwrap_wraps_and_cwd_rw():
     assert tail == ["claude", "--model", "opus"]
 
 
-# ── copy_ready (relay-логика) ────────────────────────────────────────────────
-def test_copy_ready_moves_bytes_and_detects_eof():
-    r_in, w_in = os.pipe()
-    r_out, w_out = os.pipe()
-    try:
-        os.write(w_in, b"hello relay")
-        assert cli.copy_ready(r_in, w_out) is True
-        assert os.read(r_out, 1024) == b"hello relay"
-        # Закрытая запись → EOF на чтении → False (стоп relay).
-        os.close(w_in)
-        assert cli.copy_ready(r_in, w_out) is False
-    finally:
-        for fd in (r_in, r_out, w_out):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def test_copy_ready_write_error_returns_false():
-    r_in, w_in = os.pipe()
-    r_out, w_out = os.pipe()
-    os.write(w_in, b"x")
-    os.close(r_out)  # приёмник закрыт → запись упадёт → False
-    try:
-        assert cli.copy_ready(r_in, w_out) is False
-    finally:
-        for fd in (r_in, w_in, w_out):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
 # ── e2e: run() через Engine ──────────────────────────────────────────────────
 async def _run_capture(engine: str) -> tuple[int, bytes]:
     buf = bytearray()
@@ -266,7 +231,7 @@ def test_raw_terminal_noop_on_non_tty():
 # ── интерактивный relay: stdin доходит до процесса ───────────────────────────
 async def test_interactive_relay_stdin_reaches_process():
     """interactive=True: байты из stdin_fd доезжают в pty процесса (add_reader/
-    copy_ready), процесс их отражает, fd после чисты."""
+    арбитр stdin), процесс их отражает, fd после чисты."""
     stdin_r, stdin_w = os.pipe()
     before = _fds()
     buf = bytearray()
@@ -323,8 +288,6 @@ def main() -> None:
     test_parse_unknown_arg_refused()
     test_build_argv_off_is_command_asis()
     test_build_argv_bwrap_wraps_and_cwd_rw()
-    test_copy_ready_moves_bytes_and_detects_eof()
-    test_copy_ready_write_error_returns_false()
     test_raw_terminal_restores_on_normal_exit()
     test_raw_terminal_restores_on_exception()
     test_raw_terminal_noop_on_non_tty()

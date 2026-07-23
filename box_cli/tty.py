@@ -1,0 +1,251 @@
+"""Арбитр терминала claude-box: ЕДИНСТВЕННЫЙ владелец stdin + VaultHost поверх него.
+
+Зачем. В claude-box один и тот же fd (stdin терминала) нужен двум потребителям:
+
+  * PTY-relay лончера — гонит нажатия оператора в claude (терминал в raw);
+  * кошелёк — спрашивает confirm/ASK перед тем, как пустить команду на хост
+    с реальным кредом.
+
+Наивное решение (каждый вешает свой `loop.add_reader`) НЕ работает и ломается
+необратимо: в asyncio второй add_reader на тот же fd ЗАМЕНЯЕТ колбэк, а
+`remove_reader` в finally снимает читателя ЦЕЛИКОМ. То есть после первого же
+confirm (а confirm в policy — штатная настройка, а не экзотика) клавиатура в
+сессии умирала бы до конца процесса, ответ «y» печатался бы вслепую (raw = нет
+эха), и его байты воровались бы у claude.
+
+Поэтому stdin здесь ровно один хозяин — StdinArbiter:
+
+  * один add_reader на весь запуск;
+  * по умолчанию прочитанные байты уходят в PTY-мастер процесса;
+  * на время вопроса арбитр ПЕРЕКЛЮЧАЕТ режим: терминал возвращается в
+    нормальный (канонический, с эхом — оператор видит, что печатает), вопрос
+    печатается в stderr, собранная строка отдаётся ожидающему future, терминал
+    возвращается в raw, и байты снова льются в PTY;
+  * восстановление режима — в finally, поэтому исключение/Ctrl-C/таймаут не
+    оставляют терминал сломанным;
+  * молчание оператора = таймаут = пустой ответ = DENY (правило «никогда не
+    повисать»: висящий вопрос заморозил бы и сессию).
+
+BoxVaultHost — реализация vault.host.VaultHost поверх арбитра; подставляется в
+демон/прокси кошелька ВМЕСТО TtyVaultHost (тот остаётся для `vault serve`, где
+stdin ничей и читать его самому можно).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import re
+import sys
+import termios
+from typing import Callable
+
+logger = logging.getLogger("claude-box.tty")
+
+_TAG = re.compile(r"<[^>]+>")  # снять HTML-разметку из observe-строк для терминала
+
+# Таймаут вопроса. У TtyVaultHost без таймаута живёт только confirm (там вопрос
+# держит один лишь `vault serve`), здесь же вопрос держит ВЕСЬ терминал сессии:
+# зависший confirm заморозил бы и claude. Поэтому таймаут на обоих — молчание
+# оператора трактуется как отказ (безопасная сторона), как и в ASK.
+PROMPT_TIMEOUT = 120.0
+
+_YES = ("y", "yes", "д", "да")
+
+
+class StdinArbiter:
+    """Единственный владелец stdin: relay в PTY + вопросы оператору.
+
+    write_bytes — куда лить байты в обычном режиме (обычно os.write в pty_master
+    процесса); возвращает False, если писать больше некуда (EOF/ошибка) — тогда
+    арбитр снимает relay, но остаётся живым для вопросов.
+    """
+
+    def __init__(
+        self,
+        stdin_fd: int,
+        *,
+        write_bytes: Callable[[bytes], bool] | None = None,
+        timeout: float = PROMPT_TIMEOUT,
+        log: logging.Logger | None = None,
+    ) -> None:
+        self.fd = stdin_fd
+        self._write = write_bytes
+        self.timeout = timeout
+        self.log = log or logger
+        self._reader_on = False
+        self._relay_on = True
+        self._pending: asyncio.Future[str] | None = None
+        self._buf = bytearray()
+        # Один вопрос за раз: терминал общий, два параллельных вопроса перемешали
+        # бы ввод (тот же урок, что у TtyVaultHost — один лок на confirm и ask).
+        self._lock = asyncio.Lock()
+        # Настройки терминала ДО raw — их и восстанавливаем на время вопроса
+        # (канонический режим + эхо). Снимаем при создании арбитра, то есть до
+        # входа в raw_terminal.
+        self._cooked: list | None = None
+        if os.isatty(self.fd):
+            with contextlib.suppress(termios.error, OSError):
+                self._cooked = termios.tcgetattr(self.fd)
+
+    # ── владение fd ──────────────────────────────────────────────────────────
+    def set_sink(self, write_bytes: Callable[[bytes], bool]) -> None:
+        """Назначить приёмник relay (PTY-мастер появляется позже арбитра)."""
+        self._write = write_bytes
+        self._relay_on = True
+
+    def start(self) -> bool:
+        """Повесить ЕДИНСТВЕННЫЙ читатель stdin. False — fd не селектится
+        (не tty/закрыт): тогда relay нет, а вопросы честно отвечают DENY."""
+        if self._reader_on:
+            return True
+        try:
+            asyncio.get_running_loop().add_reader(self.fd, self._readable)
+        except (OSError, ValueError):
+            return False
+        self._reader_on = True
+        return True
+
+    def stop(self) -> None:
+        """Снять читатель (выход из запуска). Идемпотентно."""
+        if not self._reader_on:
+            return
+        self._reader_on = False
+        with contextlib.suppress(Exception):
+            asyncio.get_running_loop().remove_reader(self.fd)
+
+    # ── чтение ───────────────────────────────────────────────────────────────
+    def _readable(self) -> None:
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError:
+            data = b""
+        fut = self._pending
+        if fut is not None and not fut.done():
+            self._collect(data, fut)
+            return
+        if not data:  # EOF stdin — релеить больше нечего, но вопросы ещё живы
+            self._relay_on = False
+            self.stop()
+            return
+        if self._relay_on and self._write is not None and not self._write(data):
+            self._relay_on = False
+
+    def _collect(self, data: bytes, fut: asyncio.Future[str]) -> None:
+        """Режим вопроса: копим строку до перевода, остаток отдаём relay."""
+        if not data:  # EOF посреди вопроса — ответа не будет, значит отказ
+            fut.set_result("")
+            return
+        self._buf += data
+        for i, ch in enumerate(self._buf):
+            if ch in (0x0A, 0x0D):  # \n или \r
+                line = bytes(self._buf[:i]).decode("utf-8", "replace")
+                rest = bytes(self._buf[i + 1:])
+                self._buf.clear()
+                fut.set_result(line)
+                # Всё, что оператор успел напечатать после ответа, — это уже ввод
+                # сессии: не теряем его, а отдаём в PTY.
+                if rest and self._relay_on and self._write is not None:
+                    if not self._write(rest):
+                        self._relay_on = False
+                return
+
+    # ── вопрос оператору ─────────────────────────────────────────────────────
+    @contextlib.contextmanager
+    def _normal_mode(self):
+        """Вернуть терминал в нормальный режим (эхо+строки) на время вопроса и
+        восстановить прежний (raw) в finally — при любом исходе."""
+        if self._cooked is None or not os.isatty(self.fd):
+            yield
+            return
+        try:
+            current = termios.tcgetattr(self.fd)
+        except (termios.error, OSError):
+            yield
+            return
+        try:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self._cooked)
+            yield
+        finally:
+            with contextlib.suppress(termios.error, OSError):
+                termios.tcsetattr(self.fd, termios.TCSANOW, current)
+
+    async def prompt(self, question: str, preview: str) -> str:
+        """Спросить оператора и вернуть введённую строку («» = нет ответа).
+
+        Читаем ТЕМ ЖЕ единственным читателем (никаких своих add_reader), поэтому
+        relay не ломается: после ответа байты снова уходят в PTY. Таймаут — свой,
+        по истечении возвращаем «» (вызывающий трактует как DENY)."""
+        if not self.start():
+            self.log.warning("вопрос без читаемого stdin → отказ: %s", question)
+            return ""
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[str] = loop.create_future()
+            self._buf.clear()
+            self._pending = fut
+            try:
+                with self._normal_mode():
+                    sys.stderr.write(f"\r\n{question}\r\n  {preview}\r\n[y/N] ")
+                    sys.stderr.flush()
+                    try:
+                        return await asyncio.wait_for(fut, self.timeout)
+                    except asyncio.TimeoutError:
+                        sys.stderr.write("\r\n(нет ответа — отказ)\r\n")
+                        sys.stderr.flush()
+                        return ""
+            finally:
+                self._pending = None
+                self._buf.clear()
+
+
+class BoxVaultHost:
+    """VaultHost для claude-box: confirm/ASK через арбитра терминала.
+
+    Отличия от TtyVaultHost: не трогает stdin сам (спрашивает через арбитра,
+    который делит fd с relay) и даёт таймаут ОБОИМ вопросам — вопрос держит
+    терминал живой сессии, зависнуть тут нельзя. Наблюдаемость/аудит — в лог, как
+    и у TtyVaultHost (значения секретов не печатаются нигде)."""
+
+    def __init__(
+        self, arbiter: StdinArbiter, *, assume_yes: bool = False,
+        log: logging.Logger | None = None,
+    ) -> None:
+        self.arbiter = arbiter
+        self.assume_yes = assume_yes
+        self.log = log or logger
+
+    async def _yesno(self, question: str, preview: str, what: str) -> bool:
+        if self.assume_yes:
+            return True
+        if not os.isatty(self.arbiter.fd):
+            self.log.warning("%s без tty → отказ: %s", what, preview)
+            return False
+        ans = await self.arbiter.prompt(question, preview)
+        ok = ans.strip().lower() in _YES
+        if not ok:
+            self.log.info("%s: отказ оператора (%s)", what, preview)
+        return ok
+
+    async def confirm(self, session_name: str, description: str, preview: str) -> bool:
+        return await self._yesno(
+            f"кошелёк: подтвердить «{description}»?", preview, "confirm")
+
+    async def ask(self, session_name: str, description: str, preview: str) -> bool:
+        return await self._yesno(
+            f"кошелёк: РАЗРЕШИТЬ доступ «{description}»?", preview, "ask")
+
+    async def observe(self, session_name: str, line_html: str) -> None:
+        self.log.info("[%s] %s", session_name, _TAG.sub("", line_html))
+
+    def record(self, session_name: str, *, secret: str, cmd: str, allowed: bool) -> None:
+        self.log.info("audit [%s] %s: %s → %s", session_name, secret, cmd,
+                      "allowed" if allowed else "denied")
+
+    async def notify_denied(self, session_name: str, cmd_display: str) -> None:
+        self.log.warning("[%s] ОТКАЗ: %s", session_name, cmd_display)
+
+
+__all__ = ["BoxVaultHost", "StdinArbiter", "PROMPT_TIMEOUT"]

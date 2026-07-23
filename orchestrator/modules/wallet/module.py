@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,12 +54,14 @@ from vault.redact import _redact_text
 from vault.tls import VaultCA, VaultCAError
 from vault.secret import (
     DEFAULT_HOST_COMMANDS,  # noqa: F401 — ре-экспорт для тестов/обратной совместимости
-    GIT_NETWORK,
     Secret,  # noqa: F401 — ре-экспорт для тестов
     _always_denied,  # noqa: F401 — ре-экспорт для тестов (движок решения — vault.verdict)
     _prints_token,  # noqa: F401 — ре-экспорт для тестов (исполнение — vault.daemon)
     marker,
 )
+# Генератор обёрток общий с CLI claude-box (§5.2): один git-шим на обоих
+# потребителей (box_cli не может импортировать orchestrator.*).
+from vault.shims import SHIM_DIRNAME, git_shim, tool_names, write_shims
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore
 
 from .host import OrchestratorVaultHost
@@ -71,10 +72,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Каталог per-session обёрток внутри приватного дома сессии; ставится ПЕРВЫМ в
-# PATH песочницы (SessionManager.path_hooks), поэтому завёрнутые инструменты
-# побеждают настоящие бинари. Имя знает и ядро (session_home) — держим синхронно.
-SHIM_DIRNAME = ".wallet-bin"
+# SHIM_DIRNAME (каталог per-session обёрток в приватном доме сессии; ставится
+# ПЕРВЫМ в PATH песочницы через SessionManager.path_hooks) — из vault.shims,
+# ре-экспорт выше: имя знает и ядро (session_home), держим одно на всех.
 
 # Объединённый trust-bundle (системные корни + CA Vault) в приватном доме
 # сессии. SSL_CERT_FILE указывает СЮДА, а не только на CA Vault: иначе процесс
@@ -441,59 +441,27 @@ class WalletModule:
         """Голые имена инструментов, которые надо завернуть для этой сессии —
         из `commands` её НЕ-shared секретов. shared пропускаем: их значение уже
         лежит в env песочницы (модель зовёт инструмент напрямую, хостовый
-        раунд-трип не нужен). Из шаблона берём первый токен (`curl https://a/*`
-        → curl); чистые глобы (`*`) не заворачиваем — не бинарь."""
+        раунд-трип не нужен). Отбор имён из шаблонов — vault.shims.tool_names."""
         tools: set[str] = set()
         for s in self.store.load().values():
             if s.shared or not s.session_allowed(session.name):
                 continue
-            for pat in s.effective_commands:
-                parts = pat.split()
-                tool = os.path.basename(parts[0]) if parts else ""
-                if tool and not any(c in tool for c in "*?["):
-                    tools.add(tool)
+            tools |= tool_names(s.effective_commands)
         return tools
 
     def _git_shim(self) -> str:
-        """Обёртка git: сетевые подкоманды → на хост через кошелёк, локальные →
-        настоящий git в песочнице. Путь настоящего git резолвим на хосте (/usr
-        у песочницы тот же RO-бинд, поэтому путь совпадает)."""
-        real = shutil.which("git") or "/usr/bin/git"
-        nets = "|".join(GIT_NETWORK)
-        return (
-            "#!/bin/sh\n"
-            "# Обёртка кошелька (генерируется): сетевые git-подкоманды идут на\n"
-            "# хост через `wallet exec` (креды хоста), локальные — настоящим git.\n"
-            f'case "${{1:-}}" in\n'
-            f'  {nets}) exec wallet exec git "$@" ;;\n'
-            "esac\n"
-            f'exec {real} "$@"\n'
-        )
+        """Обёртка git — общий генератор vault.shims.git_shim (ре-экспорт для тестов)."""
+        return git_shim()
 
     def _provision_shims(self, session) -> None:
         """Полная перегенерация обёрток в <дом-сессии>/.wallet-bin. Заворачиваем
-        gh/curl/ssh/… целиком (→ `wallet exec <tool>`), git — особо (см. _git_shim).
+        gh/curl/ssh/… целиком (→ `wallet exec <tool>`), git — особо (см. git_shim).
         Перегенерация чистит устаревшие обёртки, если секрет/команду отозвали."""
         shim_dir = self.core.manager.session_home(session) / SHIM_DIRNAME
         try:
-            if shim_dir.exists():
-                for old in shim_dir.iterdir():
-                    if old.is_file() or old.is_symlink():
-                        old.unlink()
-            tools = self._session_tools(session)
-            if not tools:
-                return
-            shim_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(shim_dir, 0o700)
-            for tool in sorted(tools):
-                script = self._git_shim() if tool == "git" else (
-                    f'#!/bin/sh\nexec wallet exec {tool} "$@"\n'
-                )
-                p = shim_dir / tool
-                p.write_text(script)
-                os.chmod(p, 0o755)
-            logger.info(
-                "wallet: обёртки сессии %s: %s", session.name, ", ".join(sorted(tools))
-            )
+            written = write_shims(shim_dir, self._session_tools(session))
+            if written:
+                logger.info(
+                    "wallet: обёртки сессии %s: %s", session.name, ", ".join(written))
         except OSError as e:
             logger.error("wallet: обёртки для %s не созданы: %s", session.name, e)

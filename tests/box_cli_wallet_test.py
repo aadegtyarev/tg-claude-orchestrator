@@ -69,6 +69,11 @@ def _proxy_secrets_toml(scope_prefix: str) -> str:
         "[secrets.hostcred]\n"       # обычный host-passthrough (не прокси)
         'sessions = ["*"]\n'
         'commands = ["gh"]\n'
+        "\n"
+        "[secrets.foreign]\n"        # прокси-секрет чужой сессии
+        'value = "X"\n'
+        'sessions = ["prod-*"]\n'
+        'connector = "generic-bearer"\n'
     )
 
 
@@ -80,7 +85,10 @@ def _have_openssl() -> bool:
 # ── ЮНИТ ────────────────────────────────────────────────────────────
 
 async def test_setup_refusals():
-    """Honest-отказы: нет секрета и не-прокси-секрет → WalletError код 2."""
+    """Honest-отказы: нет секрета и секрет не разрешён «claude-box» → код 2.
+
+    NB: НЕ-прокси-секрет отказом больше не является — он уходит на путь шимов
+    (см. tests/box_cli_shims_test.py); здесь остаётся общая для обоих путей часть."""
     if _IMPORT_ERR is not None:
         return _skip(f"импорт не удался: {_IMPORT_ERR}")
     tmp = Path(tempfile.mkdtemp(prefix="cli_wallet_refuse_"))
@@ -93,15 +101,15 @@ async def test_setup_refusals():
         assert e.code == 2, e.code
     else:
         raise AssertionError("несуществующий секрет должен дать WalletError")
-    # host-секрет — не прокси
+    # секрет есть, но эта «сессия» ему не разрешена
     try:
-        await setup_wallet_intercept("hostcred", secrets_path=secrets)
+        await setup_wallet_intercept("foreign", secrets_path=secrets)
     except WalletError as e:
         assert e.code == 2, e.code
-        assert "не прокси" in str(e), str(e)
+        assert "не разрешён" in str(e), str(e)
     else:
-        raise AssertionError("не-прокси-секрет должен дать WalletError")
-    print("OK honest-отказ: нет секрета / не прокси-секрет → код 2")
+        raise AssertionError("секрет чужой сессии должен дать WalletError")
+    print("OK honest-отказ: нет секрета / не разрешён claude-box → код 2")
 
 
 async def test_setup_env_bundle_and_teardown():
