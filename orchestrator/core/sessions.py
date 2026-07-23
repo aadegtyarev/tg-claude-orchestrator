@@ -43,6 +43,7 @@ from ..config import Config
 # docs/ARCHITECTURE-claude-box.md §5/§11). Реэкспорт для обратной
 # совместимости: код/тесты ссылаются на sessions._DIALOGS/_DialogAnswerer/
 # _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
+from box import transcript_path as box_transcript
 from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
 from box.pty import open_pty, start_driver
 from box.ready import (  # noqa: F401
@@ -1241,9 +1242,9 @@ class SessionManager:
         return self.runner.wrap([], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir)
 
     def transcript_path(self, session: Session) -> Path:
-        """Транскрипт сессии в профиле Claude Code (см. transcript.py)."""
-        config_dir = self.config.claude_config_dir or Path.home() / ".claude"
-        return transcript.transcript_path(
+        """Транскрипт сессии в профиле Claude Code (client-config → box)."""
+        config_dir = box_transcript.resolve_config_dir(self.config.claude_config_dir)
+        return box_transcript.transcript_path(
             config_dir, self.effective_cwd(session), session.claude_session_id
         )
 
