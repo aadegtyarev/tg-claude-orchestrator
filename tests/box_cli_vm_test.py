@@ -295,7 +295,9 @@ def test_help_does_not_call_vm_unimplemented():
     assert "--vm" in text, "справка должна упоминать --vm"
     unimplemented = text.split("Не реализовано")[-1]
     assert "--vm" not in unimplemented, unimplemented
-    assert "-p" in unimplemented and "connect" in unimplemented, unimplemented
+    # -p тоже уехал из «не реализовано» (unattended-срез), остался connect.
+    assert "-p" not in unimplemented, unimplemented
+    assert "connect" in unimplemented, unimplemented
     assert "agent-vm" in text
     print("OK --help: --vm больше не в «не реализовано»")
 

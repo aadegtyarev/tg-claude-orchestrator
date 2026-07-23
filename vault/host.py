@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
+
+logger = logging.getLogger("vault.host")
 
 
 class VaultHost(Protocol):
@@ -60,3 +63,34 @@ class VaultHost(Protocol):
         """Уведомить оператора об отказе, требующем внимания (не self-correcting).
         Вызывающий сам решает, звать ли (напр. печать токена не уведомляет)."""
         ...
+
+
+def deny_remedy(host: object | None) -> str | None:
+    """Объяснение отказа ОТ ХОСТА для модели — необязательное расширение контракта.
+
+    Зачем. Когда confirm/ask вернули False, демон/прокси знают лишь «не
+    разрешено», а причина бывает разная: оператор нажал ✗, оператор молчал,
+    спрашивать НЕКОГО (unattended `claude-box -p`, где вопросов не задают вовсе).
+    По Р0 («никогда не повисать» + прозрачность для модели) модель должна
+    получить не просто 403, а предписывающий текст: что произошло и что делать
+    вместо этого. Знает это только реализация host, поэтому она может объявить
+    строковый атрибут/свойство `deny_remedy`.
+
+    Расширение НЕобязательное (getattr, а не член Protocol): у хостов
+    оркестратора и `vault serve` его нет — там работают прежние формулировки, и
+    ни один существующий host править не пришлось.
+    """
+    # Сбой host НЕ должен превращать честный 403 в 500: `deny_remedy` может быть
+    # property, и её вычисление способно бросить. Тогда модель вместо
+    # диагностируемого отказа получила бы Internal Server Error — ровно то, что
+    # этот механизм и призван исключить. Тот же приём уже применён к host.ask()
+    # в proxy._ask_grant (сбой хоста = DENY, а не падение).
+    try:
+        text = getattr(host, "deny_remedy", None)
+    except Exception:  # noqa: BLE001 — любой сбой хоста = объяснения просто нет
+        logger.warning("vault: deny_remedy у %r бросил — отказ без пояснения",
+                       type(host).__name__, exc_info=True)
+        return None
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None

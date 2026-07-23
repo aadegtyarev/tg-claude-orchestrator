@@ -11,8 +11,26 @@
      вернуть его код. Ctrl-C уходит в процесс (raw), fd не текут (драйвер владеет
      и закрывает master; мы джойним его поток).
 
-НЕ в этом срезе (честные заглушки, а не тихий no-op — правило прозрачности):
-`-p`, подкоманда `connect` (unattended/коннекторы Vault — отдельные треки).
+НЕ в этом срезе (честная заглушка, а не тихий no-op — правило прозрачности):
+подкоманда `connect` (коннекторы Vault — отдельный трек).
+
+`-p <промпт>` — unattended-запуск (§4.6/§5.1): промпт уходит claude его же
+штатным headless-флагом `-p`, и меняется ТРИ вещи (см. build_command, main_async
+и box_cli/tty.py UnattendedVaultHost):
+  1. stdin не релеится и арбитр не поднимается — читать чужой терминал (шелл
+     оператора, CI) нам нечего и незачем;
+  2. терминал не переводится в raw — он не наш; вывод claude по-прежнему идёт в
+     stdout через драйвер PTY, код выхода claude становится кодом claude-box;
+  3. вопросы кошелька (confirm/ASK) не задаются, а СРАЗУ отклоняются с записью в
+     лог: спрашивать некого, а ждать таймаут значило бы держать модель висящей
+     (Р0 «никогда не повисать»). Модель получает предписывающий текст —
+     UnattendedVaultHost.deny_remedy.
+
+Честная граница unattended: пайп в stdin (`cat f | claude-box -p …`) до claude
+НЕ доходит. Причина не в relay, а в конструкции лончера: процесс всегда живёт под
+PTY (это его основной продукт — Слой 3 получает именно PTY), и stdin для claude —
+терминал, а не наш пайп. Эмулировать «headless stdin» тут значило бы отказаться от
+PTY ради одного режима; вместо этого честно пишем границу в --help.
 
 `--vm` — тот же запуск, но в microVM (Engine agent-vm). Это РОВНО короткая форма
 `--engine agent-vm`: по UX-доку (§5.1) «то же в microVM — ЕДИНСТВЕННОЕ отличие»,
@@ -121,14 +139,16 @@ ENGINES = ("bwrap", "off", ENGINE_VM)
 # init/profile реализованы (диспетчеризуются в subcommand_result до parse_args);
 # connect — заглушка (коннекторы Vault — отдельный трек).
 _STUB_SUBCOMMANDS = ("connect",)
-# Флаги следующих срезов: распознаём, чтобы дать честный отказ, а не «unknown».
-_STUB_FLAGS = ("-p",)
+# Формы флага промпта у самого claude: `-p` и `--print`. Ловим ОБЕ и в
+# passthrough (см. parse_args), чтобы не собрать `claude -p A --print B`.
+_PROMPT_FLAGS = ("-p", "--print")
 
 DEFAULT_SECRETS = "~/.config/claude-orchestrator/secrets.toml"
 
 _USAGE = (
     "claude-box [--engine bwrap|off|agent-vm | --vm] [--profile <имя>] "
-    "[--wallet <секрет> [--secrets <файл>]] [-- <аргументы claude>]\n"
+    "[--wallet <секрет> [--secrets <файл>]] [-p <промпт>] "
+    "[-- <аргументы claude>]\n"
     "  Запустить claude (или CLAUDE_BIN) в песочнице и отдать терминал.\n"
     "  --engine bwrap   файловая песочница bubblewrap (по умолчанию)\n"
     "  --engine off     без изоляции\n"
@@ -159,12 +179,27 @@ _USAGE = (
     "                   host/inject-секрет → обёртки git/gh/curl первыми в PATH\n"
     "                   (вызов уходит на хост через кошелёк, `wallet` тоже в PATH)\n"
     f"  --secrets <файл> путь к secrets.toml (по умолчанию {DEFAULT_SECRETS})\n"
+    "  -p <промпт>      unattended: выполнить задачу без терминала и выйти\n"
+    "                   (это флаг -p самого claude). Ввод оператора не\n"
+    "                   релеится, терминал не переводится в raw, код выхода\n"
+    "                   claude становится кодом claude-box.\n"
+    "                   ВАЖНО про кошелёк: спрашивать некого, поэтому вопросы\n"
+    "                   (confirm=true, ASK вне скоупа) не задаются, а сразу\n"
+    "                   отклоняются с записью в лог — модель получает внятный\n"
+    "                   отказ, а не зависание. Нужны такие секреты — запускай\n"
+    "                   без -p либо разреши их в policy заранее.\n"
+    "                   С --vm сочетается (промпт уезжает в гостя как аргумент\n"
+    "                   claude), с --profile — тоже.\n"
+    "                   Граница: пайп в stdin (cat f | claude-box -p …) в claude\n"
+    "                   НЕ пробрасывается — процесс всегда под PTY, и stdin для\n"
+    "                   него выглядит терминалом. Данные передавай в самом\n"
+    "                   промпте или файлом в рабочем каталоге.\n"
     "  --               всё, что после, пробрасывается в claude\n"
     "  -h, --help       эта справка\n"
     "\nПодкоманды:\n"
     "  init <имя>       создать профиль (идемпотентно) и напечатать путь\n"
     "  profile          список профилей;  profile rm <имя>  удалить профиль\n"
-    "\nНе реализовано (следующие треки): -p, connect."
+    "\nНе реализовано (следующий трек): connect."
 )
 
 
@@ -177,6 +212,12 @@ class Options:
     wallet: str | None = None
     secrets: Path | None = None
     profile: str | None = None  # имя профиля (CLAUDE_CONFIG_DIR/HOME-редирект)
+    prompt: str | None = None  # -p <промпт>: unattended (None — интерактив)
+
+    @property
+    def unattended(self) -> bool:
+        """Режим без оператора: терминал не наш, вопросы кошелька отклоняются."""
+        return self.prompt is not None
 
 
 class CliError(SystemExit):
@@ -223,6 +264,7 @@ def parse_args(argv: Sequence[str]) -> Options:
     wallet: str | None = None
     secrets: Path | None = None
     profile: str | None = None
+    prompt: str | None = None
 
     def _value(flag: str, idx: int, inline: str | None) -> tuple[str, int]:
         """Значение флага: из `--flag=val` (inline) либо из следующего аргумента."""
@@ -259,13 +301,11 @@ def parse_args(argv: Sequence[str]) -> Options:
         if key == "--profile":
             profile, i = _value("--profile", i, inline)
             continue
-        if a in _STUB_FLAGS:
-            raise CliError(
-                f"флаг «{a}» ещё не реализован (треки VM/unattended). Сейчас — "
-                "запуск в песочнице с опциональными --wallet/--profile: "
-                "claude-box [--engine bwrap|off] [--profile <имя>] "
-                "[--wallet <секрет>] [-- …]."
-            )
+        if key in _PROMPT_FLAGS:
+            # Обе формы: `-p задача` и `-p=задача` (вторая — ради единообразия с
+            # остальными флагами CLI: `--engine=off`, `--wallet=svc`).
+            prompt, i = _value(key, i, inline)
+            continue
         raise CliError(f"неизвестный аргумент «{a}». См. claude-box --help.")
 
     # --vm == --engine agent-vm. Конфликт («--vm --engine bwrap») — честный отказ,
@@ -282,6 +322,37 @@ def parse_args(argv: Sequence[str]) -> Options:
         raise CliError(f"--engine={engine!r} — допустимо: {' | '.join(ENGINES)}")
     if secrets is not None and wallet is None:
         raise CliError("--secrets имеет смысл только с --wallet <секрет>.")
+
+    # Пустой промпт (`-p ''`, `-p=`) — честный отказ, а не запуск claude с пустой
+    # задачей: он бы отработал вхолостую, а оператор решил бы, что задача ушла.
+    if prompt is not None and not prompt.strip():
+        raise CliError(
+            "-p требует непустой промпт: claude-box -p 'задача'. Нужен "
+            "интерактивный запуск — вызывай claude-box без -p."
+        )
+    # Промпт в passthrough. Правило «после `--` не трогаем ничего» остаётся в
+    # силе, но про ЭТОТ флаг молчать нельзя — он меняет режим запуска:
+    #   * вместе с нашим -p → отказ: мы кладём `-p <промпт>` в argv ПЕРВЫМ, а
+    #     сквозные аргументы после, и claude получил бы два промпта — какой из
+    #     них победит, оператор не выбирал;
+    #   * вместо нашего -p → запуск идёт (аргумент claude — дело оператора), но с
+    #     предупреждением: claude-box об unattended не узнает и оставит relay
+    #     stdin, raw-терминал и вопросы кошелька как в интерактиве.
+    dup = next((x for x in passthrough if x.partition("=")[0] in _PROMPT_FLAGS), None)
+    if dup is not None and prompt is not None:
+        raise CliError(
+            f"промпт задан дважды: флагом claude-box (-p) и «{dup}» после `--`. "
+            "claude получил бы два промпта. Оставь что-то одно — лучше -p самого "
+            "claude-box: claude-box -p 'задача' [-- прочие аргументы]."
+        )
+    if dup is not None:
+        sys.stderr.write(
+            f"claude-box: «{dup}» после `--` уходит в claude как есть, но сам "
+            "claude-box об этом режиме не знает: он оставит relay stdin, "
+            "raw-терминал и будет спрашивать подтверждения кошелька у оператора. "
+            "Нужен unattended (deny+log вместо спроса) — передавай промпт флагом "
+            "claude-box: claude-box -p 'задача'.\n"
+        )
 
     # Границы VM-режима. Отказываем ЗДЕСЬ (код 2), а не «применяем как получится»:
     # под agent-vm оба флага выглядели бы работающими, ничего при этом не делая, —
@@ -305,7 +376,7 @@ def parse_args(argv: Sequence[str]) -> Options:
         )
     return Options(
         engine=engine, passthrough=passthrough, wallet=wallet,
-        secrets=secrets, profile=profile,
+        secrets=secrets, profile=profile, prompt=prompt,
     )
 
 
@@ -379,6 +450,25 @@ def make_engine_runner(
         from orchestrator.runners.agentvm import AgentVmRunner
         return AgentVmRunner(config, root, mount_root=False)
     return make_runner(config, root)
+
+
+def build_command(
+    claude_bin: str, *, prompt: str | None, passthrough: Sequence[str],
+) -> list[str]:
+    """Командная строка claude: `claude [-p <промпт>] [сквозные аргументы]`.
+
+    `-p` — штатный headless-флаг самого claude (он же `--print`), поэтому мы его
+    не эмулируем, а просто передаём: claude сам отработает задачу и завершится.
+
+    Порядок «сначала наш -p, потом passthrough» выбран сознательно: `-p` — флаг
+    со значением, и вклинивать его в середину чужих аргументов небезопасно
+    (значение могло бы приклеиться к чужому флагу), а хвост оператора
+    (`-- --model opus`) при таком порядке разбирается claude как обычно. Свой
+    `-p`/`--print` в passthrough отвергается ещё в parse_args — иначе у claude
+    было бы два промпта, а лончер считал бы запуск интерактивным.
+    """
+    prompt_part = ["-p", prompt] if prompt is not None else []
+    return [claude_bin, *prompt_part, *passthrough]
 
 
 def build_argv(
@@ -574,7 +664,8 @@ async def main_async(argv: Sequence[str]) -> int:
 
     cwd = os.getcwd()
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
-    command = [claude_bin, *opts.passthrough]
+    command = build_command(
+        claude_bin, prompt=opts.prompt, passthrough=opts.passthrough)
     env = build_env(engine, profile=opts.profile is not None)
     # Профиль-редирект поверх окружения (CLAUDE_CONFIG_DIR + HOME под bwrap);
     # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
@@ -592,9 +683,15 @@ async def main_async(argv: Sequence[str]) -> int:
     # Арбитр stdin создаём ЗДЕСЬ — до raw_terminal (он запоминает нормальные
     # настройки терминала, чтобы возвращать эхо на время вопроса) и до подъёма
     # кошелька (демону нужен хост, который спрашивает через арбитра).
-    arbiter = StdinArbiter(0)
+    #
+    # В unattended (-p) арбитра НЕТ вовсе: спрашивать некого и релеить нечего —
+    # поднимать читателя чужого stdin (терминал оператора, из которого запущен
+    # скрипт/CI) значило бы воровать у него ввод. Терминал по той же причине не
+    # переводится в raw (см. ниже): claude-box в этом режиме — обычная утилита,
+    # которая печатает вывод и завершается.
+    arbiter = None if opts.unattended else StdinArbiter(0)
     if opts.wallet is not None:
-        from .tty import BoxVaultHost
+        from .tty import BoxVaultHost, UnattendedVaultHost
         from .wallet import WalletError, setup_wallet_intercept
         if engine != "bwrap":
             sys.stderr.write(
@@ -603,11 +700,24 @@ async def main_async(argv: Sequence[str]) -> int:
                 "поверх этого рабочий аутентифицированный канал (git push/gh с "
                 "реальными кредами) — это расширение прав, а не страховка. "
                 "Кошелёк страхует только вместе с --engine bwrap.\n")
+        if opts.unattended:
+            # Сочетание рабочее (перехват поднимается как обычно, значение
+            # секрета в песочницу не попадает), но половина policy в нём
+            # неприменима — оператор должен узнать это ДО запуска, а не по
+            # непонятному провалу задачи.
+            sys.stderr.write(
+                "claude-box: -p с --wallet: в unattended-режиме вопросы кошелька "
+                "не задаются, а сразу отклоняются с записью в лог — секреты с "
+                "confirm=true (и любой ASK вне скоупа) в этом запуске НЕ "
+                "сработают. Нужны они — запускай без -p (вопрос придёт в "
+                "терминал) либо заранее сними confirm/расширь скоуп в policy.\n")
         secrets_path = opts.secrets or Path(DEFAULT_SECRETS).expanduser()
+        # Хост кошелька = кто отвечает на confirm/ASK. Attended — арбитр
+        # терминала; unattended — deny+log (§4.6), без таймаутов и без stdin.
+        host = UnattendedVaultHost() if arbiter is None else BoxVaultHost(arbiter)
         try:
             intercept = await setup_wallet_intercept(
-                opts.wallet, secrets_path=secrets_path,
-                host=BoxVaultHost(arbiter))
+                opts.wallet, secrets_path=secrets_path, host=host)
         except WalletError as e:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
@@ -621,14 +731,20 @@ async def main_async(argv: Sequence[str]) -> int:
         full_argv = build_argv(runner, command, Path(cwd), extra_rw)
 
         stdin_fd, stdout_fd = 0, 1
-        interactive = os.isatty(stdin_fd)
+        # interactive = «релеить stdin оператора в PTY процесса». В unattended
+        # (-p) — нет, даже если запуск идёт из терминала: задача уже задана
+        # промптом, а нажатия оператора принадлежат его шеллу/скрипту.
+        interactive = os.isatty(stdin_fd) and not opts.unattended
         rows, cols = TERM_ROWS, TERM_COLS
-        if interactive:
-            try:
-                size = os.get_terminal_size(stdout_fd)
-                rows, cols = size.lines, size.columns
-            except OSError:
-                pass
+        # Размер PTY берём от терминала вывода, если он есть, — и в unattended
+        # тоже: релея ввода там нет, но перенос строк в выводе claude зависит от
+        # ширины, и «как в моём терминале» лучше дефолтных 80 колонок. Нет
+        # терминала (пайп/файл/CI) — остаются дефолты.
+        try:
+            size = os.get_terminal_size(stdout_fd)
+            rows, cols = size.lines, size.columns
+        except OSError:
+            pass
 
         def on_output(chunk: bytes) -> None:
             with contextlib.suppress(OSError):
@@ -639,7 +755,12 @@ async def main_async(argv: Sequence[str]) -> int:
         # печатаем ошибку). Сбой спавна/запуска (напр. CLAUDE_BIN на несуществующий
         # бинарь) → честный отказ в stderr + код 1, а не сырой трейсбек: остальной
         # CLI держит эту планку (CliError), держим и здесь.
-        with raw_terminal(stdin_fd):
+        #
+        # raw нужен ТОЛЬКО когда мы релеим ввод (иначе нажатия оператора шли бы
+        # построчно и с двойным эхом). В unattended терминал оператора не наш —
+        # трогать его настройки нельзя: `claude-box -p … &` в фоне сломал бы
+        # шелл, из которого запущен (raw на общем tty).
+        with raw_terminal(stdin_fd) if interactive else contextlib.nullcontext():
             try:
                 return await run(
                     full_argv, cwd=cwd, env=env, on_output=on_output,
@@ -659,7 +780,8 @@ async def main_async(argv: Sequence[str]) -> int:
         # Снять читатель stdin (кошелёк мог поднять его раньше запуска, спросив
         # confirm), снять прокси (порт освобождается) и снести временный каталог
         # bundle — даже при исключении/Ctrl-C. Не течём.
-        arbiter.stop()
+        if arbiter is not None:  # в unattended арбитра нет — снимать нечего
+            arbiter.stop()
         if intercept is not None:
             await intercept.close()
 

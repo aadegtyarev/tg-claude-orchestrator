@@ -67,7 +67,7 @@ from urllib.parse import urlsplit
 
 from .connectors import HttpReq
 from .connectors.contract import Connector, ScopeVerdict
-from .host import VaultHost
+from .host import VaultHost, deny_remedy
 from .secret import Secret
 from .tls import VaultCA, VaultCAError
 
@@ -598,6 +598,12 @@ class VaultProxy:
     async def _respond_deny(
         self, writer: asyncio.StreamWriter, verdict: ScopeVerdict
     ) -> None:
+        # ЗАМЕЧЕНО РЕВЬЮ (не чинится здесь осознанно): remedy берётся у коннектора
+        # и НЕ проходит через host.deny_remedy, в отличие от ASK-пути ниже. Под
+        # unattended (`claude-box -p`) коннектор может сказать «оператор не
+        # подтвердил», хотя вопроса не задавали вовсе. Правка требует решить, кто
+        # главнее — коннектор, знающий предметный remedy, или хост, знающий режим;
+        # это отдельный трек (ASK — основной unattended-кейс и он покрыт).
         body = f"{verdict.reason}\n\n{verdict.remedy}\n".encode()
         await self._send_response(writer, 403, "Forbidden", body)
 
@@ -639,12 +645,18 @@ class VaultProxy:
                 "его заранее.\n"
             ).encode()
         else:
-            body = (
-                f"Доступ требует подтверждения оператора: {verdict.descr}.\n\n"
+            # Если host умеет объяснить СВОЙ отказ (напр. unattended-запуск, где
+            # оператора не спрашивают вовсе) — берём его текст: иначе модели
+            # соврали бы «оператор не подтвердил», хотя вопроса никто не задавал.
+            explain = deny_remedy(self.host) or (
                 "Оператор не подтвердил запрос (отказ либо нет ответа в срок), "
                 "поэтому кошелёк его не пропускает. Оставайся в пределах уже "
                 "разрешённого скоупа секрета либо попроси оператора подтвердить "
-                "или расширить скоуп заранее.\n"
+                "или расширить скоуп заранее."
+            )
+            body = (
+                f"Доступ требует подтверждения оператора: {verdict.descr}.\n\n"
+                f"{explain}\n"
             ).encode()
         await self._send_response(writer, 403, "Forbidden", body)
 

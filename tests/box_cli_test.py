@@ -6,7 +6,11 @@
   • parse_args — engine, passthrough, заглушки (--vm/init/…) → честный отказ;
   • build_argv — bwrap-обёртка на месте, cwd RW; off — команда как есть;
   • run() e2e — команда в песочнице/direct: вывод «BOXOK» доходит через
-    on_output, код 0, fd не текут (мягкий скип bwrap при отсутствии).
+    on_output, код 0, fd не текут (мягкий скип bwrap при отсутствии);
+  • -p (unattended) — разбор всех форм и честные отказы, промпт в argv claude,
+    сочетания с passthrough/--wallet/--profile/--vm; e2e: терминал оператора не
+    в raw, его ввод не воруется, код выхода claude пробрасывается.
+    Отказы кошелька в этом режиме — tests/box_unattended_test.py.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import contextlib
 import io
 import os
 import pty
+import select
 import sys
+import tempfile
 import termios
 from pathlib import Path
 
@@ -84,15 +90,9 @@ def test_parse_bad_engine_rejected():
 
 def test_parse_stub_flags_and_subcommands_refused():
     # Заглушки: честный отказ (код 2), не тихий no-op и не «unknown».
-    # (--wallet/--profile/--vm больше НЕ заглушки — реализованы; init/profile тоже.)
-    for args in (["-p", "task"],):
-        try:
-            cli.parse_args(args)
-        except SystemExit as e:
-            assert e.code == 2, args
-        else:
-            raise AssertionError(f"{args} должно быть заглушено отказом")
-    # connect остаётся заглушкой (agent-vm-трек заблокирован).
+    # (--wallet/--profile/--vm/-p больше НЕ заглушки — реализованы, как и
+    # init/profile.)
+    # connect остаётся заглушкой (коннекторы Vault — отдельный трек).
     try:
         cli.parse_args(["connect"])
     except SystemExit as e:
@@ -108,6 +108,84 @@ def test_parse_help_exits_zero():
         assert e.code == 0
     else:
         raise AssertionError("--help должен выйти с кодом 0")
+
+
+# ── -p: unattended ───────────────────────────────────────────────────────────
+def test_parse_prompt_forms():
+    """`-p значение`, `-p=значение` и `--print` (та же форма у самого claude)."""
+    opts = cli.parse_args(["-p", "задача"])
+    assert opts.prompt == "задача" and opts.unattended is True
+    assert cli.parse_args(["-p=задача"]).prompt == "задача"
+    assert cli.parse_args(["--print", "задача"]).prompt == "задача"
+    # Без -p режим интерактивный.
+    assert cli.parse_args([]).prompt is None
+    assert cli.parse_args([]).unattended is False
+
+
+def test_parse_prompt_with_passthrough_and_flags():
+    """-p сочетается со сквозными аргументами и с --wallet/--profile/--vm."""
+    opts = cli.parse_args(["-p", "задача", "--engine", "off", "--", "--model", "opus"])
+    assert opts.prompt == "задача" and opts.passthrough == ["--model", "opus"]
+    assert cli.parse_args(["-p", "t", "--wallet", "svc"]).wallet == "svc"
+    assert cli.parse_args(["-p", "t", "--profile", "work"]).profile == "work"
+    # --vm с -p совместим: промпт уезжает в гостя обычным аргументом claude.
+    vm = cli.parse_args(["--vm", "-p", "задача"])
+    assert vm.engine == cli.ENGINE_VM and vm.prompt == "задача"
+
+
+def test_parse_prompt_empty_or_missing_refused():
+    """Пустой промпт и -p без значения → честный отказ кодом 2."""
+    for args in (["-p"], ["-p", ""], ["-p="], ["-p", "   "]):
+        try:
+            cli.parse_args(args)
+        except SystemExit as e:
+            assert e.code == 2, args
+        else:
+            raise AssertionError(f"{args} должно быть отвергнуто")
+
+
+def test_parse_prompt_in_passthrough():
+    """Промпт после `--`: сам по себе — можно (с предупреждением), вместе с
+    нашим -p — отказ (у claude было бы два промпта)."""
+    for args in (["-p", "a", "--", "-p", "b"], ["-p", "a", "--", "--print", "b"]):
+        try:
+            cli.parse_args(args)
+        except SystemExit as e:
+            assert e.code == 2, args
+        else:
+            raise AssertionError(f"{args} должно быть отвергнуто (два промпта)")
+    # Без нашего -p: аргумент уходит в claude как есть, но оператора предупреждаем,
+    # что unattended-режима лончера (deny+log) он так НЕ получит.
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        opts = cli.parse_args(["--", "-p", "задача"])
+    assert opts.passthrough == ["-p", "задача"], "после -- не трогаем"
+    assert opts.unattended is False, "лончер об этом режиме не знает — и говорит об этом"
+    assert "claude-box -p" in err.getvalue(), f"нет предупреждения: {err.getvalue()!r}"
+
+
+def test_build_command_prompt_goes_to_claude_argv():
+    """Промпт доезжает до argv claude флагом -p, перед сквозными аргументами."""
+    assert cli.build_command("claude", prompt=None, passthrough=[]) == ["claude"]
+    assert cli.build_command("claude", prompt="задача", passthrough=[]) == [
+        "claude", "-p", "задача"]
+    assert cli.build_command("claude", prompt="задача", passthrough=["--model", "opus"]) == [
+        "claude", "-p", "задача", "--model", "opus"]
+
+
+def test_help_no_longer_calls_prompt_unimplemented():
+    """--help: -p описан как рабочий, в «не реализовано» остаётся только connect."""
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            cli.parse_args(["--help"])
+    except SystemExit:
+        pass
+    text = out.getvalue()
+    tail = text[text.index("Не реализовано"):]
+    assert "-p" not in tail, f"-p всё ещё числится нереализованным: {tail!r}"
+    assert "connect" in tail
+    assert "-p <промпт>" in text and "unattended" in text
 
 
 def test_parse_unknown_arg_refused():
@@ -179,6 +257,59 @@ async def test_e2e_bwrap_boxok_or_skip():
     assert b"BOXOK" in out, f"вывод не дошёл из песочницы: {out!r}"
     leaked = _fds() - before
     assert not leaked, f"утекли fd: {leaked}"
+
+
+async def test_unattended_run_no_raw_no_stdin_steal():
+    """e2e -p: промпт доезжает до argv, код выхода пробрасывается, терминал
+    оператора НЕ трогаем (raw не включаем, stdin не читаем).
+
+    Терминал подсовываем настоящий (pty-пара на fd 0) — иначе проверка «не в
+    raw» ничего бы не значила: без tty raw_terminal и так no-op.
+    """
+    master, slave = pty.openpty()
+    tmp = Path(tempfile.mkdtemp(prefix="box_unattended_cli_"))
+    script, argv_file = tmp / "fake-claude", tmp / "argv.txt"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > {argv_file}\n'
+        "sleep 0.6\n"
+        "exit 7\n"
+    )
+    os.chmod(script, 0o755)
+    saved_stdin = os.dup(0)
+    old_bin = os.environ.get("CLAUDE_BIN")
+    os.environ["CLAUDE_BIN"] = str(script)
+    os.dup2(slave, 0)
+    try:
+        task = asyncio.create_task(cli.main_async(["-p", "PROMPT-MARK", "--engine", "off"]))
+        await asyncio.sleep(0.25)  # процесс уже поднят и ещё жив
+        attrs = termios.tcgetattr(0)
+        assert attrs[3] & termios.ECHO, "unattended не должен переводить tty в raw"
+        assert attrs[3] & termios.ICANON, "unattended не должен ломать канонический режим"
+        os.write(master, b"typed\n")  # «нажатия» оператора — не наши
+        code = await task
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        if old_bin is None:
+            os.environ.pop("CLAUDE_BIN", None)
+        else:
+            os.environ["CLAUDE_BIN"] = old_bin
+
+    assert code == 7, f"код выхода claude должен стать кодом claude-box, получен {code}"
+    got = argv_file.read_text().split("\n")
+    assert got[:2] == ["-p", "PROMPT-MARK"], f"промпт не доехал до claude: {got!r}"
+
+    # Байты оператора никто не забрал: без арбитра они лежат в буфере терминала.
+    ready, _, _ = select.select([slave], [], [], 0.5)
+    assert ready, "ввод оператора исчез — значит stdin всё-таки читали"
+    assert os.read(slave, 64) == b"typed\n"
+    os.close(master)
+    os.close(slave)
+    for p in sorted(tmp.rglob("*"), reverse=True):
+        p.unlink()
+    tmp.rmdir()
+    print("OK unattended: промпт в argv, код 7, терминал и stdin оператора не тронуты")
 
 
 # ── raw_terminal: не сломать терминал ────────────────────────────────────────
@@ -285,6 +416,12 @@ def main() -> None:
     test_parse_bad_engine_rejected()
     test_parse_stub_flags_and_subcommands_refused()
     test_parse_help_exits_zero()
+    test_parse_prompt_forms()
+    test_parse_prompt_with_passthrough_and_flags()
+    test_parse_prompt_empty_or_missing_refused()
+    test_parse_prompt_in_passthrough()
+    test_build_command_prompt_goes_to_claude_argv()
+    test_help_no_longer_calls_prompt_unimplemented()
     test_parse_unknown_arg_refused()
     test_build_argv_off_is_command_asis()
     test_build_argv_bwrap_wraps_and_cwd_rw()
@@ -295,6 +432,7 @@ def main() -> None:
     asyncio.run(test_interactive_relay_stdin_reaches_process())
     asyncio.run(test_e2e_off_boxok_reaches_output())
     asyncio.run(test_e2e_bwrap_boxok_or_skip())
+    asyncio.run(test_unattended_run_no_raw_no_stdin_steal())
     print("ALL BOX-CLI OK")
 
 
