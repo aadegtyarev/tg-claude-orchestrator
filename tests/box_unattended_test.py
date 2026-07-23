@@ -104,6 +104,32 @@ def test_deny_remedy_is_prescriptive_only_for_unattended():
     print("OK deny_remedy: есть только у unattended-хоста")
 
 
+def test_deny_remedy_survives_a_broken_host():
+    """Сбой хоста НЕ должен превращать честный 403 в 500.
+
+    `deny_remedy` может быть property, и её вычисление способно бросить. Если
+    исключение прорастёт, обработчик демона упадёт, и модель вместо
+    диагностируемого отказа получит Internal Server Error — ровно то, ради чего
+    механизм и вводился (нашло ревью, MEDIUM-1). Тот же приём, что у host.ask()
+    в proxy._ask_grant: сбой хоста = просто нет пояснения.
+    """
+    class Exploding:
+        @property
+        def deny_remedy(self):
+            raise ValueError("хост сломан")
+
+    class WrongType:
+        deny_remedy = 42  # не строка — молча игнорируем
+
+    class Blank:
+        deny_remedy = "   "  # пробелы = пусто
+
+    assert deny_remedy(Exploding()) is None, "исключение хоста должно гаситься"
+    assert deny_remedy(WrongType()) is None
+    assert deny_remedy(Blank()) is None
+    print("OK deny_remedy: сломанный/кривой хост не роняет отказ")
+
+
 def _store(tmp: Path) -> SecretStore:
     """Секрет с confirm=true — тот самый случай, который в unattended не пройдёт."""
     f = tmp / "secrets.toml"
@@ -151,6 +177,7 @@ def main() -> None:
     asyncio.run(test_unattended_denies_instantly_and_logs())
     asyncio.run(test_unattended_observe_and_audit_still_work())
     test_deny_remedy_is_prescriptive_only_for_unattended()
+    test_deny_remedy_survives_a_broken_host()
     asyncio.run(test_daemon_denies_confirm_secret_with_remedy())
     print("ALL BOX-UNATTENDED OK")
 

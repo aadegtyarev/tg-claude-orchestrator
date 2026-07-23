@@ -598,6 +598,12 @@ class VaultProxy:
     async def _respond_deny(
         self, writer: asyncio.StreamWriter, verdict: ScopeVerdict
     ) -> None:
+        # ЗАМЕЧЕНО РЕВЬЮ (не чинится здесь осознанно): remedy берётся у коннектора
+        # и НЕ проходит через host.deny_remedy, в отличие от ASK-пути ниже. Под
+        # unattended (`claude-box -p`) коннектор может сказать «оператор не
+        # подтвердил», хотя вопроса не задавали вовсе. Правка требует решить, кто
+        # главнее — коннектор, знающий предметный remedy, или хост, знающий режим;
+        # это отдельный трек (ASK — основной unattended-кейс и он покрыт).
         body = f"{verdict.reason}\n\n{verdict.remedy}\n".encode()
         await self._send_response(writer, 403, "Forbidden", body)
 

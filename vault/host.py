@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
+
+logger = logging.getLogger("vault.host")
 
 
 class VaultHost(Protocol):
@@ -77,7 +80,17 @@ def deny_remedy(host: object | None) -> str | None:
     оркестратора и `vault serve` его нет — там работают прежние формулировки, и
     ни один существующий host править не пришлось.
     """
-    text = getattr(host, "deny_remedy", None)
+    # Сбой host НЕ должен превращать честный 403 в 500: `deny_remedy` может быть
+    # property, и её вычисление способно бросить. Тогда модель вместо
+    # диагностируемого отказа получила бы Internal Server Error — ровно то, что
+    # этот механизм и призван исключить. Тот же приём уже применён к host.ask()
+    # в proxy._ask_grant (сбой хоста = DENY, а не падение).
+    try:
+        text = getattr(host, "deny_remedy", None)
+    except Exception:  # noqa: BLE001 — любой сбой хоста = объяснения просто нет
+        logger.warning("vault: deny_remedy у %r бросил — отказ без пояснения",
+                       type(host).__name__, exc_info=True)
+        return None
     if isinstance(text, str) and text.strip():
         return text.strip()
     return None
