@@ -127,7 +127,11 @@ class WalletModule:
 
     async def start(self, core) -> None:
         self.core = core
-        self.host = OrchestratorVaultHost(core)
+        # policy+тумблер — только ради ASK-гранта «навсегда» (§4.6): при
+        # WALLET_POLICY_EDIT=0 хост третью кнопку не покажет вовсе.
+        self.host = OrchestratorVaultHost(
+            core, policy=self.policy, allow_policy_edit=self.config.wallet_policy_edit
+        )
         # Провижн (~/.wallet.json в приватном доме сессии) виден CLI только
         # когда дом смонтирован КАК $HOME процесса claude — это делает лишь
         # BwrapRunner. Под off/agent-vm CLI не найдёт конфиг → предупреждаем.

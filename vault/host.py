@@ -13,10 +13,36 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+from dataclasses import dataclass
 from typing import Protocol
 
+from .connectors.contract import ScopeGrant
+
 logger = logging.getLogger("vault.host")
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """Исход ASK-спроса: разрешено ли и ЗАПИСАН ли грант в policy (§4.6).
+
+    Зачем не голый bool. «Разрешить навсегда» меняет policy на диске, а живой
+    прокси держит СВОЙ снимок scope (взят при подъёме) — не узнав о записи, он
+    переспросил бы оператора на следующем таком же запросе, хотя в файле грант
+    уже стоит. Поэтому хост сообщает факт записи, а прокси синхронно расширяет
+    свой scope (см. proxy._ask_grant).
+
+    `__bool__` — ради обратной совместимости: старый код (и `bool(granted)` в
+    прокси) продолжает читать результат как «разрешено/нет», а хосты, ничего не
+    знающие о persist, по-прежнему возвращают простой bool.
+    """
+
+    granted: bool
+    persisted: bool = False
+
+    def __bool__(self) -> bool:
+        return self.granted
 
 
 class VaultHost(Protocol):
@@ -37,12 +63,24 @@ class VaultHost(Protocol):
         standalone — tty/deny. True = разрешено, False = отказано/некому спросить."""
         ...
 
-    async def ask(self, session_name: str, description: str, preview: str) -> bool:
+    async def ask(
+        self,
+        session_name: str,
+        description: str,
+        preview: str,
+        grant: ScopeGrant | None = None,
+    ) -> bool | AskResult:
         """Спросить у оператора ГРАНТ доступа на ЭТОТ запрос (§4.6 ASK-flow:
         in_scope вернул ASK → прокси не пропускает и не отказывает сам, а
         поднимает спрос). Оркестратор — кнопки (эфемерный/persist грант),
         standalone — tty. True = разрешить этот запрос (прокси подставит кред и
         реоригинирует), False = отказать.
+
+        `grant` (необязательный) — УЗКАЯ запись в policy, которой хост может
+        предложить «разрешить навсегда»; None → узкого гранта из запроса не
+        выводится, «навсегда» предлагать НЕЛЬЗЯ (только разово). Хост, умеющий
+        писать policy, возвращает `AskResult(granted, persisted)`; хост, который
+        не умеет (tty/standalone), — обычный bool, и это остаётся валидным.
 
         Р0 («никогда не повисать»): реализация ОБЯЗАНА иметь СВОЙ таймаут —
         оператор не ответил → безопасный дефолт False (DENY). Некому спросить
@@ -94,3 +132,48 @@ def deny_remedy(host: object | None) -> str | None:
     if isinstance(text, str) and text.strip():
         return text.strip()
     return None
+
+
+def _accepts_grant(ask: object) -> bool:
+    """Принимает ли `host.ask` параметр `grant` (расширение §4.6-persist).
+
+    Контракт VaultHost.ask расширен четвёртым параметром, но реализации хоста
+    бывают ЧУЖИЕ (standalone-сборки, тестовые фейки, будущие адаптеры) и написаны
+    по старой сигнатуре из трёх аргументов. Слепой вызов с `grant=` уронил бы у
+    них ASK в TypeError → по правилу «сбой хоста = DENY» доступ бы просто
+    перестал спрашиваться: тихая деградация ровно того механизма, который мы
+    расширяем. Поэтому спрашиваем сигнатуру и передаём `grant` только тем, кто
+    его понимает; остальные получают прежние три аргумента и работают как раньше.
+
+    Любой сбой интроспекции (C-функция, экзотический callable) → False:
+    «не уверены — зовём по старому контракту», это всегда безопасно.
+    """
+    try:
+        params = inspect.signature(ask).parameters
+    except (TypeError, ValueError):  # не интроспектируется — зовём по-старому
+        return False
+    if "grant" in params:
+        return True
+    # **kwargs тоже считаем согласием: обёртки-декораторы прокидывают вслепую.
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+async def ask_grant(
+    host: object,
+    session_name: str,
+    description: str,
+    preview: str,
+    grant: ScopeGrant | None,
+) -> AskResult:
+    """Позвать `host.ask`, нормализовав результат в `AskResult`.
+
+    Единая точка совместимости: старый хост (bool, без `grant`) →
+    `AskResult(bool, persisted=False)`; новый — как вернул. Таймауты/исключения
+    НЕ ловим — ими владеет вызывающий (proxy._ask_grant, Р0)."""
+    if grant is not None and _accepts_grant(host.ask):  # type: ignore[attr-defined]
+        result = await host.ask(session_name, description, preview, grant=grant)  # type: ignore[attr-defined]
+    else:
+        result = await host.ask(session_name, description, preview)  # type: ignore[attr-defined]
+    if isinstance(result, AskResult):
+        return result
+    return AskResult(granted=bool(result))

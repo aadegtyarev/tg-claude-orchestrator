@@ -13,7 +13,7 @@ import posixpath
 from urllib.parse import unquote, urlsplit
 
 from ..secret import Secret
-from .contract import Connector, HttpReq, ScopeVerdict, with_header
+from .contract import Connector, HttpReq, ScopeGrant, ScopeVerdict, with_header
 
 logger = logging.getLogger("vault.connectors")
 
@@ -108,6 +108,34 @@ def _canonical_prefix(pref: str) -> tuple[str, str, str] | None:
     return canon
 
 
+def _narrow_grant(req_c: tuple[str, str, str]) -> ScopeGrant | None:
+    """Узкий постоянный грант из КАНОНИЗИРОВАННОГО запроса — или None, если из
+    запроса узкого гранта не выводится (§4.6, «разрешить навсегда»).
+
+    Что записываем: `scheme://netloc<путь>` БЕЗ query/fragment. Именно путь, а не
+    хост: `_under_prefix` покрывает префикс и всё под ним на границе сегмента, так
+    что `https://api.svc/docs/42` откроет `/docs/42` и его подресурсы — ровно
+    запрошенный ресурс, а соседний `/docs/43` останется под спросом. Query в
+    префиксы не входит по устройству матчера (сравнение идёт по scheme+netloc+
+    path), поэтому и в грант его не тащим — иначе оператор увидел бы в policy
+    строку, которая матчится не так, как выглядит.
+
+    None, когда путь — корень (`/`): такой «префикс» покрыл бы ВЕСЬ сервис под
+    этим секретом, а это уже не узкий грант, а «разрешить всё». Лучше отказать в
+    кнопке «навсегда» (хост это объяснит), чем записать в policy размашистое
+    правило, о котором оператор не думал.
+    """
+    scheme, netloc, path = req_c
+    if not scheme or not netloc or path in ("", "/"):
+        return None
+    value = f"{scheme}://{netloc}{path}"
+    return ScopeGrant(
+        key="url_prefixes",
+        value=value,
+        label=f"доступ к «{value}» и вложенным путям (без спроса, навсегда)",
+    )
+
+
 class GenericBearerConnector:
     """Фолбэк-коннектор: Bearer-подстановка + скоуп по URL-префиксам."""
 
@@ -154,7 +182,9 @@ class GenericBearerConnector:
                     "вне автоматически разрешённого скоупа, но помечен как требующий "
                     "подтверждения оператора. При подтверждении кошелёк подставит "
                     "кред и пропустит ИМЕННО этот запрос к сервису."
-                )
+                ),
+                # Узкий грант для «навсегда» (может быть None — тогда только разово).
+                grant=_narrow_grant(req_c),
             )
         return ScopeVerdict.deny(
             reason=f"URL «{req.url}» вне выданного скоупа секрета",

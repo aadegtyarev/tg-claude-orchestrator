@@ -39,6 +39,38 @@ class HttpReq:
 
 
 @dataclass(frozen=True)
+class ScopeGrant:
+    """УЗКИЙ постоянный грант, который оператор может записать в policy (§4.6,
+    «разрешить навсегда»).
+
+    Зачем отдельный тип, а не строка в descr. Кнопка «навсегда» пишет в
+    `secrets.<имя>.scope`, и запись обязана быть МАШИННОЙ (ключ+значение), а не
+    выуженной регуляркой из человеческого текста: иначе «узость» гранта была бы
+    вопросом форматирования. Знает, что записать, ТОЛЬКО коннектор (он же владеет
+    семантикой scope), поэтому грант рождается вместе с ASK-вердиктом.
+
+    Поля:
+      * key    — ключ внутри `scope` (для generic-bearer: "url_prefixes");
+      * value  — КОНКРЕТНОЕ значение из запроса (URL-префикс без query), а не «*»
+                 и не «весь хост»: грант должен покрывать запрошенный ресурс и
+                 почти ничего сверх;
+      * label  — человеческий текст «что именно разрешается навсегда»; хост
+                 показывает его оператору ДО нажатия кнопки;
+      * secret — имя секрета в policy. Коннектор его не знает (in_scope секрета
+                 не видит) — штампует прокси, который под этот секрет и поднят.
+
+    Грант может отсутствовать (ASK без grant): тогда «навсегда» невозможно и
+    хост обязан НЕ показывать третью кнопку (например, запрос к корню сервиса —
+    узкого префикса из него не вывести).
+    """
+
+    key: str
+    value: str
+    label: str
+    secret: str = ""
+
+
+@dataclass(frozen=True)
 class ScopeVerdict:
     """Решение коннектора по одному запросу: ALLOW | DENY | ASK.
 
@@ -47,7 +79,8 @@ class ScopeVerdict:
                 ПРЕДПИСЫВАЮЩИЙ (Р0): что не так + что доступно вместо (из scope)
                 + что делать. Гасит поиск обходов;
       * ASK   — скоуп не покрывает, но расширяем спросом у оператора (§4.6);
-                `descr` — человеческое описание запрашиваемого доступа для кнопок.
+                `descr` — человеческое описание запрашиваемого доступа для кнопок,
+                `grant` (опционально) — узкая запись в policy для «навсегда».
 
     Собирать через фабрики allow()/deny()/ask(), не напрямую — они держат
     инвариант «у DENY есть remedy, у ASK есть descr».
@@ -57,6 +90,7 @@ class ScopeVerdict:
     reason: str | None = None
     remedy: str | None = None
     descr: str | None = None
+    grant: ScopeGrant | None = None
 
     @classmethod
     def allow(cls) -> ScopeVerdict:
@@ -69,10 +103,12 @@ class ScopeVerdict:
         return cls(kind="deny", reason=reason, remedy=remedy)
 
     @classmethod
-    def ask(cls, descr: str) -> ScopeVerdict:
+    def ask(cls, descr: str, grant: ScopeGrant | None = None) -> ScopeVerdict:
+        """ASK. `grant` — узкая запись в policy, если из запроса её МОЖНО вывести;
+        None → «навсегда» недоступно (только разовый грант)."""
         if not descr or not descr.strip():
             raise ValueError("ASK без descr запрещён (нужно описание для оператора)")
-        return cls(kind="ask", descr=descr)
+        return cls(kind="ask", descr=descr, grant=grant)
 
     @property
     def is_allow(self) -> bool:
