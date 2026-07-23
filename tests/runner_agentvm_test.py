@@ -21,6 +21,7 @@ def cfg(**kw):
     base = dict(
         agent_vm_memory_gib=None, agent_vm_cpus=None, agent_vm_image=None,
         claude_env={}, agent_vm_host_ip=None,
+        agent_vm_egress_proxy=None, agent_vm_egress_ca=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -69,8 +70,108 @@ def main():
     test_preflight_no_binary()
     test_preflight_no_kvm()
     test_preflight_ok()
+    test_egress_flags_absent_by_default()
+    test_egress_flags_emitted()
+    test_preflight_rejects_egress_without_fork()
+    test_preflight_rejects_missing_ca()
 
     print("ALL RUNNER OK")
+
+
+# ── egress на наш прокси (флаги форка agent-vm) ─────────────────────────────
+def test_egress_flags_absent_by_default():
+    """Без AGENT_VM_EGRESS_PROXY argv не меняется ни на байт.
+
+    «Выключено = не существует»: апстримный agent-vm не должен видеть чужих
+    флагов, иначе он упадёт на «unexpected argument».
+    """
+    argv = AgentVmRunner(cfg(), Path("/opt/orch")).wrap(
+        ["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    s = " ".join(argv)
+    assert "--egress-proxy" not in s and "--egress-ca" not in s, argv
+
+
+def test_egress_flags_emitted():
+    """С прокси (и CA) флаги уходят в argv; CA только вместе с прокси."""
+    argv = AgentVmRunner(
+        cfg(agent_vm_egress_proxy="http://192.168.1.44:9000",
+            agent_vm_egress_ca=Path("/tmp/vault-ca.pem")),
+        Path("/opt/orch"),
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    s = " ".join(argv)
+    assert "--egress-proxy http://192.168.1.44:9000" in s, argv
+    assert "--egress-ca /tmp/vault-ca.pem" in s, argv
+
+    # CA без прокси бессмыслен (доверять upstream-плечу нечему) — не шлём.
+    argv = AgentVmRunner(
+        cfg(agent_vm_egress_ca=Path("/tmp/vault-ca.pem")), Path("/opt/orch"),
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    assert "--egress-ca" not in " ".join(argv), argv
+    print("OK agent-vm: --egress-proxy/--egress-ca только когда заданы")
+
+
+def test_preflight_rejects_egress_without_fork():
+    """Апстримный agent-vm (нет --egress-proxy в --help) + заданный прокси →
+    честный отказ на preflight, а не падение каждой сессии на unexpected argument.
+    А главное — не тихая работа с обойдённым кошельком."""
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    r = AgentVmRunner(cfg(agent_vm_egress_proxy="http://10.0.0.2:9000"), Path("/opt/orch"))
+    upstream_help = SimpleNamespace(stdout=b"--allow-host --publish", stderr=b"")
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True), \
+         mock.patch.object(agentvm.subprocess, "run", return_value=upstream_help):
+        ok, why = r.preflight()
+    assert ok is False and "--egress-proxy" in why and "форк" in why, why
+
+    # Форк (флаг есть в --help) — пропускаем.
+    fork_help = SimpleNamespace(stdout=b"--egress-proxy <URL> --egress-ca <PEM>", stderr=b"")
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True), \
+         mock.patch.object(agentvm.subprocess, "run", return_value=fork_help):
+        ok, why = r.preflight()
+    assert ok is True and why == "ok", why
+
+    # Сбой запуска бинаря = «флага нет» (честный отказ, не падение сессий).
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True), \
+         mock.patch.object(agentvm.subprocess, "run", side_effect=OSError("boom")):
+        ok, why = r.preflight()
+    assert ok is False and "--egress-proxy" in why
+    print("OK preflight: egress-флаги требуют форка (апстрим → честный отказ)")
+
+
+def test_preflight_rejects_missing_ca():
+    """Указанный, но отсутствующий CA — отказ на старте: иначе VM поднимется и
+    КАЖДОЕ TLS-соединение упадёт с невнятной ошибкой сертификата."""
+    import tempfile
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    fork_help = SimpleNamespace(stdout=b"--egress-proxy", stderr=b"")
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "nope.pem"
+        r = AgentVmRunner(
+            cfg(agent_vm_egress_proxy="http://10.0.0.2:9000", agent_vm_egress_ca=missing),
+            Path("/opt/orch"),
+        )
+        with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+             mock.patch.object(agentvm.subprocess, "run", return_value=fork_help), \
+             mock.patch.object(agentvm.Path, "exists", return_value=True):
+            ok, why = r.preflight()
+        assert ok is False and "файла нет" in why, why
+
+        present = Path(d) / "ca.pem"
+        present.write_text("-----BEGIN CERTIFICATE-----\n")
+        r = AgentVmRunner(
+            cfg(agent_vm_egress_proxy="http://10.0.0.2:9000", agent_vm_egress_ca=present),
+            Path("/opt/orch"),
+        )
+        with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+             mock.patch.object(agentvm.subprocess, "run", return_value=fork_help), \
+             mock.patch.object(agentvm.Path, "exists", return_value=True):
+            ok, why = r.preflight()
+        assert ok is True, why
+    print("OK preflight: отсутствующий --egress-ca отвергается на старте")
 
 
 def test_preflight_no_binary():
