@@ -70,6 +70,7 @@ from .connectors import HttpReq
 from .connectors.contract import Connector, ScopeGrant, ScopeVerdict
 from .host import VaultHost, ask_grant, deny_remedy
 from .secret import Secret
+from .store import SecretStore
 from .tls import VaultCA, VaultCAError
 
 logger = logging.getLogger(__name__)
@@ -190,12 +191,21 @@ class VaultProxy:
       * ca — VaultCA (корень в trust-store клиента; issue(host) даёт leaf);
       * connector — плагин сервиса (authorize/in_scope);
       * secret — секрет, чей кред подставляем на ALLOW;
-      * scope — машинный скоуп (для generic-bearer: {"url_prefixes": [...]});
+      * scope — машинный скоуп (для generic-bearer: {"url_prefixes": [...]}). Это
+        СТАРТОВЫЙ снимок; при заданном `store` scope на каждом запросе берётся
+        свежим из secrets.toml (см. store + _current_scope), snapshot остаётся
+        лишь fail-safe-фолбэком на случай ошибки чтения файла;
+      * store — общий SecretStore (тот же, что у пула/демона): источник СВЕЖЕГО
+        scope секрета. С ним прокси перечитывает scope по mtime/size (дёшево —
+        кэш store), поэтому грант, записанный ДРУГИМ живым прокси, и операторский
+        отзыв в файле действуют на лету, без перезапуска (§4.6). None → scope
+        статичен (standalone-сборка/тесты) — прежнее поведение;
       * host — VaultHost для ASK-спроса гранта (§4.6); None → ASK трактуется как
         DENY (standalone-сборка 2.3, спрашивать некому);
       * session_name — имя сессии, от чьего лица спрашиваем host.ask (прокси —
         per-session, §4.3); при host=None не используется;
-      * service_hosts — хосты, которыми владеет секрет; None → вывести из scope;
+      * service_hosts — хосты, которыми владеет секрет; None → вывести из scope
+        (при `store` — из СВЕЖЕГО scope на каждом запросе);
       * upstream_ssl — SSLContext для коннекта к РЕАЛЬНОМУ сервису (обычный
         trust); None → системный default. В тесте сюда кладут trust к локальному
         «сервису» (его серт), чтобы реориджин ему доверял;
@@ -209,6 +219,7 @@ class VaultProxy:
         secret: Secret,
         scope: dict,
         *,
+        store: SecretStore | None = None,
         host: VaultHost | None = None,
         session_name: str = "",
         service_hosts: set[str] | None = None,
@@ -225,8 +236,19 @@ class VaultProxy:
         self.connector = connector
         self.secret = secret
         self.scope = scope
+        self._store = store
+        # Последний ВАЛИДНЫЙ scope секрета — fail-safe-фолбэк для динамического
+        # режима: если secrets.toml в момент чтения недоступен/битый, держим его
+        # (ошибка чтения НЕ должна ни ронять сессию, ни расширять доступ). Стартово
+        # — снимок из конструктора (то же, что видит статический режим).
+        self._last_valid_scope = dict(scope)
         self.host = host
         self.session_name = session_name
+        # service_hosts либо ЗАФИКСИРОВАНЫ коннектором (gdocs и пр. знают свой набор
+        # хостов независимо от scope), либо выводятся из url_prefixes scope. Во
+        # втором случае при динамическом scope их надо пересчитывать (грант на новый
+        # хост / отзыв меняют набор) — см. _current_service_hosts.
+        self._service_hosts_fixed = service_hosts is not None
         self.service_hosts = (
             {h.lower() for h in service_hosts}
             if service_hosts is not None
@@ -399,6 +421,69 @@ class VaultProxy:
 
         await self._serve_decrypted(reader, writer, host, port, authority)
 
+    # --- живой (перечитываемый) scope секрета ------------------------------
+
+    def _current_scope(self) -> dict:
+        """АКТУАЛЬНЫЙ scope секрета на момент запроса.
+
+        Без store — статичный снимок `self.scope` (standalone/тесты, прежнее
+        поведение). Со store — свежий scope секрета из secrets.toml: `store.load()`
+        дёшев (кэш по mtime/mode/size — диск не читается, если файл не менялся) и
+        перечитывает файл, если он изменился. Так грант, дописанный в файл ДРУГИМ
+        живым прокси того же секрета, и операторский отзыв (сужение scope) действуют
+        на лету, без перезапуска этого прокси.
+
+        Fail-safe (Р0/безопасность — ошибка чтения НЕ должна ни ронять сессию, ни
+        расширять доступ):
+          * `store.load()` бросил / файл недоступен / права шире 0600 / битый TOML
+            (`last_load_ok == False`) → держим ПОСЛЕДНИЙ ВАЛИДНЫЙ scope. Это не
+            расширение (тот же уже-разрешённый набор), а транзиентная ошибка чтения
+            не рвёт живую работу. Осознанное следствие: правку, сделанную в БИТЫЙ
+            файл, прокси не подхватит — но операторский отзыв идёт валидной
+            атомарной записью (PolicyEditor), которую мы читаем чисто.
+          * файл валиден, но секрета в нём больше нет / сменился connector / он
+            перестал быть прокси-секретом → honest degrade: ПУСТОЙ scope. Не роняем
+            прокси, но и не пускаем по старому снимку — исчезновение секрета в
+            валидном файле это намеренное состояние; пустой scope → его хосты
+            перестают быть «своими» (см. _current_service_hosts) → кред не
+            подставляется (сквозной форвард без инъекции, сервис сам вернёт 401).
+        """
+        if self._store is None:
+            return self.scope
+        try:
+            secrets = self._store.load()
+        except Exception:  # noqa: BLE001 — чтение policy не должно ронять прокси
+            logger.warning(
+                "VaultProxy: store.load() упал — держу последний валидный scope "
+                "(секрет %s)", self.secret.name)
+            return self._last_valid_scope
+        # last_load_ok есть у настоящего SecretStore всегда; in-memory-двойник
+        # (тест/standalone), который отдаёт лишь валидные данные и не знает ошибок
+        # чтения, атрибута может не иметь → трактуем как «прочитано успешно».
+        if not getattr(self._store, "last_load_ok", True):
+            logger.warning(
+                "VaultProxy: policy недоступна/битая — держу последний валидный "
+                "scope (секрет %s, fail-safe)", self.secret.name)
+            return self._last_valid_scope
+        fresh = secrets.get(self.secret.name)
+        if (fresh is None or not fresh.is_proxy
+                or fresh.connector != self.connector.name):
+            logger.info(
+                "VaultProxy: секрет %r исчез/сменил connector в валидной policy → "
+                "scope пуст (honest degrade, доступ не расширяем)", self.secret.name)
+            return {}
+        self._last_valid_scope = dict(fresh.scope)
+        return self._last_valid_scope
+
+    def _current_service_hosts(self, scope: dict) -> set[str]:
+        """Хосты, которыми «владеет» секрет, для ТЕКУЩЕГО scope. Зафиксированные
+        коннектором (gdocs) — как есть. Выведенные из url_prefixes — статичны без
+        store (их доращивает _apply_grant), но при динамическом scope
+        пересчитываются из свежего scope (грант добавил хост / отзыв убрал)."""
+        if self._service_hosts_fixed or self._store is None:
+            return self.service_hosts
+        return _hosts_from_scope(scope)
+
     async def _serve_decrypted(
         self,
         reader: asyncio.StreamReader,
@@ -424,8 +509,12 @@ class VaultProxy:
         url = f"https://{authority}{target}"
         req = HttpReq(method=method, url=url, headers=dict(headers), body=body)
 
-        if host.lower() in self.service_hosts:
-            verdict = self.connector.in_scope(req, self.scope)
+        # Свежий scope и производные от него хосты берём ОДИН раз на запрос: со
+        # store это перечитывание secrets.toml по mtime (грант другого прокси и
+        # операторский отзыв действуют на лету), без store — статичный снимок.
+        scope = self._current_scope()
+        if host.lower() in self._current_service_hosts(scope):
+            verdict = self.connector.in_scope(req, scope)
             if verdict.is_deny:
                 await self._respond_deny(writer, verdict)
                 return
@@ -658,16 +747,21 @@ class VaultProxy:
         return bool(result)
 
     def _apply_grant(self, grant: ScopeGrant) -> None:
-        """Расширить ЖИВОЙ scope записанным в policy грантом (без перезапуска).
+        """Расширить СТАТИЧНЫЙ снимок scope записанным в policy грантом (без
+        перезапуска). Нужен для режима БЕЗ store (standalone/тесты): там `self.scope`
+        — единственный источник решения и сам по себе запись в файл не подхватывает,
+        поэтому без этого мгновенного расширения тот же запрос спрашивался бы снова.
 
-        Прокси держит снимок scope, снятый при подъёме (см. proxy_pool), поэтому
-        запись в secrets.toml сама по себе на него не влияет. Дублирование
-        безвредно, но проверяем — иначе повторные гранты пухли бы списком.
+        В ДИНАМИЧЕСКОМ режиме (со store) собственный грант виден и без этого:
+        хост пишет его в secrets.toml ДО возврата вердикта, а `_current_scope`
+        перечитывает файл по mtime/size на следующем же запросе (размер файла
+        меняется → кэш store инвалидируется) — источник правды один, файл. Мутация
+        снимка тут в этом случае на решение не влияет (решает свежий scope), но
+        безвредна и оставлена ради единого кода пути ASK-гранта. Дублирование
+        проверяем — иначе повторные гранты пухли бы списком.
 
-        ЧЕСТНОЕ ограничение: прокси ДРУГИХ сессий (или другой прокси того же
-        секрета) о записи не узнают и переспросят до своего перезапуска. Источник
-        правды — файл; синхронизировать все живые прокси = отдельный срез
-        (перечитывание scope по mtime, как SecretStore)."""
+        Кросс-прокси видимость (грант ДРУГОГО живого прокси того же секрета) со
+        store решается тем же перечитыванием файла — см. _current_scope."""
         values = list(self.scope.get(grant.key) or [])
         if grant.value not in values:
             values.append(grant.value)

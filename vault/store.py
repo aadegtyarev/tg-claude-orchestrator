@@ -49,6 +49,24 @@ class SecretStore:
         self._path = path
         self._cache_key: tuple | None = None
         self._secrets: dict[str, Secret] = {}
+        # Прочитал ли ПОСЛЕДНИЙ load() валидный файл (stat+права+TOML). False до
+        # первого удачного чтения и при любом провале (нет файла/права шире/битый
+        # TOML). Потребитель, которому важно отличить «читать нечем» от «файл
+        # валиден, но записи нет» (живой прокси — fail-safe scope), смотрит сюда:
+        # на False держит последний валидный снимок (ошибка чтения НЕ расширяет
+        # доступ и не роняет сессию), на True доверяет содержимому целиком.
+        self._last_load_ok = False
+
+    @property
+    def last_load_ok(self) -> bool:
+        """Успешно ли ПОСЛЕДНИЙ load() прочитал валидный policy-файл.
+
+        False → файла нет / права шире 0600 / битый TOML: содержимому (в т.ч.
+        «секрета нет») доверять нельзя — это ошибка чтения, а не факт policy.
+        True → файл прочитан и распарсен, отсутствие секрета в нём — намеренное
+        состояние. На cache-hit (файл не менялся) значение сохраняется от прошлого
+        чтения, поэтому корректно и без повторного парсинга."""
+        return self._last_load_ok
 
     def load(self) -> dict[str, Secret]:
         try:
@@ -56,6 +74,7 @@ class SecretStore:
         except OSError:
             # Файла нет — кошелёк работает, но секретов нет (warning на старте).
             self._cache_key, self._secrets = None, {}
+            self._last_load_ok = False
             return {}
         key = (st.st_mtime_ns, st.st_mode, st.st_size)
         if key == self._cache_key:
@@ -68,11 +87,13 @@ class SecretStore:
                 "wallet: %s доступен group/other (права %o) — секреты НЕ загружены; "
                 "выполни chmod 600", self._path, st.st_mode & 0o777,
             )
+            self._last_load_ok = False
             return {}
         try:
             data = tomllib.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
             logger.error("wallet: не удалось прочитать %s: %s", self._path, e)
+            self._last_load_ok = False
             return {}
         for name, raw in (data.get("secrets") or {}).items():
             if not isinstance(raw, dict):
@@ -147,4 +168,5 @@ class SecretStore:
                 connector=connector,
                 scope=scope,
             )
+        self._last_load_ok = True
         return self._secrets
