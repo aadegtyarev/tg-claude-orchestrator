@@ -326,28 +326,31 @@ async def main_async(argv: Sequence[str]) -> int:
         env.update(intercept.env)
         extra_rw = intercept.extra_rw
 
-    full_argv = build_argv(runner, command, Path(cwd), extra_rw)
-
-    stdin_fd, stdout_fd = 0, 1
-    interactive = os.isatty(stdin_fd)
-    rows, cols = TERM_ROWS, TERM_COLS
-    if interactive:
-        try:
-            size = os.get_terminal_size(stdout_fd)
-            rows, cols = size.lines, size.columns
-        except OSError:
-            pass
-
-    def on_output(chunk: bytes) -> None:
-        with contextlib.suppress(OSError):
-            os.write(stdout_fd, chunk)
-
-    # raw_terminal возвращает терминал в finally — обёртка исключений НЕ должна
-    # его перекрыть, поэтому try внутри with (терминал восстановлен раньше, чем
-    # печатаем ошибку). Сбой спавна/запуска (напр. CLAUDE_BIN на несуществующий
-    # бинарь) → честный отказ в stderr + код 1, а не сырой трейсбек: остальной
-    # CLI держит эту планку (CliError), держим и здесь.
+    # try/finally оборачивает ВСЁ после подъёма перехвата (build_argv, замер
+    # терминала, запуск) — иначе исключение в этом узком окне утекло бы прокси-порт
+    # и временный каталог bundle до входа в защищённый блок (нашло ревью, LOW-4).
     try:
+        full_argv = build_argv(runner, command, Path(cwd), extra_rw)
+
+        stdin_fd, stdout_fd = 0, 1
+        interactive = os.isatty(stdin_fd)
+        rows, cols = TERM_ROWS, TERM_COLS
+        if interactive:
+            try:
+                size = os.get_terminal_size(stdout_fd)
+                rows, cols = size.lines, size.columns
+            except OSError:
+                pass
+
+        def on_output(chunk: bytes) -> None:
+            with contextlib.suppress(OSError):
+                os.write(stdout_fd, chunk)
+
+        # raw_terminal возвращает терминал в finally — обёртка исключений НЕ должна
+        # его перекрыть, поэтому try внутри with (терминал восстановлен раньше, чем
+        # печатаем ошибку). Сбой спавна/запуска (напр. CLAUDE_BIN на несуществующий
+        # бинарь) → честный отказ в stderr + код 1, а не сырой трейсбек: остальной
+        # CLI держит эту планку (CliError), держим и здесь.
         with raw_terminal(stdin_fd):
             try:
                 return await run(

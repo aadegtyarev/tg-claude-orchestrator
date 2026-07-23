@@ -44,7 +44,7 @@ from vault.daemon import VaultDaemon
 # Примитивы TLS-перехвата (CA-bundle, атомарная запись, env-довесок, NO_PROXY) —
 # общие с CLI-лончером claude-box (§5.2), одна реализация на обоих потребителей.
 from vault.inject import (
-    atomic_write as _atomic_write,  # noqa: F401 — ре-экспорт для тестов (симлинк-защита)
+    atomic_write as _atomic_write,  # локальное имя: симлинк-безопасная запись bundle/.wallet.json
     build_ca_bundle,
     merge_no_proxy,
     proxy_env_vars,
