@@ -61,6 +61,11 @@ claude-box [--engine bwrap|off|agent-vm] [--vm] [--profile <имя>]
 egress сам). Профили — `box_cli/profiles.py` (чистый stdlib), кошелёк —
 `box_cli/wallet.py`, арбитр stdin для ASK/confirm в tty — `box_cli/tty.py`.
 
+Окружение: `CLAUDE_BIN` (какой бинарь запускать, дефолт `claude`),
+`CLAUDE_BOX_HOME` (корень профилей, дефолт `~/.local/share/claude-box`),
+`AGENT_VM_*` под `--vm` (ресурсы/образ/egress VM — те же имена, что у
+оркестратора). Все опциональны.
+
 ## Автономность
 
 `box/` не импортирует `orchestrator.*` — проверяется тестом
