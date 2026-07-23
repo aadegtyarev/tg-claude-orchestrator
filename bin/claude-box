@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """claude-box — запуск claude в песочнице (Слой 2 редизайна).
 
-Пока только изоляция bwrap|off; кошелёк/профили/VM/unattended — следующие срезы.
+Есть: изоляция bwrap|off, кошелёк (--wallet), профили (--profile/init/profile).
+VM (--vm/connect) и unattended (-p) — следующие треки, пока честные заглушки.
 
 Тонкий entrypoint: кладёт корень репозитория в sys.path и зовёт box_cli.cli.main.
 CLI — app поверх слоёв (импортит box + Engine), не часть автономного пакета box/.

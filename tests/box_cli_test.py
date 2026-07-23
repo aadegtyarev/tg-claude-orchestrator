@@ -85,21 +85,21 @@ def test_parse_bad_engine_rejected():
 
 def test_parse_stub_flags_and_subcommands_refused():
     # Заглушки: честный отказ (код 2), не тихий no-op и не «unknown».
-    # (--wallet больше НЕ заглушка — реализован; см. test_parse_wallet_and_secrets.)
-    for args in (["--vm"], ["--profile", "work"], ["-p", "task"]):
+    # (--wallet/--profile больше НЕ заглушки — реализованы; init/profile — тоже.)
+    for args in (["--vm"], ["-p", "task"]):
         try:
             cli.parse_args(args)
         except SystemExit as e:
             assert e.code == 2, args
         else:
             raise AssertionError(f"{args} должно быть заглушено отказом")
-    for sub in ("init", "profile", "connect"):
-        try:
-            cli.parse_args([sub])
-        except SystemExit as e:
-            assert e.code == 2, sub
-        else:
-            raise AssertionError(f"подкоманда {sub} должна быть заглушена")
+    # connect остаётся заглушкой (agent-vm-трек заблокирован).
+    try:
+        cli.parse_args(["connect"])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("подкоманда connect должна быть заглушена")
 
 
 def test_parse_help_exits_zero():
