@@ -50,6 +50,7 @@ from vault.cli import build_daemon, write_wallet
 from vault.daemon import VaultDaemon
 from vault.inject import proxy_sandbox_env
 from vault.host import VaultHost
+from vault.netloc import host_lan_ip
 from vault.policy import PolicyEditor
 from vault.proxy_pool import ProxyPoolError, SessionProxyPool
 from vault.secret import Secret
@@ -68,6 +69,12 @@ SESSION_NAME = "claude-box"
 # под bwrap $HOME — пустой tmpfs, туда писать бессмысленно; клиент находит файл
 # по WALLET_FILE (bin/wallet смотрит его ПЕРВЫМ, до ~/.wallet.json).
 WALLET_FILE_NAME = "wallet.json"
+
+# Имя PEM-файла с корнем VaultCA для `--egress-ca` форка agent-vm (путь VM). Файл
+# читает agent-vm НА ХОСТЕ (в гостя не биндится) — им intercept-прокси agent-vm
+# доверяет НАШЕМУ vault-прокси на upstream-плече. Значение секрета сюда не входит:
+# это ПУБЛИЧНЫЙ корень, которым наш прокси подписывает свои листовые серты.
+EGRESS_CA_NAME = "vault-egress-ca.pem"
 
 
 def box_policy_access(secrets_path: Path) -> tuple[PolicyEditor, bool]:
@@ -112,11 +119,31 @@ class WalletError(Exception):
 @dataclass
 class WalletIntercept:
     """Результат настройки: env-довесок к box.launch, доп. RW-бинды песочницы и
-    асинхронный teardown. Один тип на оба пути (прокси/шимы) — лончеру всё равно,
-    что именно поднято: он делает env.update + extra_rw + close() в finally."""
+    асинхронный teardown. Один тип на все пути (прокси/шимы/VM) — лончеру всё
+    равно, что именно поднято: он делает env.update + extra_rw + close() в finally.
+
+    Поля egress_* заполнены ТОЛЬКО на VM-пути (прокси-секрет под --vm). Под VM env
+    в гостя не течёт (F1), поэтому env/extra_rw там пусты, а кошелёк доставляется
+    гостю иначе — через флаги форка agent-vm:
+      * egress_proxy — `http://<LAN-IP хоста>:<порт>` нашего vault-прокси (гость
+        не видит loopback хоста, F2 — прокси слушает на LAN-адресе);
+      * egress_ca — путь к PEM с корнем VaultCA для `--egress-ca` (файл читает
+        agent-vm на ХОСТЕ, в гостя не едет);
+      * allow_egress — LAN-адрес хоста для `--allow-egress` (public_only гостя
+        режет RFC1918 без явного разрешения).
+    Под bwrap/off/шимы все три — None, и лончер работает как раньше (env-довесок).
+    """
 
     env: dict[str, str]
     extra_rw: list[Path] = field(default_factory=list)
+    egress_proxy: str | None = None
+    egress_ca: Path | None = None
+    allow_egress: str | None = None
+    # env_files — пары «env-имя=путь-к-файлу-со-значением» для `--env-file` форка
+    # agent-vm (VM-путь inject-секрета): значение читается из временного файла
+    # 0600, в argv/лог не попадает. Пусто на всех прочих путях. Файл лежит в
+    # _tmpdir — teardown (close) сносит его вместе с прокси/CA.
+    env_files: list[str] = field(default_factory=list)
     _pool: SessionProxyPool | None = None
     _daemon: VaultDaemon | None = None
     _tmpdir: Path | None = None
@@ -144,13 +171,22 @@ class WalletIntercept:
 
 async def setup_wallet_intercept(
     secret_name: str, *, secrets_path: Path, session_name: str = SESSION_NAME,
-    host: VaultHost | None = None,
+    host: VaultHost | None = None, vm: bool = False,
 ) -> WalletIntercept:
     """Поднять кошелёк под один секрет и вернуть WalletIntercept.
 
-    Вид секрета решает КАК: прокси-секрет → MITM-перехват TLS, host/inject →
-    PATH-шимы над standalone-демоном. Бросает WalletError (с кодом выхода) на
-    любой честный отказ; всё уже поднятое при отказе сворачивается (не течём).
+    Вид секрета И движок решают КАК:
+      * прокси-секрет (connector) под bwrap/off → MITM-перехват TLS через env
+        HTTPS_PROXY + CA-bundle (значение подставляет прокси на проводе);
+      * прокси-секрет под --vm → egress-proxy форка agent-vm: наш vault-прокси на
+        LAN-адресе хоста, гость направляется в него через `--egress-proxy` (env в
+        гостя не течёт, F1; loopback гость не видит, F2);
+      * host/inject-секрет под bwrap/off → PATH-шимы над standalone-демоном;
+      * host/inject-секрет под --vm → ЧЕСТНЫЙ отказ (код 2): env в гостя не течёт
+        (F1), а git/gh ведёт сам agent-vm (§5.2) — шимам там не за что зацепиться.
+
+    Бросает WalletError (с кодом выхода) на любой честный отказ; всё уже поднятое
+    при отказе сворачивается (не течём).
 
     host — реализация VaultHost для confirm/ASK. У claude-box это ОБЯЗАН быть
     хост, который делит stdin с PTY-relay через арбитра терминала (box_cli.tty.
@@ -170,12 +206,32 @@ async def setup_wallet_intercept(
             f"секрет «{secret_name}» не разрешён «{session_name}»: добавь "
             f'sessions = ["{session_name}"] (или ["*"]) в его запись secrets.toml.',
             code=2)
-    if not secret.is_proxy:
-        return await setup_wallet_shims(
-            secret_name, secret=secret, secrets_path=secrets_path,
-            session_name=session_name, host=host)
-    return await _setup_proxy_intercept(
-        secret_name, store=store, session_name=session_name, host=host)
+    if secret.is_proxy:
+        if vm:
+            return await _setup_proxy_intercept_vm(
+                secret_name, store=store, session_name=session_name, host=host)
+        return await _setup_proxy_intercept(
+            secret_name, store=store, session_name=session_name, host=host)
+    # Не прокси-секрет. Под bwrap/off — PATH-шимы над демоном (inject и host
+    # одинаково). Под --vm шимов нет (§5.2: git/gh ведёт сам agent-vm), но два
+    # подвида расходятся:
+    #   * inject (value+env) → значение доставляется прямой инъекцией в env гостя
+    #     через `--env NAME=VALUE` форка agent-vm — то же, что inject под bwrap
+    #     (значение в окружении процесса claude);
+    #   * host-passthrough (только команды, без value/env) → честный отказ (код 2):
+    #     заворачивать нечего (git/gh ведёт agent-vm) и инъектить нечего.
+    if vm:
+        if secret.value and secret.env:
+            return _setup_inject_env_vm(secret_name, secret=secret)
+        raise WalletError(
+            f"секрет «{secret_name}» — host-passthrough (обёртки git/gh/curl), а под "
+            "--vm они бессмысленны: git/gh ведёт сам agent-vm (§5.2), заворачивать "
+            "нечего, а значения для инъекции у host-passthrough нет. Под --vm "
+            "работают прокси-секрет (connector) и inject-секрет (value+env); "
+            "host-passthrough — под --engine bwrap.", code=2)
+    return await setup_wallet_shims(
+        secret_name, secret=secret, secrets_path=secrets_path,
+        session_name=session_name, host=host)
 
 
 async def _setup_proxy_intercept(
@@ -216,6 +272,132 @@ async def _setup_proxy_intercept(
         secret_name, port, bundle_path)
     # Временный каталог биндится в песочницу тем же путём — bundle виден изнутри.
     return WalletIntercept(env=env, extra_rw=[tmpdir], _pool=pool, _tmpdir=tmpdir)
+
+
+async def _setup_proxy_intercept_vm(
+    secret_name: str, *, store: SecretStore, session_name: str,
+    host: VaultHost | None = None,
+) -> WalletIntercept:
+    """Прокси-секрет под --vm: vault-прокси на LAN-адресе хоста + флаги форка.
+
+    Топология (соблюдена точно, docs/ARCHITECTURE-claude-box.md):
+      гость(claude) → intercept-прокси agent-vm (свой CA) → CONNECT →
+      НАШ vault-прокси (LAN-IP хоста, VaultCA) → реальный сервис.
+
+    Отличия от bwrap-пути:
+      * прокси слушает на LAN-адресе хоста, а не на 127.0.0.1 — гость loopback
+        хоста не видит (F2); env HTTPS_PROXY в гостя не течёт (F1), поэтому
+        доставка — не через env, а через `--egress-proxy` форка agent-vm;
+      * корень VaultCA кладётся во ВРЕМЕННЫЙ PEM (для `--egress-ca`): им
+        intercept-прокси agent-vm доверяет нашему прокси на upstream-плече. Файл
+        читает agent-vm на ХОСТЕ, в гостя не биндится;
+      * env/extra_rw пусты — доставка целиком во флагах раннера.
+
+    upstream_ssl НЕ переопределяем (СИСТЕМНЫЙ trust, как в bwrap-пути): реориджин
+    к реальному сервису проверяет его настоящий серт — самозванец под сервис кред
+    не получит (§4.2). fail-closed: прокси обязан подняться ДО старта VM (иначе
+    agent-vm с недостижимым egress-proxy упадёт) — сюда мы возвращаемся только с
+    уже поднятым прокси, а лончер строит и запускает VM после этого.
+    """
+    # LAN-адрес хоста — гость видит хост только по нему (не по loopback, F2).
+    lan_ip = host_lan_ip()
+    if not lan_ip:
+        raise WalletError(
+            "--wallet под --vm требует LAN-адрес хоста (гость не видит его "
+            "loopback), а определить его не удалось. Задай явно "
+            "AGENT_VM_HOST_IP=<адрес хоста в LAN>.", code=1)
+
+    try:
+        ca = VaultCA()
+    except VaultCAError as e:
+        raise WalletError(
+            f"не удалось создать CA Vault ({e}) — нужен openssl. Перехват не поднят.",
+            code=1) from e
+
+    # Прокси на LAN-адресе хоста (bind_host), а не на 127.0.0.1. upstream_ssl не
+    # трогаем — системный trust (см. docstring). host — арбитр терминала лончера.
+    pool = SessionProxyPool(
+        ca, store, bind_host=lan_ip, host=host or TtyVaultHost())
+    try:
+        port = await pool.start(session_name, secret_name)
+    except ProxyPoolError as e:
+        await pool.stop_all()
+        raise WalletError(f"прокси-секрет «{secret_name}» не поднят: {e}", code=2) from e
+
+    # Корень VaultCA во временный PEM для --egress-ca. Всё, что уже поднято,
+    # сворачиваем при любом сбое записи — не оставляем висеть прокси/порт.
+    tmpdir = Path(tempfile.mkdtemp(prefix="claude-box-vault-vm-"))
+    ca_file = tmpdir / EGRESS_CA_NAME
+    try:
+        ca_file.write_text(ca.ca_cert_pem(), encoding="utf-8")
+        os.chmod(ca_file, 0o644)  # публичный корень; читает agent-vm на хосте
+    except OSError as e:
+        await pool.stop_all()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise WalletError(
+            f"не удалось записать CA для egress-proxy ({e}). Проверь место на диске.",
+            code=1) from e
+
+    egress_proxy = f"http://{lan_ip}:{port}"
+    # Прозрачность: кошелёк работает через egress-proxy на LAN-IP, а не через env.
+    # В argv/лог уходит только адрес прокси и публичный CA — значение секрета нет.
+    sys.stderr.write(
+        f"claude-box: --wallet «{secret_name}» под --vm: кошелёк работает через "
+        f"egress-proxy на {egress_proxy} (не через окружение — оно в гостя не "
+        "течёт). Значение секрета в гостя/лог/argv не попадает; подстановку делает "
+        "vault-прокси между хостом и сервисом.\n")
+    logger.info(
+        "wallet(vm): перехват секрета «%s» через egress-proxy %s (CA %s)",
+        secret_name, egress_proxy, ca_file)
+    return WalletIntercept(
+        env={}, extra_rw=[], egress_proxy=egress_proxy, egress_ca=ca_file,
+        allow_egress=lan_ip, _pool=pool, _tmpdir=tmpdir)
+
+
+def _setup_inject_env_vm(secret_name: str, *, secret: Secret) -> WalletIntercept:
+    """Inject-секрет под --vm: значение уходит в env гостя через `--env-file` форка.
+
+    Под bwrap inject-секрет = значение в окружении процесса claude; под --vm ровно
+    то же делает форковый `--env-file NAME=PATH` — переменная доезжает в env агента
+    В ГОСТЕ, а ЗНАЧЕНИЕ форк читает из ФАЙЛА (флаг v0.1.28,
+    docs/FORK-agent-vm-egress-proxy.md). Значит в argv agent-vm попадают только имя
+    и путь — значение секрета в командную строку (ps на хосте) НЕ входит. Пишем
+    значение во ВРЕМЕННЫЙ файл 0600 (как CA в прокси-пути); teardown (close) сносит
+    каталог. Одиночный завершающий \\n форк срезает — значение пишем как есть.
+
+    ГРАНИЦА (confirm). Под --vm нет per-command перехвата (значение просто в env),
+    поэтому `confirm=true` тут не применяется — предупреждаем оператора явно.
+    """
+    # Временный каталог 0700 + файл значения 0600. Всё в _tmpdir — teardown его
+    # сносит; при сбое записи сворачиваемся сразу (не оставляем каталог висеть).
+    tmpdir = Path(tempfile.mkdtemp(prefix="claude-box-wallet-vm-"))
+    os.chmod(tmpdir, 0o700)
+    value_file = tmpdir / f"{secret.env}.env"  # имя ради читаемости; значение внутри
+    try:
+        fd = os.open(value_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secret.value)
+    except OSError as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise WalletError(
+            f"не удалось записать значение inject-секрета «{secret_name}» ({e}). "
+            "Проверь место на диске.", code=1) from e
+
+    warn = ""
+    if secret.confirm:
+        warn = (" ВНИМАНИЕ: у секрета confirm=true, но под --vm per-command "
+                "подтверждения нет — значение доступно агенту в госте сразу.")
+    # Прозрачность БЕЗ значения: только имя env-переменной (значение — в файле).
+    sys.stderr.write(
+        f"claude-box: --wallet «{secret_name}» под --vm: значение уходит в env "
+        f"гостя как {secret.env} (флаг --env-file agent-vm — значение читается из "
+        "временного файла 0600, в argv/лог его нет)." + warn + "\n")
+    logger.info(
+        "wallet(vm): inject-секрет «%s» → env гостя %s (значение в файле, не логируем)",
+        secret_name, secret.env)
+    return WalletIntercept(
+        env={}, extra_rw=[], env_files=[f"{secret.env}={value_file}"],
+        _tmpdir=tmpdir)
 
 
 # ── host/inject-секрет: шимы над standalone-демоном ──────────────────────────

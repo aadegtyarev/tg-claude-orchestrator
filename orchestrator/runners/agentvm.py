@@ -19,10 +19,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Sequence, TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -83,6 +85,28 @@ def egress_hosts(claude_env: dict[str, str], host_ip: str | None) -> list[str]:
     return [host_ip] if any(host_ip in v for v in claude_env.values()) else []
 
 
+def egress_proxy_allow(egress_proxy: str | None) -> list[str]:
+    """Адрес самого egress-прокси, которому нужен `--allow-egress` (или []).
+
+    Если egress-прокси слушает на ПРИВАТНОМ (RFC1918) адресе — типовой случай
+    кошелька под --vm: наш vault-прокси на LAN-адресе хоста — гость по умолчанию
+    (public_only) не имеет права к нему обратиться, и весь egress молча упал бы.
+    Открываем ровно этот адрес. Публичный прокси допущен политикой и без явного
+    allow — для него ничего не добавляем (прод-путь оркестратора 1:1, если там
+    задан публичный AGENT_VM_EGRESS_PROXY). Хост не распарсился/не IP — [].
+    """
+    if not egress_proxy:
+        return []
+    host = urlsplit(egress_proxy).hostname
+    if not host:
+        return []
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return []
+    return [host] if ip.is_private else []
+
+
 class AgentVmRunner:
     name = "agent-vm"
     unique_cwd = True  # имя VM = hash(cwd): вторая сессия убила бы VM первой
@@ -130,6 +154,17 @@ class AgentVmRunner:
         ca = self.config.agent_vm_egress_ca
         if ca and not ca.is_file():
             return False, f"AGENT_VM_EGRESS_CA={ca} — файла нет (нужен PEM CA прокси)."
+        # Inject-секрет кошелька под --vm доставляется флагом --env-file (значение
+        # из файла, не в argv). Он есть только в форке v0.1.28+ — на старом бинаре
+        # честный отказ, а не падение каждой сессии на «unexpected argument».
+        if getattr(self.config, "agent_vm_env_files", ()) and \
+                not self._help_contains(b"--env-file"):
+            return False, (
+                "inject-секрет под --vm требует флаг --env-file, но установленный "
+                "agent-vm его не знает (нужен форк v0.1.28+, "
+                "docs/FORK-agent-vm-egress-proxy.md). Обнови agent-vm, либо используй "
+                "прокси-секрет под --vm, либо inject-секрет под --engine bwrap."
+            )
         return True, "ok"
 
     def _supports_egress_flags(self) -> bool:
@@ -140,6 +175,13 @@ class AgentVmRunner:
         без правок. Сбой запуска считаем «не знает»: лучше честный отказ на
         старте, чем падение каждой сессии.
         """
+        return self._help_contains(b"--egress-proxy")
+
+    def _help_contains(self, flag: bytes) -> bool:
+        """Есть ли `flag` в выводе `agent-vm claude --help` (форк vs апстрим).
+
+        Сбой запуска бинаря считаем «нет флага»: лучше честный отказ на старте,
+        чем падение каждой сессии на «unexpected argument»."""
         try:
             out = subprocess.run(
                 [AGENT_VM_BIN, "claude", "--help"],
@@ -147,7 +189,7 @@ class AgentVmRunner:
             )
         except Exception:  # noqa: BLE001 — любой сбой = считаем, что флага нет
             return False
-        return b"--egress-proxy" in out.stdout + out.stderr
+        return flag in out.stdout + out.stderr
 
     def wrap(
         self,
@@ -180,9 +222,15 @@ class AgentVmRunner:
         # ХОСТЕ. Гостю его LAN-адрес по умолчанию запрещён политикой
         # public_only — открываем ровно этот адрес, не всю LAN (--allow-lan
         # дал бы гостю всю подсеть). Config уже переписал loopback на него.
-        for host_ip in egress_hosts(
-            self.config.claude_env, self.config.agent_vm_host_ip
-        ):
+        # Плюс адрес самого egress-прокси, если он приватный (кошелёк под --vm:
+        # наш vault-прокси на LAN-адресе хоста — без allow гость до него не
+        # достучится). dict.fromkeys — стабильный порядок и дедуп (LAN-адрес
+        # может прийти из обоих источников сразу).
+        allow = dict.fromkeys(
+            egress_hosts(self.config.claude_env, self.config.agent_vm_host_ip)
+            + egress_proxy_allow(self.config.agent_vm_egress_proxy)
+        )
+        for host_ip in allow:
             out += ["--allow-egress", host_ip]
         # Egress гостя на наш прокси (кошелёк). Без этого весь HTTPS гостя
         # прозрачно MITM-ит собственный прокси agent-vm своим CA, и наш
@@ -195,6 +243,14 @@ class AgentVmRunner:
             if self.config.agent_vm_egress_ca:
                 # CA доверяется на UPSTREAM-плече перехвата, в гостя не едет.
                 out += ["--egress-ca", str(self.config.agent_vm_egress_ca)]
+        # Инъекция env в гостя из ФАЙЛА (VM-путь inject-секрета кошелька). Флаг
+        # форка `--env-file NAME=PATH` кладёт переменную в окружение агента в
+        # госте, читая значение из файла — в argv (ps на хосте) значение НЕ
+        # попадает, только имя и путь. Поле только у EngineConfig (кошелёк
+        # claude-box) — orchestrator.Config его не имеет, поэтому getattr с
+        # дефолтом ().
+        for pair in getattr(self.config, "agent_vm_env_files", ()):
+            out += ["--env-file", pair]
         for port in publish_ports:
             out += ["--publish", f"{port}:{port}"]
         # cwd монтирует сам agent-vm — второй --mount на тот же гостевой путь он

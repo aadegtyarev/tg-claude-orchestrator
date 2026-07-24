@@ -45,12 +45,14 @@ docs/ARCHITECTURE-claude-box.md) — под `--vm` НЕ работают и по
     $HOME сюда не заведена осознанно: по §4.7 она может пересеять отработанный
     одноразовый refresh-токен и РАЗЛОГИНИТЬ учётку оператора — нужен отдельный
     живой smoke.
-  * `--wallet` — под VM env в гостя не течёт (F1), а весь egress гостя прозрачно
-    MITM-ит собственный CA agent-vm (F10), т.е. HTTPS_PROXY нашего перехвата
-    просто не сработает; шимов под VM тоже нет (§5.2: git/gh ведёт сам agent-vm).
-    Рабочий путь — `--egress-proxy/--egress-ca` форка agent-vm (раннер их уже
-    умеет), но прокси кошелька слушает 127.0.0.1, а гостю нужен LAN-адрес хоста
-    (F2) — сведение этого в один флаг остаётся следующему срезу.
+  * `--wallet` с ПРОКСИ-секретом (connector) — РАБОТАЕТ: под VM env в гостя не
+    течёт (F1) и HTTPS_PROXY нашего перехвата не сработал бы, но кошелёк поднимает
+    vault-прокси на LAN-адресе хоста (F2 — гость loopback не видит) и направляет
+    egress гостя в него через `--egress-proxy`/`--egress-ca` форка agent-vm
+    (+ `--allow-egress <LAN-IP>`, т.к. public_only режет RFC1918). Значение
+    секрета в гостя/argv/лог не попадает — подстановку делает прокси на проводе.
+  * `--wallet` с host/inject-секретом — под VM ЧЕСТНЫЙ отказ (код 2): env в
+    гостя не течёт (F1), а PATH-шимов там нет (§5.2: git/gh ведёт сам agent-vm).
 
 Что уезжает в гостя под `--vm`: ТОЛЬКО текущий каталог (его монтирует сам
 agent-vm). Корень установки claude-box в VM не монтируется — раннер строится с
@@ -132,6 +134,12 @@ class EngineConfig:
     agent_vm_image: str | None = None
     agent_vm_egress_proxy: str | None = None
     agent_vm_egress_ca: Path | None = None
+    # Инъекция env в гостя через `--env-file NAME=PATH` форка agent-vm (VM-путь
+    # inject-секрета кошелька): значение читается из файла, в argv не попадает.
+    # Список строк «NAME=PATH». Пусто вне --wallet --vm. Читается только раннером
+    # agent-vm; orchestrator.Config такого поля не имеет (его кошелёк работает
+    # иначе) — раннер берёт его через getattr с дефолтом [].
+    agent_vm_env_files: tuple[str, ...] = ()
 
 
 ENGINE_VM = "agent-vm"
@@ -156,16 +164,20 @@ _USAGE = (
     "  --vm             короткая форма --engine agent-vm (то же в microVM).\n"
     "                   Ресурсы/образ VM — из AGENT_VM_MEMORY_GIB, AGENT_VM_CPUS,\n"
     "                   AGENT_VM_IMAGE, AGENT_VM_EGRESS_PROXY/CA, AGENT_VM_HOST_IP.\n"
-    "                   Что НЕ сочетается с --vm (запуск откажет с кодом 2, а не\n"
+    "                   Что НЕ работает под --vm (запуск откажет с кодом 2, а не\n"
     "                   сделает вид, что флаг применён):\n"
     "                     --profile — внутри VM свой claude со своим ~/.claude,\n"
     "                       и профиль хоста туда не пробросить: agent-vm\n"
     "                       игнорирует CLAUDE_CONFIG_DIR и держит креды у себя.\n"
     "                       Нужны профили — запускай без --vm (движок bwrap).\n"
-    "                     --wallet — окружение и наш HTTPS_PROXY в гостя не\n"
-    "                       попадают, а весь его egress расшифровывает сам\n"
-    "                       agent-vm, так что перехват секрета не состоится.\n"
-    "                       Нужен кошелёк — запускай без --vm (движок bwrap).\n"
+    "                     --wallet с host/inject-секретом (PATH-шимы) —\n"
+    "                       окружение в гостя не течёт, git/gh ведёт сам\n"
+    "                       agent-vm, шимам не за что зацепиться. Нужны такие\n"
+    "                       секреты — запускай без --vm (движок bwrap).\n"
+    "                   --wallet с ПРОКСИ-секретом (connector) под --vm РАБОТАЕТ:\n"
+    "                   кошелёк поднимает vault-прокси на LAN-адресе хоста и\n"
+    "                   направляет egress гостя в него через --egress-proxy форка\n"
+    "                   agent-vm; значение секрета в гостя/argv/лог не попадает.\n"
     "                   В госте claude ходит в сеть и в git/gh средствами\n"
     "                   agent-vm; каталог запуска монтируется в VM, ничего\n"
     "                   другого с хоста туда не уезжает\n"
@@ -365,15 +377,11 @@ def parse_args(argv: Sequence[str]) -> Options:
             "отработанный одноразовый refresh-токен и разлогинить учётку — нужен "
             "живой smoke на машине с KVM. Профили работают под --engine bwrap."
         )
-    if engine == ENGINE_VM and wallet is not None:
-        raise CliError(
-            "--wallet под --vm пока не работает: env процесса в гостя не попадает "
-            "(F1), а весь egress гостя прозрачно MITM-ит собственный CA agent-vm "
-            "(F10) — наш HTTPS_PROXY был бы обойдён; PATH-шимов под VM тоже нет "
-            "(git/gh ведёт сам agent-vm, §5.2). Рабочий путь — --egress-proxy форка "
-            "agent-vm на LAN-адрес хоста (F2), это следующий срез. Сейчас: кошелёк "
-            "под --engine bwrap, либо --vm без --wallet."
-        )
+    # --wallet под --vm ЗДЕСЬ не отвергаем: работоспособность зависит от ВИДА
+    # секрета (прокси-секрет — работает через --egress-proxy форка; host/inject —
+    # нет), а вид известен только после загрузки secrets.toml. Решение принимает
+    # box_cli/wallet.setup_wallet_intercept (honest-отказ кодом 2 для host/inject
+    # под --vm), а не парсер, который секрета не видит.
     return Options(
         engine=engine, passthrough=passthrough, wallet=wallet,
         secrets=secrets, profile=profile, prompt=prompt,
@@ -420,8 +428,19 @@ def agent_vm_env_config() -> dict[str, object]:
 
 def make_engine_runner(
     engine: str, root: Path, *, claude_config_dir: Path | None = None,
+    wallet_vm: dict[str, object] | None = None,
 ) -> Runner:
     """Раннер Engine (Слой 0) по минимальному конфигу.
+
+    wallet_vm — переопределение полей конфига под `--wallet --vm`. Оно ПЕРЕКРЫВАЕТ
+    значения из окружения (кошелёк ведёт egress сам, а не то, что в .env). Два вида:
+      * прокси-секрет → {agent_vm_egress_proxy, agent_vm_egress_ca,
+        agent_vm_host_ip}: раннер эмитит `--egress-proxy`/`--egress-ca` и, т.к.
+        адрес приватный, `--allow-egress <LAN-IP>` (AgentVmRunner.wrap /
+        egress_proxy_allow);
+      * inject-секрет → {agent_vm_env_files}: раннер эмитит `--env-file NAME=PATH`
+        (значение читается из файла, в argv не попадает).
+    Вне VM-кошелька — None, конфиг из окружения как раньше.
 
     claude_config_dir — куда указывает CLAUDE_CONFIG_DIR (профиль передаёт свой
     <profile>/.claude). Без него — из окружения. Важно для bwrap: раннер биндит
@@ -441,10 +460,17 @@ def make_engine_runner(
     хуков (см. build_argv). Под bwrap корень репозитория, наоборот, нужен и
     биндится только на чтение — тот путь не трогаем.
     """
+    vm_fields = agent_vm_env_config() if engine == ENGINE_VM else {}
+    # Кошелёк под --vm перекрывает egress окружения своими значениями (прокси на
+    # LAN-адресе хоста + временный CA). Только для agent-vm — под bwrap/off этих
+    # полей в конфиге нет («выключено = не существует»), и wallet_egress туда не
+    # приходит (VM-путь кошелька поднимается лишь для engine==agent-vm).
+    if wallet_vm and engine == ENGINE_VM:
+        vm_fields = {**vm_fields, **wallet_vm}
     config = EngineConfig(
         sandbox=engine,
         claude_config_dir=claude_config_dir or _config_dir_from_env(),
-        **(agent_vm_env_config() if engine == ENGINE_VM else {}),
+        **vm_fields,
     )
     if engine == ENGINE_VM:
         from orchestrator.runners.agentvm import AgentVmRunner
@@ -646,22 +672,9 @@ async def main_async(argv: Sequence[str]) -> int:
         profile_config_dir = pdir / ".claude"
         profile_rw = [pdir]
 
-    runner = make_engine_runner(engine, root, claude_config_dir=profile_config_dir)
-
-    # Preflight движка. Для agent-vm он и проверяет отсутствие бинаря/KVM (и
-    # egress-флаги форка) — на этой машине это самый частый исход, и оператор
-    # обязан увидеть внятную причину, а не трейсбек и не молчаливый откат в
-    # bwrap: «в VM» и «не в VM» — разные гарантии, подменять их нельзя.
-    ok, why = runner.preflight()
-    if not ok:
-        fallback = (
-            "Без microVM: claude-box (bwrap) — файловая песочница на этой машине.\n"
-            if engine == ENGINE_VM else
-            "Попробуй --engine off (без изоляции).\n"
-        )
-        sys.stderr.write(f"claude-box: движок «{engine}» не готов: {why}\n" + fallback)
-        return 1
-
+    # Раннер и preflight строятся НИЖЕ, внутри try/finally: под --wallet --vm
+    # раннеру нужны egress-поля, которые отдаёт уже поднятый кошелёк, а его
+    # teardown обязан отработать даже если preflight упадёт (машина без KVM).
     cwd = os.getcwd()
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     command = build_command(
@@ -680,6 +693,10 @@ async def main_async(argv: Sequence[str]) -> int:
     # extra_rw начинается с каталога профиля (RW-бинд src==dst → HOME/CONFIG_DIR
     # валидны изнутри песочницы); wallet при наличии докидывает свой bundle-каталог.
     extra_rw: list[Path] = list(profile_rw)
+    # Переопределение раннера под --wallet --vm: egress-поля (прокси-секрет) либо
+    # inject-env (inject-секрет). None вне этого случая — раннер строится из
+    # окружения как раньше (bwrap/off/шимы кошелька env не меняют этот путь).
+    wallet_vm: dict[str, object] | None = None
     # Арбитр stdin создаём ЗДЕСЬ — до raw_terminal (он запоминает нормальные
     # настройки терминала, чтобы возвращать эхо на время вопроса) и до подъёма
     # кошелька (демону нужен хост, который спрашивает через арбитра).
@@ -693,7 +710,7 @@ async def main_async(argv: Sequence[str]) -> int:
     if opts.wallet is not None:
         from .tty import BoxVaultHost, UnattendedVaultHost
         from .wallet import WalletError, box_policy_access, setup_wallet_intercept
-        if engine != "bwrap":
+        if engine == "off":
             sys.stderr.write(
                 "claude-box: --wallet с --engine off: песочницы НЕТ. Модель и так "
                 "работает на хосте оператора без изоляции, а кошелёк ДОБАВЛЯЕТ ей "
@@ -726,17 +743,54 @@ async def main_async(argv: Sequence[str]) -> int:
                 arbiter, policy=policy, allow_policy_edit=allow_edit)
         try:
             intercept = await setup_wallet_intercept(
-                opts.wallet, secrets_path=secrets_path, host=host)
+                opts.wallet, secrets_path=secrets_path, host=host,
+                vm=engine == ENGINE_VM)
         except WalletError as e:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
         env.update(intercept.env)
         extra_rw.extend(intercept.extra_rw)
+        # Кошелёк под --vm доставляется НЕ через env (в гостя не течёт), а флагами
+        # форка agent-vm — собрать переопределение для раннера:
+        #   * прокси-секрет → --egress-proxy на наш прокси (LAN-IP) + --egress-ca +
+        #     --allow-egress LAN-IP (public_only гостя иначе режет RFC1918);
+        #   * inject-секрет → --env-file NAME=PATH (значение из файла, не в argv).
+        if intercept.egress_proxy is not None:
+            wallet_vm = {
+                "agent_vm_egress_proxy": intercept.egress_proxy,
+                "agent_vm_egress_ca": intercept.egress_ca,
+                "agent_vm_host_ip": intercept.allow_egress,
+            }
+        elif intercept.env_files:
+            wallet_vm = {"agent_vm_env_files": tuple(intercept.env_files)}
 
-    # try/finally оборачивает ВСЁ после подъёма перехвата (build_argv, замер
-    # терминала, запуск) — иначе исключение в этом узком окне утекло бы прокси-порт
-    # и временный каталог bundle до входа в защищённый блок (нашло ревью, LOW-4).
+    # try/finally оборачивает ВСЁ после подъёма перехвата (раннер, preflight,
+    # build_argv, замер терминала, запуск) — иначе исключение в этом узком окне
+    # утекло бы прокси-порт и временный каталог до входа в защищённый блок (ревью
+    # LOW-4). Раннер строим ЗДЕСЬ, а не раньше: под --wallet --vm ему нужны
+    # egress-поля от уже поднятого кошелька (wallet_egress), а его teardown обязан
+    # отработать, даже если preflight откажет на машине без KVM.
     try:
+        runner = make_engine_runner(
+            engine, root, claude_config_dir=profile_config_dir,
+            wallet_vm=wallet_vm)
+
+        # Preflight движка. Для agent-vm он проверяет отсутствие бинаря/KVM и
+        # egress-флаги форка (под --wallet --vm форк ОБЯЗАН знать --egress-proxy —
+        # иначе кошелёк был бы тихо обойдён). Оператор обязан увидеть внятную
+        # причину, а не трейсбек и не молчаливый откат в bwrap: «в VM» и «не в VM» —
+        # разные гарантии, подменять их нельзя.
+        ok, why = runner.preflight()
+        if not ok:
+            fallback = (
+                "Без microVM: claude-box (bwrap) — файловая песочница на этой машине.\n"
+                if engine == ENGINE_VM else
+                "Попробуй --engine off (без изоляции).\n"
+            )
+            sys.stderr.write(
+                f"claude-box: движок «{engine}» не готов: {why}\n" + fallback)
+            return 1
+
         full_argv = build_argv(runner, command, Path(cwd), extra_rw)
 
         stdin_fd, stdout_fd = 0, 1

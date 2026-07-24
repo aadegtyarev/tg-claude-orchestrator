@@ -271,16 +271,18 @@ def test_profile_under_vm_refused():
     print("OK --profile + --vm → честный отказ (код 2)")
 
 
-def test_wallet_under_vm_refused():
-    """F1/F10: env в гостя не течёт, egress MITM-ит сам agent-vm; шимов под VM нет."""
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        assert _exit_code(cli.parse_args, ["--wallet", "svc", "--vm"]) == 2
-        assert _exit_code(cli.parse_args, ["--vm", "--wallet=svc"]) == 2
-    msg = err.getvalue()
-    assert "--wallet" in msg and "egress" in msg, msg
+def test_wallet_under_vm_parses():
+    """--wallet + --vm БОЛЬШЕ не отвергается парсером: работоспособность зависит
+    от ВИДА секрета (прокси/inject работают, host-passthrough — отказ кодом 2), а
+    вид известен только после загрузки secrets.toml. Решение принимает
+    box_cli.wallet.setup_wallet_intercept, не парсер (см. box_cli_wallet_test)."""
+    opts = cli.parse_args(["--wallet", "svc", "--vm"])
+    assert opts.wallet == "svc" and opts.engine == "agent-vm", opts
+    opts = cli.parse_args(["--vm", "--wallet=svc"])
+    assert opts.wallet == "svc" and opts.engine == "agent-vm", opts
+    # Без --vm по-прежнему разбирается.
     assert cli.parse_args(["--wallet", "svc"]).wallet == "svc"
-    print("OK --wallet + --vm → честный отказ (код 2)")
+    print("OK --wallet + --vm разбирается (вид секрета решает рантайм)")
 
 
 # ── справка ──────────────────────────────────────────────────────────────────
@@ -340,7 +342,7 @@ def main() -> None:
     test_vm_preflight_refuses_without_binary()
     test_vm_preflight_refuses_without_kvm()
     test_profile_under_vm_refused()
-    test_wallet_under_vm_refused()
+    test_wallet_under_vm_parses()
     test_help_does_not_call_vm_unimplemented()
     print("ALL BOX-CLI-VM OK")
 
