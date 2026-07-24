@@ -11,6 +11,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from urllib.parse import urlsplit, urlunsplit
 
+# host_lan_ip вынесен в общий нижний слой (vault/netloc): его делят оркестратор
+# и Launcher (box_cli/wallet.py биндит vault-прокси кошелька на этот адрес под
+# --vm). Реэкспорт сохраняет обратную совместимость — `from orchestrator.config
+# import host_lan_ip` и внутренние вызовы работают как раньше, поведение 1:1.
+from vault.netloc import host_lan_ip
+
 logger = logging.getLogger(__name__)
 
 # Что сказать оператору, когда модуль пропущен из-за несовпадения песочницы:
@@ -81,47 +87,6 @@ def env_number(name: str, cast):
             f"{name}={raw!r} — ожидалось {kind}. Исправь значение в .env "
             f"или убери переменную (тогда возьмётся умолчание)."
         ) from None
-
-
-def host_lan_ip() -> str | None:
-    """LAN-адрес хоста, по которому его видит гость microVM.
-
-    Зачем не `host.microsandbox.internal`: замерено живьём — agent-vm гонит
-    egress гостя через свой HTTP-CONNECT прокси, и хостовое gateway-имя он не
-    маршрутизирует (запрос к сервису на хосте не доходит). А вот LAN-адрес
-    хоста прокси обходит (он сам кладёт его в `no_proxy` гостя), и с
-    `--allow-egress <этот адрес>` сервис на хосте из гостя ДОСТУПЕН —
-    проверено: гость получил ответ от хостового сервиса.
-
-    Берём `src` ДЕФОЛТНОГО маршрута с наименьшей метрикой — ровно тот адрес,
-    что выбирает сам agent-vm (сверено: он положил его в `no_proxy` гостя).
-    Трюк «UDP-сокет на 8.8.8.8» здесь НЕ годится: при поднятом VPN он вернёт
-    адрес туннеля (более специфичный маршрут), а гость ходит не туда.
-
-    Переопределяется явно — `AGENT_VM_HOST_IP` (если авто-выбор промахнулся).
-    """
-    override = os.getenv("AGENT_VM_HOST_IP", "").strip()
-    if override:
-        return override
-    import re
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["ip", "-o", "route", "show", "default"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    best: tuple[int, str] | None = None
-    for line in out.splitlines():
-        m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
-        if not m:
-            continue
-        metric = int(mm.group(1)) if (mm := re.search(r"\bmetric\s+(\d+)", line)) else 0
-        if best is None or metric < best[0]:
-            best = (metric, m.group(1))
-    return best[1] if best else None
 
 
 @dataclass(frozen=True)

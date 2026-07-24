@@ -79,8 +79,11 @@ def main():
     test_preflight_ok()
     test_egress_flags_absent_by_default()
     test_egress_flags_emitted()
+    test_egress_proxy_allow_when_private()
+    test_inject_env_file_emitted()
     test_preflight_rejects_egress_without_fork()
     test_preflight_rejects_missing_ca()
+    test_preflight_rejects_env_file_without_fork()
 
     print("ALL RUNNER OK")
 
@@ -115,6 +118,70 @@ def test_egress_flags_emitted():
     ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
     assert "--egress-ca" not in " ".join(argv), argv
     print("OK agent-vm: --egress-proxy/--egress-ca только когда заданы")
+
+
+def test_egress_proxy_allow_when_private():
+    """Приватный egress-прокси (кошелёк под --vm: наш прокси на LAN-адресе) →
+    гостю нужен `--allow-egress <этот адрес>` (public_only режет RFC1918). Для
+    публичного прокси allow не добавляем (прод-путь 1:1). Дедуп с claude_env."""
+    from orchestrator.runners.agentvm import egress_proxy_allow
+    assert egress_proxy_allow("http://192.168.1.44:9000") == ["192.168.1.44"]
+    assert egress_proxy_allow("http://10.1.2.3:9000") == ["10.1.2.3"]
+    assert egress_proxy_allow("http://93.184.216.34:9000") == []  # публичный
+    assert egress_proxy_allow("http://proxy.example.com:9000") == []  # не IP
+    assert egress_proxy_allow(None) == [] and egress_proxy_allow("") == []
+    # LOOPBACK исключён: наш vault-прокси под --wallet --vm на 127.0.0.1, но гость
+    # к нему не ходит (agent-vm заворачивает egress с хоста, bypass loopback) —
+    # --allow-egress 127.0.0.1 был бы бессмыслен (для гостя это его loopback).
+    assert egress_proxy_allow("http://127.0.0.1:41981") == []
+    assert egress_proxy_allow("http://127.0.0.5:9000") == []  # весь 127/8
+
+    # LAN-IP уходит в --allow-egress вместе с --egress-proxy.
+    argv = AgentVmRunner(
+        cfg(agent_vm_egress_proxy="http://192.168.1.44:9000",
+            agent_vm_egress_ca=Path("/tmp/ca.pem")),
+        Path("/opt/orch"), mount_root=False,
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    s = " ".join(argv)
+    assert "--egress-proxy http://192.168.1.44:9000" in s, argv
+    assert "--allow-egress 192.168.1.44" in s, argv
+
+    # Дедуп: тот же LAN-IP в claude_env (прокси Anthropic) не даёт двойной allow.
+    argv = AgentVmRunner(
+        cfg(agent_vm_egress_proxy="http://192.168.1.44:9000",
+            agent_vm_host_ip="192.168.1.44",
+            claude_env={"ANTHROPIC_BASE_URL": "http://192.168.1.44:8080"}),
+        Path("/opt/orch"), mount_root=False,
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    assert " ".join(argv).count("--allow-egress 192.168.1.44") == 1, argv
+
+    # Публичный egress-прокси: --allow-egress НЕ добавляется (прод-путь не поехал).
+    argv = AgentVmRunner(
+        cfg(agent_vm_egress_proxy="http://93.184.216.34:9000"),
+        Path("/opt/orch"), mount_root=False,
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    assert "--allow-egress" not in " ".join(argv), argv
+    print("OK agent-vm: приватный egress-прокси → --allow-egress; публичный → нет")
+
+
+def test_inject_env_file_emitted():
+    """VM-путь inject-секрета: `--env-file NAME=PATH` в argv (значение из файла, в
+    argv не попадает). Поле только у EngineConfig (cfg тут его добавляет);
+    orchestrator.Config его не имеет — getattr дефолт ()."""
+    # Дефолт: поля нет (SimpleNamespace без него) → --env-file не эмитится.
+    argv = AgentVmRunner(cfg(), Path("/opt/orch"), mount_root=False).wrap(
+        ["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    assert "--env-file" not in " ".join(argv), argv
+
+    argv = AgentVmRunner(
+        cfg(agent_vm_env_files=("MYTOKEN=/tmp/w/MYTOKEN.env",)),
+        Path("/opt/orch"), mount_root=False,
+    ).wrap(["claude"], chdir=Path("/p"), extra_rw=[], publish_ports=[])
+    s = " ".join(argv)
+    assert "--env-file MYTOKEN=/tmp/w/MYTOKEN.env" in s, argv
+    # Значение секрета в argv не светится (в argv только имя+путь).
+    assert "--env " not in s, argv
+    print("OK agent-vm: inject-секрет → --env-file NAME=PATH (значение из файла)")
 
 
 def test_preflight_rejects_egress_without_fork():
@@ -179,6 +246,31 @@ def test_preflight_rejects_missing_ca():
             ok, why = r.preflight()
         assert ok is True, why
     print("OK preflight: отсутствующий --egress-ca отвергается на старте")
+
+
+def test_preflight_rejects_env_file_without_fork():
+    """agent_vm_env_files задан, но бинарь не знает --env-file (v0.1.27/апстрим) →
+    честный отказ на preflight, а не падение на «unexpected argument»."""
+    from unittest import mock
+    from orchestrator.runners import agentvm
+    r = AgentVmRunner(
+        cfg(agent_vm_env_files=("MYTOKEN=/tmp/w/x.env",)), Path("/opt/orch"),
+        mount_root=False)
+    old_help = SimpleNamespace(stdout=b"--allow-host --env <KEY=VALUE>", stderr=b"")
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True), \
+         mock.patch.object(agentvm.subprocess, "run", return_value=old_help):
+        ok, why = r.preflight()
+    assert ok is False and "--env-file" in why, why
+
+    # Форк 0.1.28 (флаг есть) — пропускаем.
+    fork_help = SimpleNamespace(stdout=b"--env-file <KEY=PATH>", stderr=b"")
+    with mock.patch.object(agentvm.shutil, "which", return_value="/usr/bin/agent-vm"), \
+         mock.patch.object(agentvm.Path, "exists", return_value=True), \
+         mock.patch.object(agentvm.subprocess, "run", return_value=fork_help):
+        ok, why = r.preflight()
+    assert ok is True and why == "ok", why
+    print("OK preflight: inject под --vm требует --env-file (старый бинарь → отказ)")
 
 
 def test_root_equal_cwd_not_mounted_twice():
