@@ -88,12 +88,14 @@ def egress_hosts(claude_env: dict[str, str], host_ip: str | None) -> list[str]:
 def egress_proxy_allow(egress_proxy: str | None) -> list[str]:
     """Адрес самого egress-прокси, которому нужен `--allow-egress` (или []).
 
-    Если egress-прокси слушает на ПРИВАТНОМ (RFC1918) адресе — типовой случай
-    кошелька под --vm: наш vault-прокси на LAN-адресе хоста — гость по умолчанию
-    (public_only) не имеет права к нему обратиться, и весь egress молча упал бы.
-    Открываем ровно этот адрес. Публичный прокси допущен политикой и без явного
-    allow — для него ничего не добавляем (прод-путь оркестратора 1:1, если там
-    задан публичный AGENT_VM_EGRESS_PROXY). Хост не распарсился/не IP — [].
+    Если egress-прокси слушает на ПРИВАТНОМ (RFC1918) LAN-адресе — гость по
+    умолчанию (public_only) не имеет права к нему обратиться, и egress молча
+    упал бы; открываем ровно этот адрес. LOOPBACK (127.0.0.0/8) исключаем: наш
+    vault-прокси под --wallet --vm слушает на 127.0.0.1, но гость к нему НЕ
+    ходит — egress заворачивает сам agent-vm с хоста и loopback bypass'ит
+    (no_proxy), так что `--allow-egress 127.0.0.1` был бы бессмыслен (для гостя
+    это его собственный loopback). Публичный прокси допущен политикой без allow
+    (прод-путь оркестратора 1:1). Хост не распарсился/не IP — [].
     """
     if not egress_proxy:
         return []
@@ -104,7 +106,7 @@ def egress_proxy_allow(egress_proxy: str | None) -> list[str]:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return []
-    return [host] if ip.is_private else []
+    return [host] if ip.is_private and not ip.is_loopback else []
 
 
 class AgentVmRunner:

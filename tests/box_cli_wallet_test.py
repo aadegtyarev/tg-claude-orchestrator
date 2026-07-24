@@ -367,10 +367,13 @@ def _inject_secrets_toml() -> str:
 
 
 async def test_setup_vm_proxy_egress_and_teardown():
-    """Прокси-секрет под --vm: egress-поля (--egress-proxy на LAN-IP + CA-файл +
-    allow), env/extra_rw пусты, значение секрета нигде; argv раннера содержит
-    LAN-IP и в --egress-proxy, и в --allow-egress; close() снимает прокси и сносит
-    CA-файл. LAN-IP форсим на 127.0.0.1 (bindable)."""
+    """Прокси-секрет под --vm: egress-поля (--egress-proxy на 127.0.0.1 + CA-файл),
+    allow_egress=None (loopback — --allow-egress не нужен), env/extra_rw пусты,
+    значение секрета нигде; argv раннера содержит loopback в --egress-proxy и
+    НЕ содержит --allow-egress; close() снимает прокси и сносит CA-файл.
+
+    Прокси на 127.0.0.1: egress гостя заворачивает сам agent-vm с хоста (CONNECT
+    с peer=127.0.0.1), гость к прокси не ходит — LAN-bind был бы лишней экспозицией."""
     if _IMPORT_ERR is not None:
         return _skip(f"импорт не удался: {_IMPORT_ERR}")
     if not _have_openssl():
@@ -378,9 +381,7 @@ async def test_setup_vm_proxy_egress_and_teardown():
     tmp = Path(tempfile.mkdtemp(prefix="cli_wallet_vm_"))
     secrets = tmp / "secrets.toml"
     _write_secrets(secrets, _proxy_secrets_toml("https://localhost/allowed"))
-    old_ip = os.environ.get("AGENT_VM_HOST_IP")
     old_xdg = os.environ.get("XDG_CONFIG_HOME")
-    os.environ["AGENT_VM_HOST_IP"] = "127.0.0.1"
     os.environ["XDG_CONFIG_HOME"] = str(tmp / "xdg")
     intercept = None
     try:
@@ -388,45 +389,43 @@ async def test_setup_vm_proxy_egress_and_teardown():
         # Под VM env/extra_rw пусты (в гостя не течёт) — доставка во флагах.
         assert intercept.env == {} and intercept.extra_rw == [], intercept
         assert intercept.egress_proxy.startswith("http://127.0.0.1:"), intercept.egress_proxy
-        assert intercept.allow_egress == "127.0.0.1", intercept.allow_egress
+        assert intercept.allow_egress is None, "loopback: --allow-egress не нужен"
         ca_file = intercept.egress_ca
         assert ca_file.exists() and "BEGIN CERTIFICATE" in ca_file.read_text()
         assert oct(ca_file.stat().st_mode & 0o777) == "0o644"
         # Значение секрета никуда в возвращённое не попало.
-        blob = f"{intercept.egress_proxy} {ca_file} {intercept.allow_egress}"
+        blob = f"{intercept.egress_proxy} {ca_file}"
         assert _SECRET_VALUE not in blob and _SECRET_VALUE not in ca_file.read_text()
 
-        # argv раннера: LAN-IP и в --egress-proxy, и в --allow-egress; CA-файл; без
-        # значения секрета.
+        # argv раннера: --egress-proxy на loopback + CA-файл; БЕЗ --allow-egress
+        # (loopback agent-vm bypass'ит сам); без значения секрета.
         runner = cli.make_engine_runner("agent-vm", cli.repo_root(), wallet_vm={
             "agent_vm_egress_proxy": intercept.egress_proxy,
             "agent_vm_egress_ca": intercept.egress_ca,
-            "agent_vm_host_ip": intercept.allow_egress,
         })
         argv = cli.build_argv(runner, ["claude"], Path("/tmp/proj"))
         s = " ".join(argv)
         assert f"--egress-proxy {intercept.egress_proxy}" in s, s
         assert f"--egress-ca {ca_file}" in s, s
-        assert "--allow-egress 127.0.0.1" in s, s
+        assert "--allow-egress" not in s, "для loopback-прокси --allow-egress не нужен"
         assert _SECRET_VALUE not in s, "значение секрета в argv!"
 
         # Прод-trust: пул НЕ переопределяет upstream_ssl (системный дефолт).
         assert intercept._pool is not None and intercept._pool._upstream_ssl is None
-        assert intercept._pool._bind_host == "127.0.0.1", "прокси не на LAN-адресе"
+        assert intercept._pool._bind_host == "127.0.0.1", "прокси не на loopback"
 
         tmpdir = ca_file.parent
         await intercept.close()
         assert not tmpdir.exists(), "CA-файл/каталог не снесён после close()"
         assert intercept._pool is None, "прокси не снят"
-        print("OK VM прокси: egress на LAN-IP+CA+allow, env пуст, секрет не в argv, teardown")
+        print("OK VM прокси: egress на loopback+CA, без allow-egress, секрет не в argv, teardown")
     finally:
         if intercept is not None:
             await intercept.close()
-        for k, v in (("AGENT_VM_HOST_IP", old_ip), ("XDG_CONFIG_HOME", old_xdg)):
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        if old_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = old_xdg
 
 
 async def test_setup_vm_inject_via_env_file():
@@ -488,6 +487,37 @@ async def test_vm_host_passthrough_refused():
     print("OK VM host-passthrough: отказ кодом 2 (а прокси/inject — работают)")
 
 
+async def test_vm_inject_bad_env_name_refused():
+    """env-имя inject-секрета валидируется ДО записи файла: слэш/`=`/`..` увели бы
+    файл значения за приватный tmpdir или расщепили бы NAME=PATH у форка — отказ
+    кодом 2, файл со значением не создаётся (нашло ревью, LOW)."""
+    if _IMPORT_ERR is not None:
+        return _skip(f"импорт не удался: {_IMPORT_ERR}")
+    # непустые кривые env → inject-путь + валидация env-имени (пустой env — это
+    # уже host-passthrough, у него свой отказ, проверяется в другом тесте).
+    for bad in ("../../evil", "A=B", "with/slash", "1DIGIT", "has space"):
+        tmp = Path(tempfile.mkdtemp(prefix="cli_wallet_vm_badenv_"))
+        secrets = tmp / "secrets.toml"
+        _write_secrets(
+            secrets,
+            "[secrets.tok]\n"
+            'value = "V-DO-NOT-LEAK"\n'
+            f'env = "{bad}"\n'
+            'sessions = ["*"]\n')
+        try:
+            await setup_wallet_intercept("tok", secrets_path=secrets, vm=True)
+        except WalletError as e:
+            assert e.code == 2, (bad, e.code)
+            assert "env-имя" in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"env-имя {bad!r} должно быть отвергнуто")
+        # Значение не утекло в файлы вне secrets.toml (файл-значение не создан).
+        leaked = [p for p in tmp.rglob("*") if p.is_file() and "V-DO-NOT-LEAK" in
+                  p.read_text(errors="ignore") and p.name != "secrets.toml"]
+        assert not leaked, f"значение записано в файл при плохом env: {leaked}"
+    print("OK VM inject: кривое env-имя (traversal/=/пусто) → отказ, файл значения не создан")
+
+
 def main() -> None:
     if _IMPORT_ERR is not None:
         _skip(f"box_cli/vault недоступны: {_IMPORT_ERR}")
@@ -499,6 +529,7 @@ def main() -> None:
     asyncio.run(test_setup_vm_proxy_egress_and_teardown())
     asyncio.run(test_setup_vm_inject_via_env_file())
     asyncio.run(test_vm_host_passthrough_refused())
+    asyncio.run(test_vm_inject_bad_env_name_refused())
     print("ALL BOX-CLI-WALLET OK")
 
 

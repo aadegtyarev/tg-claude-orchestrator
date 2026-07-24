@@ -130,6 +130,11 @@ def test_egress_proxy_allow_when_private():
     assert egress_proxy_allow("http://93.184.216.34:9000") == []  # публичный
     assert egress_proxy_allow("http://proxy.example.com:9000") == []  # не IP
     assert egress_proxy_allow(None) == [] and egress_proxy_allow("") == []
+    # LOOPBACK исключён: наш vault-прокси под --wallet --vm на 127.0.0.1, но гость
+    # к нему не ходит (agent-vm заворачивает egress с хоста, bypass loopback) —
+    # --allow-egress 127.0.0.1 был бы бессмыслен (для гостя это его loopback).
+    assert egress_proxy_allow("http://127.0.0.1:41981") == []
+    assert egress_proxy_allow("http://127.0.0.5:9000") == []  # весь 127/8
 
     # LAN-IP уходит в --allow-egress вместе с --egress-proxy.
     argv = AgentVmRunner(
